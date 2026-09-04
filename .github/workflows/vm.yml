@@ -25,9 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
+      # NB: RUNNER_ID / VM_PANEL_ENV TIDAK di-set di level job — jika job-wide,
+      # unit test mewarisi env tersebut dan gagal assert 'local' (hermetic tests).
+      # Scope env hanya ke step yang benar-benar membutuhkan.
       VPANEL_MASTER_KEY: ${{ secrets.VPANEL_MASTER_KEY }}
-      RUNNER_ID: ${{ github.run_id }}
-      VM_PANEL_ENV: actions
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,6 +58,9 @@ jobs:
         run: |
           bash scripts/start_manager.sh
           bash scripts/start_panel.sh
+        env:
+          RUNNER_ID: ${{ github.run_id }}
+          VM_PANEL_ENV: actions
 
       - name: Health gate (manager + panel wajib lulus)
         run: bash scripts/health_check.sh
