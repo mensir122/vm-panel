@@ -1,0 +1,96 @@
+# VM-Panel — workflow utama (self-chain runner).
+# Desain: docs/DESIGN.md §15, §24, keputusan D8a-D8c.
+# - Ephemeral runner: job max 6 jam (timeout-minutes: 360).
+# - Self-chain: sebelum timeout, dispatch run berikutnya via GITHUB_TOKEN
+#   (workflow_dispatch = pengecualian eksplisit aturan non-triggering).
+# - Anti split-brain: concurrency group + cek run in_progress lain + drain
+#   berbasis job started_at (bukan jam runner) + final backup + health gate.
+# - TANPA PAT: hanya GITHUB_TOKEN default.
+
+name: vm
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: vm-chain
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+timeout-minutes: 360
+
+jobs:
+  vm:
+    runs-on: ubuntu-latest
+    env:
+      VPANEL_MASTER_KEY: ${{ secrets.VPANEL_MASTER_KEY }}
+      RUNNER_ID: ${{ github.run_id }}
+      VM_PANEL_ENV: actions
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Quick tests (unit only, batasi budget)
+        run: npm run test:unit
+
+      - name: Restore state (backup terakhir dari artifact run sebelumnya)
+        id: restore
+        run: bash scripts/restore_state.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+
+      - name: Verify state integrity
+        run: bash scripts/verify_state.sh
+
+      - name: Start manager + panel
+        run: |
+          bash scripts/start_manager.sh
+          bash scripts/start_panel.sh
+
+      - name: Health gate (manager + panel wajib lulus)
+        run: bash scripts/health_check.sh
+
+      - name: Services + supervisor + keepalive + self-chain
+        run: bash scripts/keepalive.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Final backup sebelum shutdown
+        if: always()
+        run: bash scripts/backup_final.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Graceful shutdown
+        if: always()
+        run: bash scripts/stop_all.sh
+
+      - name: Upload state artifact (untuk chain berikutnya)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-state-${{ github.run_id }}
+          path: backups/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload chain lock (watchdog recovery.yml membaca ini)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-chain-lock
+          path: runtime/chain-lock.json
+          retention-days: 2
+          if-no-files-found: warn

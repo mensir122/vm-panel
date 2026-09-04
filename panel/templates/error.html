@@ -1,0 +1,56 @@
+<!doctype html>
+<!--
+  VPANEL template: error.html
+  Standalone error page (no sidebar; reachable pre- and post-auth).
+
+  VARS (written as [key] here to avoid template substitution inside
+  this comment; the real placeholders use double braces):
+
+    [code]     escaped short status/error code, e.g. "404" or
+               "LOCKOUT". Rendered large in mono.
+    [message]  escaped one-line human explanation, e.g.
+               "The page you requested was not found."
+               Keep it operational; no apology marketing copy.
+
+  Also accepted (server may pass empty strings):
+    [user]      escaped username when a session exists; empty pre-auth.
+    [banner|raw], [flash|raw]  fragments or empty.
+
+  Intentionally NOT used: [nav|raw] — the error layout is standalone;
+  a "Back to dashboard" link is included directly. If the error is
+  pre-auth (e.g. session expired), the server may rewrite that link
+  to /login.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>{{code}} — VPANEL</title>
+  <link rel="stylesheet" href="/static/panel.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+</head>
+<body>
+  <main class="auth__wrap">
+    <h1 class="sr-only">Error</h1>
+
+    <div class="notices auth__notices">
+      {{banner|raw}}
+      {{flash|raw}}
+    </div>
+
+    <section class="auth__card">
+      <p class="error__code mono">{{code}}</p>
+      <p class="error__message">{{message}}</p>
+      <a class="btn btn--primary" href="/dashboard">Back to dashboard</a>
+    </section>
+
+    <footer class="auth__foot">
+      <span class="mono">VPANEL</span>
+      <span>If this persists, check the panel log.</span>
+    </footer>
+  </main>
+
+  <script src="/static/panel.js" defer></script>
+</body>
+</html>

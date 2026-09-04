@@ -1,0 +1,158 @@
+<!doctype html>
+<!--
+  VPANEL template: project-detail.html
+  Single project view: header + anchor tabs (Overview, Deployments,
+  Health, Logs, Settings), each tab is a section on the same page.
+
+  VARS (written as [key|raw] here to avoid template substitution
+  inside this comment; the real placeholders use double braces):
+
+    [nav|raw]            sidebar nav fragment, "Projects" active.
+    [user]               escaped username.
+    [banner|raw]         optional banner fragment (div.alert...), or empty.
+    [flash|raw]          one-shot flash fragment, or empty.
+    [overviewGrid|raw]   metadata card. Carries the project identity
+                         (name, ID in mono, type badge, status dot)
+                         since the page header is static. Suggested shape:
+                         <section class="card">
+                           <header class="card__header">
+                             <h2 class="card__title">
+                               <span class="status">
+                                 <span class="dot dot--healthy" role="img"
+                                   aria-label="status: healthy"></span>
+                                 api-gateway
+                               </span>
+                             </h2>
+                             <span class="mono muted">prj_01ABC...</span>
+                           </header>
+                           <div class="card__body">
+                             <dl class="kv">
+                               <dt class="kv__key">Type</dt>
+                               <dd class="kv__value"><span class="badge badge--accent">node</span></dd>
+                               <dt class="kv__key">Revision</dt>
+                               <dd class="kv__value mono">a1b2c3d</dd>
+                               <dt class="kv__key">Workspace</dt>
+                               <dd class="kv__value mono">projects/active/...</dd>
+                               ...
+                             </dl>
+                           </div>
+                         </section>
+    [deploymentsTable|raw] table (div.table-wrap > table.table; th: ID,
+                         Revision, Status, Actor, Started UTC, Finished UTC)
+                         or div.empty with "No deployments yet."
+    [healthSection|raw]  card with current status + recent checks table
+                         (see health.html fragment guidance), or div.empty.
+    [logsSection|raw]    card containing:
+                         <pre class="log" tabindex="0"
+                           data-autoscroll>...log lines...</pre>
+                         (mono, auto-scrolls near bottom via panel.js),
+                         or div.empty with "No log output."
+    [settingsForm|raw]   read-only settings card: dl.kv for restart
+                         policy, health check config, port, env/secret
+                         ref metadata (names + scopes only, never
+                         values), or div.empty.
+
+  Notes for the integrator:
+    - Tabs are in-page anchors (href="#overview" etc.). No JS tabs;
+      works without JavaScript. Sections carry class panel-section
+      and matching ids; :target highlights the active card.
+    - Destructive actions in Settings must use the two-phase
+      contract (data-confirm / data-confirm-phrase) so panel.js
+      intercepts them; the server enforces its own second phase.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Project detail — VPANEL</title>
+  <link rel="stylesheet" href="/static/panel.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="app">
+    <aside class="app__sidebar">
+      <div class="brand">
+        <a class="brand__mark" href="/dashboard">VPANEL</a>
+        <span class="brand__sub">VM-Panel</span>
+      </div>
+      {{nav|raw}}
+      <div class="app__sidebar-foot">VM-Panel · operations console</div>
+    </aside>
+
+    <div class="app__main">
+      <header class="topbar">
+        <span class="topbar__user">{{user}}</span>
+        <form method="post" action="/logout">
+          <button class="btn btn--ghost" type="submit">Log out</button>
+        </form>
+      </header>
+
+      <div class="notices">
+        {{banner|raw}}
+        {{flash|raw}}
+      </div>
+
+      <main class="page" id="main">
+        <div class="page__header">
+          <div>
+            <h1 class="page__title">Project detail</h1>
+            <p class="page__meta">Name, ID, type and current status are shown in the Overview card</p>
+          </div>
+          <div class="page__actions">
+            <a class="btn btn--ghost" href="/projects">Back to projects</a>
+          </div>
+        </div>
+
+        <nav class="tabs" aria-label="Project sections">
+          <a class="tab" href="#overview">Overview</a>
+          <a class="tab" href="#deployments">Deployments</a>
+          <a class="tab" href="#health">Health</a>
+          <a class="tab" href="#logs">Logs</a>
+          <a class="tab" href="#settings">Settings</a>
+        </nav>
+
+        <p class="page__hint">
+          Tabs jump to sections on this page. Project name, ID, type and
+          status are rendered in the Overview card below.
+        </p>
+
+        <div class="page__stack">
+          <section class="panel-section" id="overview" aria-labelledby="h-overview">
+            <h2 class="sr-only" id="h-overview">Overview</h2>
+            {{overviewGrid|raw}}
+          </section>
+
+          <section class="panel-section" id="deployments" aria-labelledby="h-deployments">
+            <h2 class="sr-only" id="h-deployments">Deployments</h2>
+            {{deploymentsTable|raw}}
+          </section>
+
+          <section class="panel-section" id="health" aria-labelledby="h-health">
+            <h2 class="sr-only" id="h-health">Health</h2>
+            {{healthSection|raw}}
+          </section>
+
+          <section class="panel-section" id="logs" aria-labelledby="h-logs">
+            <h2 class="sr-only" id="h-logs">Logs</h2>
+            {{logsSection|raw}}
+          </section>
+
+          <section class="panel-section" id="settings" aria-labelledby="h-settings">
+            <h2 class="sr-only" id="h-settings">Settings</h2>
+            {{settingsForm|raw}}
+          </section>
+        </div>
+      </main>
+
+      <footer class="footer">
+        <span class="mono">VPANEL</span>
+        <span>Data as of page load. Refresh for current state.</span>
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/panel.js" defer></script>
+</body>
+</html>

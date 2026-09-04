@@ -1,0 +1,115 @@
+<!doctype html>
+<!--
+  VPANEL template: projects.html
+  Project registry table. Requires a session.
+
+  VARS (written as [key|raw] here to avoid template substitution
+  inside this comment; the real placeholders use double braces):
+
+    [nav|raw]           sidebar nav fragment, "Projects" active
+                        (nav__link--active + aria-current="page").
+    [user]              escaped username.
+    [banner|raw]        optional banner fragment (div.alert...), or empty.
+    [flash|raw]         one-shot flash fragment, or empty.
+    [projectsTable|raw] either the registry table:
+                        <div class="table-wrap">
+                          <table class="table">
+                            <thead><tr>
+                              <th scope="col">ID</th>
+                              <th scope="col">Name</th>
+                              <th scope="col">Type</th>
+                              <th scope="col">Status</th>
+                              <th scope="col">Port</th>
+                              <th scope="col">Last deploy</th>
+                            </tr></thead>
+                            <tbody>
+                              <tr>
+                                <td class="mono">prj_01ABC...</td>
+                                <td><a href="/projects/prj_...">api-gateway</a></td>
+                                <td><span class="badge">node</span></td>
+                                <td><span class="status">
+                                  <span class="dot dot--healthy"
+                                    role="img" aria-label="status: healthy"></span>
+                                  healthy</span></td>
+                                <td class="mono">10001</td>
+                                <td class="mono">2026-09-04 12:00 UTC</td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
+                        or the empty state:
+                        <div class="empty">
+                          <p class="empty__title">No projects registered.</p>
+                          <p class="empty__hint">Create one via
+                            <code>vmctl project create</code>.</p>
+                        </div>
+
+    Notes for the integrator:
+    - "New project" is a server-rendered disabled button with
+      title="F5" (project creation ships in phase F5). Kept in
+      markup, not a var, so it never disappears.
+    - Status dot variants: dot--healthy | dot--degraded |
+      dot--unhealthy | dot--crash_loop | dot--stopped |
+      dot--disabled | dot--unknown (see docs/DESIGN.md Lampiran B).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Projects — VPANEL</title>
+  <link rel="stylesheet" href="/static/panel.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="app">
+    <aside class="app__sidebar">
+      <div class="brand">
+        <a class="brand__mark" href="/dashboard">VPANEL</a>
+        <span class="brand__sub">VM-Panel</span>
+      </div>
+      {{nav|raw}}
+      <div class="app__sidebar-foot">VM-Panel · operations console</div>
+    </aside>
+
+    <div class="app__main">
+      <header class="topbar">
+        <span class="topbar__user">{{user}}</span>
+        <form method="post" action="/logout">
+          <button class="btn btn--ghost" type="submit">Log out</button>
+        </form>
+      </header>
+
+      <div class="notices">
+        {{banner|raw}}
+        {{flash|raw}}
+      </div>
+
+      <main class="page" id="main">
+        <div class="page__header">
+          <div>
+            <h1 class="page__title">Projects</h1>
+            <p class="page__meta">Registered deployable units on this host</p>
+          </div>
+          <div class="page__actions">
+            <button class="btn btn--primary" type="button" disabled
+                    title="F5">New project</button>
+          </div>
+        </div>
+
+        <div class="page__stack">
+          {{projectsTable|raw}}
+        </div>
+      </main>
+
+      <footer class="footer">
+        <span class="mono">VPANEL</span>
+        <span>Status reflects the last health sample.</span>
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/panel.js" defer></script>
+</body>
+</html>

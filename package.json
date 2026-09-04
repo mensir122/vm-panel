@@ -1,0 +1,26 @@
+{
+  "name": "vm-panel",
+  "version": "0.1.0",
+  "description": "VM-Panel — VM deployment manager (fresh system; desain: docs/DESIGN.md)",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "vmctl": "./bin/vmctl.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "test:unit": "node --test",
+    "test:integration": "node --test tests/integration/*.test.js",
+    "test:security": "node --test tests/security/*.test.js",
+    "test:recovery": "node --test tests/recovery/*.test.js",
+    "start": "node manager/index.js",
+    "start:panel": "node panel/server/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "11.10.0"
+  }
+}

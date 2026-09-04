@@ -1,0 +1,112 @@
+<!doctype html>
+<!--
+  VPANEL template: recovery.html
+  Services in crash-loop: automatic restarts exhausted, manual
+  intervention required. Requires a session.
+
+  VARS (written as [key|raw] here to avoid template substitution
+  inside this comment; the real placeholders use double braces):
+
+    [nav|raw]            sidebar nav fragment, "Recovery" active.
+    [user]               escaped username.
+    [banner|raw]         optional banner fragment (div.alert...), or empty.
+    [flash|raw]          one-shot flash fragment, or empty.
+    [recoverySections|raw] one card per crash-looping service,
+                         suggested shape:
+                         <section class="card">
+                           <header class="card__header">
+                             <h2 class="card__title">
+                               <span class="status">
+                                 <span class="dot dot--crash_loop" role="img"
+                                   aria-label="status: crash loop"></span>
+                                 api-gateway
+                               </span>
+                             </h2>
+                             <span class="mono muted">svc_01ABC...</span>
+                           </header>
+                           <div class="card__body">
+                             <dl class="kv">
+                               <dt class="kv__key">Restart count</dt>
+                               <dd class="kv__value mono">5 / 5</dd>
+                               <dt class="kv__key">Last event</dt>
+                               <dd class="kv__value mono">2026-09-04 12:00 UTC · exit 1</dd>
+                             </dl>
+                             <form method="post" action="/services/svc_.../retry">
+                               <button class="btn btn--danger" type="submit"
+                                 data-confirm="Manually retry service api-gateway?"
+                                 data-confirm-detail="This restarts the service and resets the backoff sequence."
+                                 data-confirm-phrase="svc_...">Manual retry</button>
+                             </form>
+                           </div>
+                         </section>
+                         If nothing is crash-looping:
+                         <div class="empty">
+                           <p class="empty__title">No services in crash-loop.</p>
+                           <p class="empty__hint">The supervisor is operating
+                             within restart limits.</p>
+                         </div>
+
+    "Manual retry" is destructive-ish (restarts service, resets
+    backoff): it must carry the data-confirm contract; the server
+    enforces its own two-phase confirmation.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Recovery — VPANEL</title>
+  <link rel="stylesheet" href="/static/panel.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="app">
+    <aside class="app__sidebar">
+      <div class="brand">
+        <a class="brand__mark" href="/dashboard">VPANEL</a>
+        <span class="brand__sub">VM-Panel</span>
+      </div>
+      {{nav|raw}}
+      <div class="app__sidebar-foot">VM-Panel · operations console</div>
+    </aside>
+
+    <div class="app__main">
+      <header class="topbar">
+        <span class="topbar__user">{{user}}</span>
+        <form method="post" action="/logout">
+          <button class="btn btn--ghost" type="submit">Log out</button>
+        </form>
+      </header>
+
+      <div class="notices">
+        {{banner|raw}}
+        {{flash|raw}}
+      </div>
+
+      <main class="page" id="main">
+        <div class="page__header">
+          <div>
+            <h1 class="page__title">Recovery</h1>
+            <p class="page__meta">
+              Services that exhausted automatic restarts
+              (backoff sequence 5/15/30/60/120s)
+            </p>
+          </div>
+        </div>
+
+        <div class="page__stack">
+          {{recoverySections|raw}}
+        </div>
+      </main>
+
+      <footer class="footer">
+        <span class="mono">VPANEL</span>
+        <span>Crash-looped services stay down until a manual retry.</span>
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/panel.js" defer></script>
+</body>
+</html>

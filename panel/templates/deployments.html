@@ -1,0 +1,120 @@
+<!doctype html>
+<!--
+  VPANEL template: deployments.html
+  Deployment history with retry / rollback. Requires a session.
+
+  VARS (written as [key|raw] here to avoid template substitution
+  inside this comment; the real placeholders use double braces):
+
+    [nav|raw]              sidebar nav fragment, "Deployments" active.
+    [user]                 escaped username.
+    [banner|raw]           optional banner fragment (div.alert...), or empty.
+    [flash|raw]            one-shot flash fragment, or empty.
+    [deploymentsTable|raw] either the deployments table:
+                           <div class="table-wrap">
+                             <table class="table">
+                               <thead><tr>
+                                 <th scope="col">ID</th>
+                                 <th scope="col">Project</th>
+                                 <th scope="col">Revision</th>
+                                 <th scope="col">Status</th>
+                                 <th scope="col">Actor</th>
+                                 <th scope="col">Started UTC</th>
+                                 <th scope="col">Actions</th>
+                               </tr></thead>
+                               <tbody>
+                                 <tr>
+                                   <td class="mono">dep_01ABC...</td>
+                                   <td><a href="/projects/prj_...">api-gateway</a></td>
+                                   <td class="mono">a1b2c3d</td>
+                                   <td><span class="badge badge--ok">success</span></td>
+                                   <td>owner</td>
+                                   <td class="mono">2026-09-04 12:00 UTC</td>
+                                   <td>
+                                     <div class="table__actions">
+                                       <form method="post" action="/deployments/dep_.../retry">
+                                         <button class="btn btn--sm" type="submit"
+                                           data-confirm="Retry deployment dep_...?"
+                                           data-confirm-phrase="dep_...">Retry</button>
+                                       </form>
+                                       <form method="post" action="/deployments/dep_.../rollback">
+                                         <button class="btn btn--sm btn--danger" type="submit"
+                                           data-confirm="Roll back to the revision of dep_...?"
+                                           data-confirm-detail="The service restarts on the previous successful revision."
+                                           data-confirm-phrase="dep_...">Rollback</button>
+                                       </form>
+                                     </div>
+                                   </td>
+                                 </tr>
+                               </tbody>
+                             </table>
+                           </div>
+                           or the empty state:
+                           <div class="empty">
+                             <p class="empty__title">No deployments.</p>
+                             <p class="empty__hint">Deployments appear after
+                               the first deploy of a project.</p>
+                           </div>
+
+    Status badge mapping: success=badge--ok, failed=badge--err,
+    pending/running=badge, rolled_back=badge--warn.
+    Retry and Rollback are destructive: both must carry the
+    data-confirm contract; server enforces its own second phase.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Deployments — VPANEL</title>
+  <link rel="stylesheet" href="/static/panel.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="app">
+    <aside class="app__sidebar">
+      <div class="brand">
+        <a class="brand__mark" href="/dashboard">VPANEL</a>
+        <span class="brand__sub">VM-Panel</span>
+      </div>
+      {{nav|raw}}
+      <div class="app__sidebar-foot">VM-Panel · operations console</div>
+    </aside>
+
+    <div class="app__main">
+      <header class="topbar">
+        <span class="topbar__user">{{user}}</span>
+        <form method="post" action="/logout">
+          <button class="btn btn--ghost" type="submit">Log out</button>
+        </form>
+      </header>
+
+      <div class="notices">
+        {{banner|raw}}
+        {{flash|raw}}
+      </div>
+
+      <main class="page" id="main">
+        <div class="page__header">
+          <div>
+            <h1 class="page__title">Deployments</h1>
+            <p class="page__meta">Deployment history across all projects</p>
+          </div>
+        </div>
+
+        <div class="page__stack">
+          {{deploymentsTable|raw}}
+        </div>
+      </main>
+
+      <footer class="footer">
+        <span class="mono">VPANEL</span>
+        <span>Rollback restarts the service on the previous successful revision.</span>
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/panel.js" defer></script>
+</body>
+</html>

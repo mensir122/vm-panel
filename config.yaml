@@ -1,0 +1,76 @@
+# VM-Panel — konfigurasi root.
+# SEMUA nilai di bawah adalah default dummy/dev. Tidak ada credential di file ini.
+# Nilah rahasia TIDAK PERNAH ditaruh di config.yaml — gunakan secret refs (secrets/secrets.yaml) + vault (secrets/vault.enc).
+
+manager:
+  # Port internal Manager API (localhost). Panel berkomunikasi ke sini.
+  api_port: 8097
+  # Mode host tempat manager berjalan:
+  #   dev      — development laptop (default)
+  #   actions  — GitHub Actions runner
+  #   vps      — VPS produksi
+  #   container — di dalam container terkelola
+  host_mode: "dev"
+
+ports:
+  # Rentang alokasi port untuk project (inklusif).
+  range: [10000, 65535]
+  # Port yang tidak boleh dialokasikan ke project.
+  reserved: [22, 80, 443, 8080, 8097]
+
+supervisor:
+  # Interval polling status proses (detik).
+  poll_interval_sec: 5
+  # Urutan backoff antar restart (detik) — dipakai berurutan lalu cap di nilai terakhir.
+  backoff_seq: [5, 15, 30, 60, 120]
+  # Batas restart dalam stable_window sebelum menandai failed.
+  max_restarts: 5
+  # Jendela waktu (detik) proses dianggap stabil setelah hidup tanpa restart.
+  stable_window_sec: 600
+
+health:
+  # Interval default health check per project (detik), bisa dioverride per project.
+  default_interval_sec: 30
+
+backup:
+  # Interval backup berkala (jam).
+  interval_hours: 6
+  retention:
+    # Jumlah maksimum file backup disimpan per kategori.
+    latest: 3
+    daily: 7
+    weekly: 4
+
+storage:
+  # Ambang warning free space (%). Di bawah ini → tampil peringatan.
+  warn_pct: 20
+  # Ambang kritis free space (%). Di bawah ini → blok backup/restore baru.
+  crit_pct: 10
+  # Ukuran maksimum total folder backup (MB). Melebihi → prune & tampil warning.
+  max_backup_size_mb: 2048
+
+panel:
+  # Port HTTP panel.
+  port: 8080
+  # TTL session login (menit).
+  session_ttl_min: 480
+
+worker:
+  # Ukuran pool worker untuk job berat (backup, export, restore, dsb).
+  pool: 4
+  # Kapasitas antrean job. Job baru ditolak saat penuh.
+  queue_cap: 32
+
+runner:
+  # Mode GitHub Actions runner:
+  #   off     — tidak ada runner aktif (default dev)
+  #   actions — runner job via GitHub Actions
+  mode: "off"
+  # Budget menit job runner per siklus.
+  job_minutes_budget: 300
+  # Waktu drain (menit) sebelum runner dipaksa berhenti.
+  drain_minutes: 15
+
+tunnel:
+  # Provider tunnel eksternal. "none" = tidak ada (default dev).
+  provider: "none"

@@ -1,0 +1,86 @@
+<!doctype html>
+<!--
+  VPANEL template: login.html
+  Pre-auth page. Centered card on near-black; no sidebar, no nav.
+
+  VARS (written as [key|raw] here to avoid template substitution
+  inside this comment; the real placeholders use double braces):
+
+    [banner|raw]  optional system banner. Fragment of one or more
+                  div.alert.alert--info|--warn|--error elements, or
+                  empty string.
+    [flash|raw]   one-shot session flash (e.g. "Signed out.").
+                  Same fragment shape as banner, or empty string.
+    [error|raw]   login failure box. Expected:
+                  <div class="alert alert--error" role="alert">...</div>
+                  or empty string.
+
+  Intentionally NOT used on this page: [nav|raw] and [user] — the
+  operator has no session yet. The server may pass empty strings.
+
+  Static form posts to /login. Adjust action/name attrs if the
+  server routes differ. Password/TOTP handling is server-side.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Sign in — VPANEL</title>
+  <link rel="stylesheet" href="/static/panel.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+</head>
+<body class="auth">
+  <main class="auth__wrap">
+    <h1 class="sr-only">Sign in to VPANEL</h1>
+
+    <div class="notices auth__notices">
+      {{banner|raw}}
+      {{flash|raw}}
+    </div>
+
+    <section class="auth__card">
+      <div class="auth__brand">
+        <span class="brand__mark">VPANEL</span>
+        <span class="auth__brand-sub">VM deployment manager — operator sign-in</span>
+      </div>
+
+      {{error|raw}}
+
+      <form class="auth__form" method="post" action="/login">
+        <div class="field">
+          <label class="field__label" for="username">Username</label>
+          <input class="field__input" type="text" id="username" name="username"
+                 autocomplete="username" autocapitalize="none" spellcheck="false"
+                 required autofocus>
+        </div>
+
+        <div class="field">
+          <label class="field__label" for="password">Password</label>
+          <input class="field__input" type="password" id="password" name="password"
+                 autocomplete="current-password" required>
+        </div>
+
+        <div class="field">
+          <label class="field__label" for="totp">2FA code</label>
+          <input class="field__input field__input--mono" type="text" id="totp" name="totp"
+                 inputmode="numeric" autocomplete="one-time-code" maxlength="6"
+                 placeholder="000000">
+          <p class="field__hint">6-digit code from your authenticator app. Leave blank if 2FA is not enabled.</p>
+        </div>
+
+        <button class="btn btn--primary btn--block" type="submit">Sign in</button>
+      </form>
+
+      <p class="auth__note">After 5 failed attempts the account is locked for 15 minutes.</p>
+    </section>
+
+    <footer class="auth__foot">
+      <span class="mono">VPANEL</span>
+      <span>Unauthorized access is prohibited. All sign-in attempts are logged.</span>
+    </footer>
+  </main>
+
+  <script src="/static/panel.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,123 @@
+<!doctype html>
+<!--
+  VPANEL template: health.html
+  Aggregate health view: one section per service with current
+  status and the latest checks. Requires a session.
+
+  VARS (written as [key|raw] here to avoid template substitution
+  inside this comment; the real placeholders use double braces):
+
+    [nav|raw]           sidebar nav fragment, "Health" active.
+    [user]              escaped username.
+    [banner|raw]        optional banner fragment (div.alert...), or empty.
+    [flash|raw]         one-shot flash fragment, or empty.
+    [healthSections|raw] one or more cards, suggested shape per service:
+                        <section class="card">
+                          <header class="card__header">
+                            <h2 class="card__title">
+                              api-gateway
+                              <span class="status">
+                                <span class="dot dot--healthy" role="img"
+                                  aria-label="status: healthy"></span>
+                                healthy
+                              </span>
+                            </h2>
+                            <span class="mono muted">svc_01ABC...</span>
+                          </header>
+                          <div class="card__body">
+                            <div class="table-wrap">
+                              <table class="table">
+                                <thead><tr>
+                                  <th scope="col">Time UTC</th>
+                                  <th scope="col">Type</th>
+                                  <th scope="col">Latency</th>
+                                  <th scope="col">Result</th>
+                                  <th scope="col">Detail</th>
+                                </tr></thead>
+                                <tbody>
+                                  <tr>
+                                    <td class="mono">2026-09-04 12:00:30</td>
+                                    <td class="mono">http</td>
+                                    <td class="mono">12 ms</td>
+                                    <td><span class="badge badge--ok">pass</span></td>
+                                    <td class="mono muted">200 OK</td>
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        </section>
+                        (show the last 5-10 checks per service; latency
+                        and errors in mono). If there are no services:
+                        <div class="empty">
+                          <p class="empty__title">No health data.</p>
+                          <p class="empty__hint">Health checks appear once
+                            services are deployed.</p>
+                        </div>
+
+    Result badge mapping: pass=badge--ok, warn=badge--warn,
+    fail=badge--err, timeout/skipped=badge.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Health — VPANEL</title>
+  <link rel="stylesheet" href="/static/panel.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="app">
+    <aside class="app__sidebar">
+      <div class="brand">
+        <a class="brand__mark" href="/dashboard">VPANEL</a>
+        <span class="brand__sub">VM-Panel</span>
+      </div>
+      {{nav|raw}}
+      <div class="app__sidebar-foot">VM-Panel · operations console</div>
+    </aside>
+
+    <div class="app__main">
+      <header class="topbar">
+        <span class="topbar__user">{{user}}</span>
+        <form method="post" action="/logout">
+          <button class="btn btn--ghost" type="submit">Log out</button>
+        </form>
+      </header>
+
+      <div class="notices">
+        {{banner|raw}}
+        {{flash|raw}}
+      </div>
+
+      <main class="page" id="main">
+        <div class="page__header">
+          <div>
+            <h1 class="page__title">Health</h1>
+            <p class="page__meta">Latest check results per service</p>
+          </div>
+          <ul class="legend" aria-label="Status legend">
+            <li class="legend__item"><span class="dot dot--healthy" aria-hidden="true"></span> healthy</li>
+            <li class="legend__item"><span class="dot dot--degraded" aria-hidden="true"></span> degraded</li>
+            <li class="legend__item"><span class="dot dot--unhealthy" aria-hidden="true"></span> unhealthy</li>
+            <li class="legend__item"><span class="dot dot--unknown" aria-hidden="true"></span> unknown</li>
+          </ul>
+        </div>
+
+        <div class="page__stack">
+          {{healthSections|raw}}
+        </div>
+      </main>
+
+      <footer class="footer">
+        <span class="mono">VPANEL</span>
+        <span>Checks run on a 30s interval per service by default.</span>
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/panel.js" defer></script>
+</body>
+</html>

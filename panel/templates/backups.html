@@ -1,0 +1,137 @@
+<!doctype html>
+<!--
+  VPANEL template: backups.html
+  Backup inventory + manual controls. Requires a session.
+
+  VARS (written as [key|raw] here to avoid template substitution
+  inside this comment; the real placeholders use double braces):
+
+    [nav|raw]           sidebar nav fragment, "Backups" active.
+    [user]              escaped username.
+    [banner|raw]        optional banner fragment (div.alert...), or empty.
+    [flash|raw]         one-shot flash fragment, or empty.
+    [backupControls|raw] full controls card (server decides visibility
+                        by role), suggested shape:
+                        <section class="card">
+                          <header class="card__header">
+                            <h2 class="card__title">Backup controls</h2>
+                          </header>
+                          <div class="card__body">
+                            <div class="page__actions">
+                              <form method="post" action="/backups/create">
+                                <button class="btn btn--primary" type="submit"
+                                  data-confirm="Create a backup now?">Create backup</button>
+                              </form>
+                              <form method="post" action="/backups/export">
+                                <button class="btn btn--ghost" type="submit">Export</button>
+                              </form>
+                            </div>
+                            <p class="field__hint">Backups pause deployments
+                              while running. Manual and export backups are
+                              never deleted by retention.</p>
+                          </div>
+                        </section>
+                        or empty string (role without permission).
+    [backupsTable|raw]  either the backups table:
+                        <div class="table-wrap">
+                          <table class="table">
+                            <thead><tr>
+                              <th scope="col">ID</th>
+                              <th scope="col">Class</th>
+                              <th scope="col">Size</th>
+                              <th scope="col">SHA-256 (8)</th>
+                              <th scope="col">Verified</th>
+                              <th scope="col">Created UTC</th>
+                              <th scope="col">Actions</th>
+                            </tr></thead>
+                            <tbody>
+                              <tr>
+                                <td class="mono">bak_01ABC...</td>
+                                <td><span class="badge">daily</span></td>
+                                <td class="mono">48.2 MB</td>
+                                <td class="mono">3f9c1a2b</td>
+                                <td><span class="badge badge--ok">valid</span></td>
+                                <td class="mono">2026-09-04 04:00 UTC</td>
+                                <td>
+                                  <div class="table__actions">
+                                    <form method="post" action="/backups/bak_.../restore">
+                                      <button class="btn btn--sm btn--danger" type="submit"
+                                        data-confirm="Restore backup bak_...?"
+                                        data-confirm-detail="Current state is replaced. Services restart on restored data."
+                                        data-confirm-phrase="bak_...">Restore</button>
+                                    </form>
+                                  </div>
+                                </td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
+                        or the empty state:
+                        <div class="empty">
+                          <p class="empty__title">No backups.</p>
+                          <p class="empty__hint">Create one manually or wait
+                            for the scheduled backup.</p>
+                        </div>
+
+    Verification badge mapping: valid=badge--ok, pending=badge,
+    failed/corrupt=badge--err. Retention classes: latest, daily,
+    weekly, manual, export, failed.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Backups — VPANEL</title>
+  <link rel="stylesheet" href="/static/panel.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="app">
+    <aside class="app__sidebar">
+      <div class="brand">
+        <a class="brand__mark" href="/dashboard">VPANEL</a>
+        <span class="brand__sub">VM-Panel</span>
+      </div>
+      {{nav|raw}}
+      <div class="app__sidebar-foot">VM-Panel · operations console</div>
+    </aside>
+
+    <div class="app__main">
+      <header class="topbar">
+        <span class="topbar__user">{{user}}</span>
+        <form method="post" action="/logout">
+          <button class="btn btn--ghost" type="submit">Log out</button>
+        </form>
+      </header>
+
+      <div class="notices">
+        {{banner|raw}}
+        {{flash|raw}}
+      </div>
+
+      <main class="page" id="main">
+        <div class="page__header">
+          <div>
+            <h1 class="page__title">Backups</h1>
+            <p class="page__meta">Snapshots, verification status and restore points</p>
+          </div>
+        </div>
+
+        <div class="page__stack">
+          {{backupControls|raw}}
+          {{backupsTable|raw}}
+        </div>
+      </main>
+
+      <footer class="footer">
+        <span class="mono">VPANEL</span>
+        <span>Restore replaces current state; the manager takes a pre-restore backup first.</span>
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/panel.js" defer></script>
+</body>
+</html>

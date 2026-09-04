@@ -1,0 +1,18 @@
+node_modules/
+.env
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.db.corrupt
+runtime/
+logs/
+backups/
+secrets/vault.enc
+secrets/vault.enc.tmp
+projects/workspaces/
+*.tmp
+coverage/
+.nyc_output/
+
+# atomic-write temp files
+*.tmp-*

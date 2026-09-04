@@ -1,0 +1,125 @@
+<!doctype html>
+<!--
+  VPANEL template: users.html
+  User list + owner-only administration form. Requires a session.
+
+  VARS (written as [key|raw] here to avoid template substitution
+  inside this comment; the real placeholders use double braces):
+
+    [nav|raw]          sidebar nav fragment, "Users" active.
+    [user]             escaped username.
+    [banner|raw]       optional banner fragment (div.alert...), or empty.
+    [flash|raw]        one-shot flash fragment, or empty.
+    [usersTable|raw]   the users table:
+                       <div class="table-wrap">
+                         <table class="table">
+                           <thead><tr>
+                             <th scope="col">Username</th>
+                             <th scope="col">Role</th>
+                             <th scope="col">Status</th>
+                             <th scope="col">Last login UTC</th>
+                           </tr></thead>
+                           <tbody>
+                             <tr>
+                               <td>owner</td>
+                               <td><span class="badge badge--accent">owner</span></td>
+                               <td><span class="status">
+                                 <span class="dot dot--healthy" role="img"
+                                   aria-label="status: active"></span> active</span></td>
+                               <td class="mono">2026-09-04 08:12 UTC</td>
+                             </tr>
+                           </tbody>
+                         </table>
+                       </div>
+    [usersAdminForm|raw] owner-only administration card; pass the FULL
+                       card for owners, empty string for other roles:
+                       <section class="card">
+                         <header class="card__header">
+                           <h2 class="card__title">User administration</h2>
+                         </header>
+                         <div class="card__body">
+                           <form method="post" action="/users/create" class="stack">
+                             <div class="field">
+                               <label class="field__label" for="u-username">Username</label>
+                               <input class="field__input" id="u-username" name="username"
+                                 autocomplete="off" spellcheck="false" required>
+                             </div>
+                             <div class="field">
+                               <label class="field__label" for="u-role">Role</label>
+                               <select class="field__input" id="u-role" name="role">
+                                 <option value="viewer">viewer</option>
+                                 <option value="operator">operator</option>
+                                 <option value="owner">owner</option>
+                               </select>
+                             </div>
+                             <button class="btn btn--primary" type="submit">Create user</button>
+                           </form>
+                           (additional forms: approve pending user,
+                            set role — one form per action, each with
+                            programmatic labels)
+                         </div>
+                       </section>
+
+    Notes: newly created users start as "pending" until approved by an
+    owner (admin approval flow). Role badges: owner=badge--accent,
+    operator=badge, viewer=badge. Status dots: active=dot--healthy,
+    pending=dot--degraded, locked=dot--unhealthy, disabled=dot--disabled.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Users — VPANEL</title>
+  <link rel="stylesheet" href="/static/panel.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="app">
+    <aside class="app__sidebar">
+      <div class="brand">
+        <a class="brand__mark" href="/dashboard">VPANEL</a>
+        <span class="brand__sub">VM-Panel</span>
+      </div>
+      {{nav|raw}}
+      <div class="app__sidebar-foot">VM-Panel · operations console</div>
+    </aside>
+
+    <div class="app__main">
+      <header class="topbar">
+        <span class="topbar__user">{{user}}</span>
+        <form method="post" action="/logout">
+          <button class="btn btn--ghost" type="submit">Log out</button>
+        </form>
+      </header>
+
+      <div class="notices">
+        {{banner|raw}}
+        {{flash|raw}}
+      </div>
+
+      <main class="page" id="main">
+        <div class="page__header">
+          <div>
+            <h1 class="page__title">Users</h1>
+            <p class="page__meta">Panel operators, roles and access state</p>
+          </div>
+        </div>
+
+        <div class="page__stack">
+          {{usersTable|raw}}
+          {{usersAdminForm|raw}}
+        </div>
+      </main>
+
+      <footer class="footer">
+        <span class="mono">VPANEL</span>
+        <span>Only owners can create, approve or reassign users.</span>
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/panel.js" defer></script>
+</body>
+</html>

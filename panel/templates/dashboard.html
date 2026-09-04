@@ -1,0 +1,119 @@
+<!doctype html>
+<!--
+  VPANEL template: dashboard.html
+  Operational overview: system health, resources, runner state,
+  port registry, recent alerts. Requires a session.
+
+  VARS (written as [key|raw] here to avoid template substitution
+  inside this comment; the real placeholders use double braces):
+
+    [nav|raw]         sidebar/topbar nav fragment:
+                      <nav class="nav" aria-label="Primary">
+                        <ul>
+                          <li><a href="/dashboard" class="nav__link--active"
+                             aria-current="page">Dashboard</a></li>
+                          ...
+                        </ul>
+                      </nav>
+                      Mark the active item with nav__link--active +
+                      aria-current="page".
+    [user]            escaped username, e.g. "owner". If the server
+                      has no display name, pass the username.
+    [banner|raw]      optional system banner. Fragment of one or more
+                      div.alert.alert--info|--warn|--error, or empty.
+    [flash|raw]       one-shot session flash, same fragment shape, or empty.
+    [systemCards|raw] grid of status cards. Suggested fragment:
+                      <div class="grid grid--3">
+                        <section class="card">
+                          <header class="card__header">
+                            <h2 class="card__title">System status</h2>
+                          </header>
+                          <div class="card__body">
+                            <dl class="kv">
+                              <dt class="kv__key">VM uptime</dt>
+                              <dd class="kv__value mono">3d 04:12:51</dd>
+                              ...
+                            </dl>
+                          </div>
+                        </section>
+                        <section class="card">... Resources (use .bar /
+                          .bar__head / .bar__track / .bar__fill) ...</section>
+                        <section class="card">... Runner (phase, expires,
+                          chain depth, mono values) ...</section>
+                      </div>
+                      Card titles: System status, Resources, Runner.
+    [alertsTable|raw] "Recent alerts" card containing either a table
+                      (class "table" inside div.table-wrap; th: Time UTC,
+                      Level, Project, Message) or an empty-state:
+                      <div class="empty">
+                        <p class="empty__title">No recent alerts.</p>
+                        <p class="empty__hint">Alerts appear when checks
+                          fail or thresholds are exceeded.</p>
+                      </div>
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Dashboard — VPANEL</title>
+  <link rel="stylesheet" href="/static/panel.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="app">
+    <aside class="app__sidebar">
+      <div class="brand">
+        <a class="brand__mark" href="/dashboard">VPANEL</a>
+        <span class="brand__sub">VM-Panel</span>
+      </div>
+      {{nav|raw}}
+      <div class="app__sidebar-foot">VM-Panel · operations console</div>
+    </aside>
+
+    <div class="app__main">
+      <header class="topbar">
+        <span class="topbar__user">{{user}}</span>
+        <form method="post" action="/logout">
+          <button class="btn btn--ghost" type="submit">Log out</button>
+        </form>
+      </header>
+
+      <div class="notices">
+        {{banner|raw}}
+        {{flash|raw}}
+      </div>
+
+      <main class="page" id="main">
+        <div class="page__header">
+          <div>
+            <h1 class="page__title">Dashboard</h1>
+            <p class="page__meta">Host status, resources and recent alerts</p>
+          </div>
+        </div>
+
+        <div class="page__stack">
+          {{systemCards|raw}}
+
+          <section class="card">
+            <header class="card__header">
+              <h2 class="card__title">Recent alerts</h2>
+            </header>
+            <div class="card__body">
+              {{alertsTable|raw}}
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <footer class="footer">
+        <span class="mono">VPANEL</span>
+        <span>Values are sampled on page load; refresh for current state.</span>
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/panel.js" defer></script>
+</body>
+</html>

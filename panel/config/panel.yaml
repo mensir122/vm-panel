@@ -1,0 +1,19 @@
+# panel/config/panel.yaml — konfigurasi panel web (docs/DESIGN.md §2.5, §16).
+# Tidak ada credential di file ini — token manager dibaca dari token_file
+# (runtime/sockets/cli-token), master key dari env VPANEL_MASTER_KEY / meta.
+
+panel:
+  # Port HTTP panel (bind 127.0.0.1).
+  port: 8080
+  # TTL session login (menit) — 480 = 8 jam.
+  session_ttl_min: 480
+  # Rate limit global per-IP (request/menit).
+  rate_per_min: 60
+  # Rate limit khusus POST /login per-IP (percobaan/menit).
+  login_rate_per_min: 10
+
+manager:
+  # Port Manager API loopback yang dipanggil panel.
+  api_port: 8097
+  # File bearer token manager (relatif terhadap rootDir panel).
+  token_file: "runtime/sockets/cli-token"
