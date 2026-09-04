@@ -26,3 +26,15 @@ Harness: `tests/recovery/simulate.js` (DESIGN.md §19.3). Skenario 1-4, 8-11, 13
 
 Total: 7 skenario — semua PASS.
 
+
+## Failure Simulation Run + Live Chain Drill (GitHub Actions nyata)
+
+| Skenario | Run | Hasil | Bukti |
+|---|---|---|---|
+| Live chain drill 1 (graceful estafet) | 33872071325 | SUCCESS | restore-decrypt + verify + start + health gate + keepalive + drain + self-chain dispatch |
+| Live chain drill 2 (runner baru restore state TERENKRIPSI) | 33873428361 | restore=SUCCESS, health-gate=SUCCESS (dibatalkan setelah bukti tercapai) | artifact vm-state.enc (AES-256-GCM) didekripsi di runner baru |
+| Bug ditemukan & diperbaiki via drill nyata | 33860222597..33870967656 | 4 run | RUNNER_ID env leak (hermetic test), panel CLI entrypoint hilang, health probe tanpa bearer token, keepalive job-name + queued-run deteksi, restore extract path |
+| Roundtrip state terenkripsi (lokal) | state-container.test.js | 6/6 PASS | encrypt-decrypt, wrong-key, tamper, traversal, empty, usage |
+
+Tanggal: 2026-09-04 UTC. Repo: github.com/mensir122/vm-panel (public).
+Kesimpulan: self-chain + encrypted state roundtrip TERBUKTI bekerja di GitHub Actions nyata.
