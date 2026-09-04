@@ -20,11 +20,10 @@ permissions:
   actions: write
   contents: read
 
-timeout-minutes: 360
-
 jobs:
   vm:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     env:
       VPANEL_MASTER_KEY: ${{ secrets.VPANEL_MASTER_KEY }}
       RUNNER_ID: ${{ github.run_id }}
