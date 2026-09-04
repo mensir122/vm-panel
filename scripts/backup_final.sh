@@ -34,15 +34,19 @@ if [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
   B64=$(base64 -w0 runtime/vm-state.enc)
   vault_put() {
     local OLD_SHA="$1" BODY
-    BODY=$(node --input-type=module -e "
-      const args = process.argv.slice(2);
-      console.log(JSON.stringify({
-        message: args[0],
-        branch: 'state',
-        content: args[1],
-        sha: args[2] || undefined,
-      }));
-    " "${COMMIT_MSG}" "${B64}" "${OLD_SHA}")
+    # NB: kirim data via ENV, bukan argv — `node -e` punya model argv berbeda
+    # dari script biasa (argv[1] = argumen user pertama, tanpa placeholder).
+    BODY=$(
+      export COMMIT_MSG B64 OLD_SHA
+      node --input-type=module -e "
+        console.log(JSON.stringify({
+          message: process.env.COMMIT_MSG,
+          branch: 'state',
+          content: process.env.B64,
+          sha: process.env.OLD_SHA || undefined,
+        }));
+      "
+    )
     gh api -X PUT "repos/${REPO}/contents/vm-state.enc" --input - <<< "${BODY}" > /dev/null 2>&1
   }
   OLD_SHA=$(gh api "repos/${REPO}/contents/vm-state.enc?ref=state" --jq '.sha // empty' 2>/dev/null || true)
