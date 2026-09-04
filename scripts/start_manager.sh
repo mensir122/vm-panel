@@ -20,5 +20,8 @@ for i in $(seq 1 60); do
 done
 
 echo "[start_manager] GAGAL: manager tidak merespons dalam 60s"
-tail -n 50 logs/manager/manager-stdout.log || true
+echo "[start_manager] --- tail logs/manager/manager-stdout.log ---"
+tail -n 50 logs/manager/manager-stdout.log 2>/dev/null || true
+echo "[start_manager] --- tail logs/manager/manager.log (JSON) ---"
+tail -n 30 logs/manager/manager.log 2>/dev/null || true
 exit 1

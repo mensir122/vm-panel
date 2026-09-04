@@ -21,7 +21,7 @@ import os from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readFileSync } from 'node:fs';
 import { renderTemplate, escapeHtml } from './render.js';
 import { PanelAuth, SESSION_COOKIE, CSRF_COOKIE } from './auth.js';
@@ -1560,3 +1560,25 @@ export class PanelServer {
   }
 }
 
+
+/** CLI entrypoint langsung: `node panel/server/index.js`. */
+const isMain =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  const { loadConfig } = await import('../../lib/config.js');
+  const cfg = loadConfig({ rootDir: process.env.VPANEL_ROOT || process.cwd() });
+  const server = new PanelServer({
+    rootDir: cfg.rootDir,
+    dataDir: join(cfg.rootDir, 'data'),
+    config: cfg,
+  });
+  const addr = await server.start();
+  console.log(`[panel] listening on http://127.0.0.1:${addr.port}`);
+  const shutdown = async (sig) => {
+    console.log(`[panel] ${sig} — shutdown`);
+    await server.close();
+    process.exit(0);
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+}

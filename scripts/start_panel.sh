@@ -18,5 +18,6 @@ for i in $(seq 1 60); do
 done
 
 echo "[start_panel] GAGAL: panel tidak merespons dalam 60s"
-tail -n 50 logs/panel/panel-stdout.log || true
+echo "[start_panel] --- tail logs/panel/panel-stdout.log ---"
+tail -n 50 logs/panel/panel-stdout.log 2>/dev/null || true
 exit 1
