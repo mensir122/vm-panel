@@ -503,6 +503,53 @@ export class BackupManager {
     }
     return row;
   }
+
+  /**
+   * Daftarkan backup EKSTERNAL (mis. dari artifact GitHub Actions) ke katalog
+   * tanpa menyalin/memodifikasi isinya — dipakai scripts/restore_state.sh.
+   * Path dituliskan apa adanya; manifest dibaca untuk metadata (size, sha).
+   * @param {{backupId: string, dir: string, trigger?: string,
+   *          retentionClass?: string, runnerId?: string}} ext
+   */
+  catalogExternal(ext) {
+    if (!ext?.backupId || !ext?.dir) {
+      throw new VmPanelError(VALIDATION, 'catalogExternal: backupId & dir wajib');
+    }
+    const manifestPath = path.join(ext.dir, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) {
+      throw new VmPanelError(NOT_FOUND, `manifest tidak ada di ${ext.dir}`);
+    }
+    const manifest = readJson(manifestPath);
+    const bk = this._backupsDb();
+    const existing = bk.db
+      .prepare('SELECT id FROM backups WHERE id = ?')
+      .get(String(ext.backupId));
+    if (existing) {
+      return { cataloged: false, reason: 'sudah ada di katalog' };
+    }
+    const dirSize = manifest.totalSize ?? 0;
+    bk.db
+      .prepare(
+        `INSERT INTO backups (
+           id, project_id, at, trigger, file_path, file_size, sha256,
+           db_status, upload_status, verification_status, retention_class,
+           runner_id, error
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'external', 'pending', ?, ?, NULL)`,
+      )
+      .run(
+        String(ext.backupId),
+        manifest.projectId ?? null,
+        manifest.createdAt ?? new Date().toISOString(),
+        ext.trigger ?? 'external',
+        ext.dir,
+        dirSize,
+        manifest.totalSha256 ?? null,
+        'external',
+        ext.retentionClass ?? 'latest',
+        ext.runnerId ?? process.env.RUNNER_ID ?? 'local',
+      );
+    return { cataloged: true, backupId: ext.backupId };
+  }
 }
 
 export default BackupManager;

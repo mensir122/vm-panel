@@ -6,11 +6,22 @@
 # - Anti split-brain: concurrency group + cek run in_progress lain + drain
 #   berbasis job started_at (bukan jam runner) + final backup + health gate.
 # - TANPA PAT: hanya GITHUB_TOKEN default.
+# - Repo PUBLIC: state artifact WAJIB terenkripsi (runtime/vm-state.enc,
+#   AES-256-GCM atas VPANEL_MASTER_KEY) — lihat scripts/state-container.mjs.
 
 name: vm
 
 on:
   workflow_dispatch:
+    inputs:
+      drill_job_minutes:
+        description: 'Budget menit job untuk drill (default 360 = produksi)'
+        required: false
+        default: '360'
+      drill_drain_minutes:
+        description: 'Drain mulai t-N menit (default 15)'
+        required: false
+        default: '15'
 
 concurrency:
   group: vm-chain
@@ -44,12 +55,13 @@ jobs:
       - name: Quick tests (unit only, batasi budget)
         run: npm run test:unit
 
-      - name: Restore state (backup terakhir dari artifact run sebelumnya)
+      - name: Restore state (unduh + dekripsi artifact run sebelumnya)
         id: restore
         run: bash scripts/restore_state.sh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ github.ref_name }}
+          VPANEL_MASTER_KEY: ${{ secrets.VPANEL_MASTER_KEY }}
 
       - name: Verify state integrity
         run: bash scripts/verify_state.sh
@@ -69,23 +81,26 @@ jobs:
         run: bash scripts/keepalive.sh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNNER_JOB_MINUTES: ${{ inputs.drill_job_minutes || '360' }}
+          RUNNER_DRAIN_MINUTES: ${{ inputs.drill_drain_minutes || '15' }}
 
       - name: Final backup sebelum shutdown
         if: always()
         run: bash scripts/backup_final.sh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNNER_ID: ${{ github.run_id }}
 
       - name: Graceful shutdown
         if: always()
         run: bash scripts/stop_all.sh
 
-      - name: Upload state artifact (untuk chain berikutnya)
+      - name: Upload state TERENKRIPSI (untuk chain berikutnya & restore data)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vm-state-${{ github.run_id }}
-          path: backups/
+          name: vm-state
+          path: runtime/vm-state.enc
           retention-days: 30
           if-no-files-found: warn
 
