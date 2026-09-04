@@ -49,8 +49,14 @@ while :; do
   fi
 
   # Health check periodik manager (jika mati → exit 1: health gate workflow).
+  # /health wajib bearer token (runtime/sockets/cli-token ditulis manager saat start).
   PORT="${MANAGER_API_PORT:-8097}"
-  if ! curl -sf -o /dev/null "http://127.0.0.1:${PORT}/health"; then
+  AUTH=()
+  if [ -f runtime/sockets/cli-token ] && [ -s runtime/sockets/cli-token ]; then
+    TOKEN=$(tr -d '[:space:]' < runtime/sockets/cli-token)
+    AUTH=(-H "Authorization: Bearer ${TOKEN}")
+  fi
+  if ! curl -sf --max-time 3 -o /dev/null "${AUTH[@]}" "http://127.0.0.1:${PORT}/health"; then
     echo "[keepalive] manager tidak merespons — cek apakah launcher masih hidup"
     if [ -f runtime/pid/manager-launcher.pid ] && ! kill -0 "$(cat runtime/pid/manager-launcher.pid)" 2>/dev/null; then
       echo "[keepalive] manager mati permanen → exit 1 (workflow health gate)"

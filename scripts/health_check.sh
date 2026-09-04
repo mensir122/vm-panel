@@ -6,12 +6,18 @@ set -euo pipefail
 MP="${MANAGER_API_PORT:-8097}"
 PP="${PANEL_PORT:-8080}"
 FAIL=0
+TOKEN_FILE="runtime/sockets/cli-token"
+AUTH=()
+if [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then
+  TOKEN=$(tr -d '[:space:]' < "$TOKEN_FILE")
+  AUTH=(-H "Authorization: Bearer ${TOKEN}")
+fi
 
-if curl -sf -o /dev/null "http://127.0.0.1:${MP}/health"; then
-  STATUS=$(curl -sf "http://127.0.0.1:${MP}/system/status" || echo '{}')
+if [ "${#AUTH[@]}" -gt 0 ] && curl -sf --max-time 3 -o /dev/null "${AUTH[@]}" "http://127.0.0.1:${MP}/health"; then
+  STATUS=$(curl -sf --max-time 3 "${AUTH[@]}" "http://127.0.0.1:${MP}/system/status" || echo '{}')
   echo "[health_check] manager: OK ${STATUS}"
 else
-  echo "[health_check] MANAGER DOWN"
+  echo "[health_check] MANAGER DOWN (atau token belum tersedia)"
   FAIL=1
 fi
 
