@@ -29,7 +29,7 @@ concurrency:
 
 permissions:
   actions: write
-  contents: read
+  contents: write   # vault branch 'state': commit vm-state.enc otomatis
 
 jobs:
   vm:

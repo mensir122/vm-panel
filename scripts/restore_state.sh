@@ -22,20 +22,17 @@ RUN_ID="${GITHUB_RUN_ID:-}"
 ART_ID=$(gh api "repos/${REPO}/actions/artifacts?name=vm-state" \
   --jq "[.artifacts[] | select(.expired == false and (.run_id|tostring) != \"${RUN_ID}\")][0].id // empty" 2>/dev/null || true)
 
-if [ -z "$ART_ID" ]; then
-  echo "[restore_state] tidak ada artifact state sebelumnya - FRESH START"
-  echo "restored_from=fresh" >> "${GITHUB_OUTPUT:-/dev/null}"
-  exit 0
-fi
-
-RUN_OF_ART=$(gh api "repos/${REPO}/actions/artifacts/${ART_ID}" --jq '.run_id')
-echo "[restore_state] unduh artifact ${ART_ID} (run ${RUN_OF_ART})"
 mkdir -p .state-download
-gh api "repos/${REPO}/actions/artifacts/${ART_ID}/zip" > .state-download/state.zip
+ENC_FILE=""
 
-# Ekstrak hanya file .enc (whitelist; tolak traversal) — LANGSUNG ke
-# .state-download/ agar find di bawah menemukannya.
-python3 - <<'PY'
+if [ -n "$ART_ID" ]; then
+  RUN_OF_ART=$(gh api "repos/${REPO}/actions/artifacts/${ART_ID}" --jq '.run_id')
+  echo "[restore_state] unduh artifact ${ART_ID} (run ${RUN_OF_ART})"
+  gh api "repos/${REPO}/actions/artifacts/${ART_ID}/zip" > .state-download/state.zip
+
+  # Ekstrak hanya file .enc (whitelist; tolak traversal) - LANGSUNG ke
+  # .state-download/ agar find di bawah menemukannya.
+  python3 - <<'PY'
 import zipfile
 z = zipfile.ZipFile('.state-download/state.zip')
 found = False
@@ -47,8 +44,24 @@ if not found:
     raise SystemExit('tidak ada file .enc di artifact')
 print("[restore_state] container .enc diekstrak")
 PY
-
-ENC_FILE=$(find .state-download -name '*.enc' | head -1)
+  ENC_FILE=$(find .state-download -name '*.enc' | head -1)
+  STATE_SOURCE="artifact run ${RUN_OF_ART}"
+else
+  # FALLBACK VAULT BRANCH: artifact tidak ada/kedaluwarsa -> ambil dari
+  # branch 'state' (backup permanen otomatis yang di-commit tiap shutdown).
+  echo "[restore_state] artifact tidak tersedia - coba vault branch 'state'..."
+  VAULT_SHA=$(gh api "repos/${REPO}/contents/vm-state.enc?ref=state" --jq '.sha // empty' 2>/dev/null || true)
+  if [ -n "$VAULT_SHA" ]; then
+    gh api "repos/${REPO}/contents/vm-state.enc?ref=state" --jq '.content' 2>/dev/null | base64 -d > .state-download/vm-state.enc
+    ENC_FILE=".state-download/vm-state.enc"
+    STATE_SOURCE="vault branch 'state'"
+    echo "[restore_state] container dari vault branch 'state' diunduh"
+  else
+    echo "[restore_state] tidak ada artifact DAN tidak ada vault branch 'state' - FRESH START"
+    echo "restored_from=fresh" >> "${GITHUB_OUTPUT:-/dev/null}"
+    exit 0
+  fi
+fi
 
 # Dekripsi container -> backups/ terisi ulang (plaintext hanya hidup di runner
 # ephemeral ini; sumber kebenaran tetap artifact terenkripsi).
