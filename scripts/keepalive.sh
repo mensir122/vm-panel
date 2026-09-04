@@ -43,7 +43,8 @@ while :; do
   NOW=$(date +%s)
 
   if [ "$NOW" -ge "$DRAIN_EPOCH" ]; then
-    echo "[keepalive] masuk drain window (t-${(( EXPIRES_EPOCH - NOW )) / 60} menit)"
+    REMAIN_MIN=$(( (EXPIRES_EPOCH - NOW) / 60 ))
+    echo "[keepalive] masuk drain window (t-${REMAIN_MIN} menit)"
     break
   fi
 

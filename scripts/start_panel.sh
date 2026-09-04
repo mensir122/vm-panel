@@ -9,9 +9,9 @@ nohup node panel/server/index.js >> logs/panel/panel-stdout.log 2>&1 &
 echo $! > runtime/pid/panel-launcher.pid
 
 PORT="${PANEL_PORT:-8080}"
-for i in $(seq 1 60); do
-  if curl -sf -o /dev/null "http://127.0.0.1:${PORT}/login"; then
-    echo "[start_panel] panel ok di port ${PORT}"
+for i in $(seq 1 120); do
+  if curl -sf --max-time 3 -o /dev/null "http://127.0.0.1:${PORT}/login"; then
+    echo "[start_panel] panel ok di port ${PORT} (detik ke-$i)"
     exit 0
   fi
   sleep 1
