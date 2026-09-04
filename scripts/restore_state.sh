@@ -33,14 +33,15 @@ echo "[restore_state] unduh artifact ${ART_ID} (run ${RUN_OF_ART})"
 mkdir -p .state-download
 gh api "repos/${REPO}/actions/artifacts/${ART_ID}/zip" > .state-download/state.zip
 
-# Ekstrak hanya file .enc (whitelist; tolak traversal).
+# Ekstrak hanya file .enc (whitelist; tolak traversal) — LANGSUNG ke
+# .state-download/ agar find di bawah menemukannya.
 python3 - <<'PY'
 import zipfile
 z = zipfile.ZipFile('.state-download/state.zip')
 found = False
 for n in z.namelist():
     if n.endswith('.enc') and '..' not in n:
-        z.extract(n)
+        z.extract(n, '.state-download')
         found = True
 if not found:
     raise SystemExit('tidak ada file .enc di artifact')
