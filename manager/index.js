@@ -503,6 +503,8 @@ export class Manager {
 const isMain =
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
+  const { loadDotEnv } = await import('../lib/env.js');
+  loadDotEnv(process.env.VPANEL_ROOT || process.cwd());
   const { loadConfig } = await import('../lib/config.js');
   const config = loadConfig({ rootDir: process.env.VPANEL_ROOT || process.cwd() });
   const manager = new Manager({ rootDir: config.rootDir, config });

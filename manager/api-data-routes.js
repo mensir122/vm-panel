@@ -18,6 +18,7 @@
 // message:'modul belum aktif'}}.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { VmPanelError, NOT_FOUND, VALIDATION } from '../lib/errors.js';
 
@@ -25,6 +26,7 @@ import { VmPanelError, NOT_FOUND, VALIDATION } from '../lib/errors.js';
 const LOG_TAIL_LINES = 200;
 const LIST_LIMIT_DEFAULT = 50;
 const LIST_LIMIT_MAX = 1000;
+const MB = 1024 * 1024;
 
 /** Modul manager belum aktif → 503 NOT_READY (dipetakan dispatcher api.js). */
 function notReady() {
@@ -67,6 +69,69 @@ function assertSafeId(id, label) {
     throw new VmPanelError(VALIDATION, `${label} tidak valid`, { [label]: id ?? null });
   }
   return id;
+}
+
+/**
+ * Spesifikasi host + pemakaian (GET /system/specs). CPU/mem via node:os;
+ * disk via fs.statfsSync(dataDir) (Node >= 18.15) — filesystem tanpa
+ * dukungan statfs → disk null (tidak boleh membuat route gagal).
+ * Semua nilai advisory, sampled on request.
+ */
+function collectSystemSpecs(dataDir) {
+  const cores = Math.max(os.cpus().length, 1);
+  const load1 = Math.round((os.loadavg()[0] ?? 0) * 100) / 100;
+  const loadPct = Math.max(0, Math.min(100, (load1 / cores) * 100));
+
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = Math.max(0, totalMem - freeMem);
+
+  let disk = null;
+  try {
+    const st = fs.statfsSync(dataDir);
+    const total = Number(st.blocks) * Number(st.bsize);
+    const free = Number(st.bavail) * Number(st.bsize);
+    const used = Math.max(0, total - free);
+    if (Number.isFinite(total) && total > 0) {
+      disk = {
+        totalMb: Math.round(total / MB),
+        usedMb: Math.round(used / MB),
+        freeMb: Math.round(free / MB),
+        usedPct: clampPct01((used / total) * 100),
+      };
+    }
+  } catch {
+    disk = null; // statfs tidak didukung fs/OS → disk tidak tersedia
+  }
+
+  return {
+    cpu: {
+      model: String(os.cpus()[0]?.model ?? 'unknown'),
+      cores,
+      load1,
+      usagePct: Math.round(loadPct * 100) / 100,
+    },
+    memory: {
+      totalMb: Math.round(totalMem / MB),
+      usedMb: Math.round(usedMem / MB),
+      freeMb: Math.round(freeMem / MB),
+      usedPct: clampPct01((usedMem / totalMem) * 100),
+    },
+    disk,
+    host: {
+      platform: process.platform,
+      osRelease: String(os.release()),
+      hostname: String(os.hostname()),
+      uptimeSec: Math.round(os.uptime()),
+      nodeVersion: process.version,
+    },
+  };
+}
+
+/** Persen 0..100 dibulatkan; input tak finite → 0. */
+function clampPct01(n) {
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, Math.round(n * 100) / 100));
 }
 
 /** Tail file: N baris terakhir. File tidak ada → NOT_FOUND. */
@@ -307,6 +372,14 @@ export function registerDataRoutes({ manager } = {}) {
           actor: user ?? 'system',
         });
       },
+    },
+
+    // ── system specs ────────────────────────────────────────────────────────
+    {
+      method: 'GET',
+      pattern: '/system/specs',
+      // Tanpa permission tambahan — bagian system, dibaca oleh panel dashboard.
+      handler: () => collectSystemSpecs(manager.dataDir),
     },
 
     // ── logs ────────────────────────────────────────────────────────────────

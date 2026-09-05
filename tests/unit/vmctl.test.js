@@ -133,13 +133,22 @@ describe('main() (level proses, tanpa spawn)', () => {
   });
 
   test('command tanpa token → exit 1 dengan pesan auth', async () => {
-    const prevToken = process.env.VM_PANEL_TOKEN;
+    // Hermetic: matikan env token DAN arahkan token-file ke path yang pasti
+    // tidak ada (di mesin dengan manager berjalan, cli-token nyata ada).
+    const prev = {
+      VM_PANEL_TOKEN: process.env.VM_PANEL_TOKEN,
+      VM_PANEL_TOKEN_FILE: process.env.VM_PANEL_TOKEN_FILE,
+    };
     delete process.env.VM_PANEL_TOKEN;
+    process.env.VM_PANEL_TOKEN_FILE = 'tests/.tmp-no-token/' + Date.now();
     try {
       const code = await main(['system', 'status']);
       assert.equal(code, 1);
     } finally {
-      if (prevToken !== undefined) process.env.VM_PANEL_TOKEN = prevToken;
+      if (prev.VM_PANEL_TOKEN !== undefined) process.env.VM_PANEL_TOKEN = prev.VM_PANEL_TOKEN;
+      else delete process.env.VM_PANEL_TOKEN;
+      if (prev.VM_PANEL_TOKEN_FILE !== undefined) process.env.VM_PANEL_TOKEN_FILE = prev.VM_PANEL_TOKEN_FILE;
+      else delete process.env.VM_PANEL_TOKEN_FILE;
     }
   });
 });

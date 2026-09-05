@@ -316,7 +316,14 @@ export class PanelAuth {
 
     // Faktor kedua wajib: TOTP (window ±1) ATAU recovery code sekali pakai
     let secondFactor = false;
-    const secretBase32 = this.#decryptTotpSecret(row.totp_secret);
+    let secretBase32 = null;
+    try {
+      secretBase32 = this.#decryptTotpSecret(row.totp_secret);
+    } catch {
+      // Kunci enkripsi tidak cocok (mis. master key berubah) — perlakukan
+      // sebagai 2FA gagal, JANGAN biarkan melempar 500 INTERNAL.
+      secretBase32 = null;
+    }
     if (secretBase32 && typeof totpCode === 'string' && totpCode.trim() !== '') {
       secondFactor = totpVerify(secretBase32, totpCode.trim(), { window: 1 });
     }

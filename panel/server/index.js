@@ -233,6 +233,20 @@ function fmtBytes(n) {
   return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
 }
 
+/** Megabyte → string manusiawi (MB/GB/TB); tak valid → '—'. */
+function fmtMb(mb) {
+  const m = Number(mb);
+  if (!Number.isFinite(m) || m < 0) return '—';
+  const units = ['MB', 'GB', 'TB'];
+  let v = m;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(1)} ${units[i]}`;
+}
+
 function clampPct(n) {
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(100, Math.round(n)));
@@ -841,15 +855,17 @@ export class PanelServer {
 
   async #pageDashboard(session, pathname) {
     this.#requirePermission(session, PAGE_ACTIONS['/']);
-    const [status, projects, services] = await Promise.all([
+    const [status, projects, services, specs] = await Promise.all([
       this.#managerGet('/system/status'),
       this.#managerGet('/projects'),
       this.#managerGet('/services'),
+      this.#managerGet('/system/specs'),
     ]);
     const rows = Array.isArray(projects.data) ? projects.data : [];
     const banner = status.ok && projects.ok ? '' : alertFrag('warn', MANAGER_DOWN_BANNER);
 
     const st = status.ok && status.data && typeof status.data === 'object' ? status.data : null;
+    const sp = specs.ok && specs.data && typeof specs.data === 'object' ? specs.data : null;
     const cpus = Math.max(os.cpus().length, 1);
     const loadPct = clampPct((os.loadavg()[0] / cpus) * 100);
     const memPct = clampPct(((os.totalmem() - os.freemem()) / os.totalmem()) * 100);
@@ -862,14 +878,35 @@ export class PanelServer {
       `<dt class="kv__key">Version</dt><dd class="kv__value mono">${escapeHtml(String(st?.version ?? '—'))}</dd>` +
       `<dt class="kv__key">PID</dt><dd class="kv__value mono">${escapeHtml(String(st?.pid ?? '—'))}</dd>` +
       `</dl></div></section>` +
-      `<section class="card"><header class="card__header"><h2 class="card__title">Resources</h2></header><div class="card__body">` +
-      `${barHtml('CPU load (advisory)', loadPct)}${barHtml('Memory used (advisory)', memPct)}` +
-      `<p class="field__hint">Host CPU/RAM via node:os — advisory, sampled on page load.</p>` +
-      `</div></section>` +
+      // Resources: data nyata dari manager /system/specs bila tersedia,
+      // fallback advisory node:os lokal (manager down) — graceful.
+      (sp
+        ? `<section class="card"><header class="card__header"><h2 class="card__title">Resources</h2></header><div class="card__body">` +
+          `${barHtml('CPU load (1m avg)', clampPct(sp.cpu?.usagePct))}` +
+          `${barHtml(`Memory used (${fmtMb(sp.memory?.usedMb)} / ${fmtMb(sp.memory?.totalMb)})`, clampPct(sp.memory?.usedPct))}` +
+          (sp.disk
+            ? barHtml(`Disk used (${fmtMb(sp.disk.usedMb)} / ${fmtMb(sp.disk.totalMb)})`, clampPct(sp.disk.usedPct))
+            : `<p class="field__hint">Disk usage is unavailable on this filesystem.</p>`) +
+          `<p class="field__hint">Host usage from manager /system/specs — sampled on page load.</p>` +
+          `</div></section>`
+        : `<section class="card"><header class="card__header"><h2 class="card__title">Resources</h2></header><div class="card__body">` +
+          `${barHtml('CPU load (advisory)', loadPct)}${barHtml('Memory used (advisory)', memPct)}` +
+          `<p class="field__hint">Host CPU/RAM via node:os — advisory, sampled on page load.</p>` +
+          `</div></section>`) +
       `<section class="card"><header class="card__header"><h2 class="card__title">Runner</h2></header><div class="card__body"><dl class="kv">` +
       `<dt class="kv__key">Runner ID</dt><dd class="kv__value mono">${escapeHtml(String(st?.runnerId ?? '—'))}</dd>` +
       `<dt class="kv__key">Phase</dt><dd class="kv__value mono">${escapeHtml(String(st?.status ?? 'unknown'))}</dd>` +
       `<dt class="kv__key">Started</dt><dd class="kv__value mono">${fmtTime(st?.startedAt ?? null)}</dd>` +
+      `</dl></div></section>` +
+      `<section class="card"><header class="card__header"><h2 class="card__title">Specs</h2></header><div class="card__body"><dl class="kv">` +
+      `<dt class="kv__key">CPU model</dt><dd class="kv__value mono">${escapeHtml(String(sp?.cpu?.model ?? '—'))}</dd>` +
+      `<dt class="kv__key">Cores</dt><dd class="kv__value mono">${escapeHtml(String(sp?.cpu?.cores ?? '—'))}</dd>` +
+      `<dt class="kv__key">Load (1m)</dt><dd class="kv__value mono">${escapeHtml(String(sp?.cpu?.load1 ?? '—'))}</dd>` +
+      `<dt class="kv__key">Platform</dt><dd class="kv__value mono">${escapeHtml(String(sp?.host?.platform ?? '—'))}</dd>` +
+      `<dt class="kv__key">OS release</dt><dd class="kv__value mono">${escapeHtml(String(sp?.host?.osRelease ?? '—'))}</dd>` +
+      `<dt class="kv__key">Hostname</dt><dd class="kv__value mono">${escapeHtml(String(sp?.host?.hostname ?? '—'))}</dd>` +
+      `<dt class="kv__key">Host uptime</dt><dd class="kv__value mono">${sp ? escapeHtml(fmtDuration(sp.host?.uptimeSec)) : '—'}</dd>` +
+      `<dt class="kv__key">Node</dt><dd class="kv__value mono">${escapeHtml(String(sp?.host?.nodeVersion ?? '—'))}</dd>` +
       `</dl></div></section></div>`;
 
     // Alerts: checks gagal/warn per service (best-effort; kosong → empty state).
@@ -1565,6 +1602,8 @@ export class PanelServer {
 const isMain =
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
+  const { loadDotEnv } = await import('../../lib/env.js');
+  loadDotEnv(process.env.VPANEL_ROOT || process.cwd());
   const { loadConfig } = await import('../../lib/config.js');
   const cfg = loadConfig({ rootDir: process.env.VPANEL_ROOT || process.cwd() });
   const server = new PanelServer({
@@ -1575,7 +1614,7 @@ if (isMain) {
   const addr = await server.start();
   console.log(`[panel] listening on http://127.0.0.1:${addr.port}`);
   const shutdown = async (sig) => {
-    console.log(`[panel] ${sig} � shutdown`);
+    console.log(`[panel] ${sig} � shutdown`);
     await server.close();
     process.exit(0);
   };

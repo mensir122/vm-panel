@@ -163,10 +163,16 @@ export function confirmPhrase(expected, input) {
   return input.trim() === expected;
 }
 
-/** Baca token dari runtime/sockets/cli-token (dibuat manager). Absen → undefined. */
+/** Baca token dari file cli-token (dibuat manager). Absen → undefined.
+ * Path bisa dioverride via env VM_PANEL_TOKEN_FILE (untuk hermetic test &
+ * konfigurasi custom). Default: runtime/sockets/cli-token di root repo. */
 function readTokenFile() {
   try {
-    const raw = readFileSync(new URL('../runtime/sockets/cli-token', import.meta.url), 'utf8');
+    const custom = process.env.VM_PANEL_TOKEN_FILE;
+    const p = custom
+      ? new URL(`file://${custom.replace(/\\/g, '/')}`)
+      : new URL('../runtime/sockets/cli-token', import.meta.url);
+    const raw = readFileSync(p, 'utf8');
     const tok = raw.trim();
     return tok ? tok : undefined;
   } catch {
