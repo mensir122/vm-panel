@@ -49,6 +49,9 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Runner specs (tercatat di log tiap siklus)
+        run: node -p "JSON.stringify((()=>{const os=require('os'),fs=require('fs');const s=fs.statfsSync('.');return {CPU:os.cpus()[0].model.trim(),Cores:os.cpus().length,RAM_GB:+(os.totalmem()/2**30).toFixed(1),Disk_free_GB:+(s.bfree*s.bsize/2**30).toFixed(1),Disk_total_GB:+(s.blocks*s.bsize/2**30).toFixed(1),OS:os.type()+' '+os.release()}})())"
+
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
