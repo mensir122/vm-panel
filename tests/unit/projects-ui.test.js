@@ -228,6 +228,25 @@ describe('projects-ui (kelola project via web)', () => {
     assert.ok(ctx.projectId && ctx.gitProjectId, 'link detail kedua project ada');
   });
 
+  test('(2b) GET /projects/:id (detail) → 200, bukan INTERNAL (regresi const→let)', async () => {
+    // Regresi: #pageProjectDetail pernah men-assign `project = projectFull`
+    // padahal dideklarasikan const → TypeError → halaman INTERNAL saat dibuka.
+    for (const id of [ctx.gitProjectId, ctx.projectId]) {
+      if (!id) continue;
+      // eslint-disable-next-line no-await-in-loop
+      const res = await req(ctx.port, 'GET', `/projects/${id}`, { jar: ctx.ownerJar });
+      assert.equal(res.status, 200, `detail ${id} harus 200`);
+      // eslint-disable-next-line no-await-in-loop
+      const text = await res.text();
+      assert.ok(!text.includes('Terjadi kesalahan internal'), `detail ${id} tidak boleh INTERNAL`);
+      // Kartu Deploy tampil dengan sumber yang benar (git project → repoUrl).
+      // eslint-disable-next-line no-await-in-loop
+      const res2 = await req(ctx.port, 'GET', `/projects/${id}`, { jar: ctx.ownerJar });
+      const t2 = await res2.text();
+      assert.ok(t2.includes('Deploy'), 'kartu Deploy ada di detail');
+    }
+  });
+
   test('(3) POST /projects/:id/deploy (repo_url git lokal) → success + service running + health ok', { skip: !gitAvailable }, async () => {
     const res = await req(ctx.port, 'POST', `/projects/${ctx.gitProjectId}/deploy`, {
       jar: ctx.ownerJar,

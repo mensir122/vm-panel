@@ -1085,7 +1085,10 @@ export class PanelServer {
       this.#managerGet('/deployments', { limit: 50 }),
     ]);
     const rows = Array.isArray(projects.data) ? projects.data : [];
-    const project = rows.find((p) => p && String(p.id ?? '') === String(id));
+    // NB: `let` — projectFull (record penuh dengan repoUrl/branch) menimpa
+    // variable ini; `const` di sini pernah menyebabkan TypeError → INTERNAL
+    // saat membuka halaman detail project (regresi: login-recovery test suite).
+    let project = rows.find((p) => p && String(p.id ?? '') === String(id));
     // NB: GET /projects (route inti) tidak membawa repoUrl → ambil record
     // penuh via data route /projects/:id untuk kartu Deploy (best-effort).
     let projectFull = null;
