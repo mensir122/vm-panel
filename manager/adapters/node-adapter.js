@@ -1,5 +1,9 @@
 // manager/adapters/node-adapter.js — adapter project Node.js (DESIGN.md §2.6 baris "node").
-// install: npm ci --ignore-scripts (pinned lockfile); start: node <main> dengan env PORT.
+// install: lockfile ada → npm ci --ignore-scripts (pinned); TANPA lockfile →
+// npm install --no-audit --no-fund; lalu npm run build bila scripts.build ada
+// (Next.js-style, env NEXT_TELEMETRY_DISABLED=1, timeout 15 menit, output clamp).
+// start: node <main> ATAU — bila tanpa main — `npm run start` (scripts.start),
+// keduanya dengan env PORT (npm path + NEXT_TELEMETRY_DISABLED=1).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,7 +12,48 @@ import { VmPanelError, VALIDATION, NOT_FOUND } from '../../lib/errors.js';
 import { BaseAdapter } from './base.js';
 
 const INSTALL_TIMEOUT_MS = 120_000; // §desain fase F2
+const BUILD_TIMEOUT_MS = 15 * 60_000; // build Next.js bisa 3-8 menit (budget 15)
 const OUTPUT_LIMIT = 4 * 1024; // output clamp 4KB
+
+/** npm executable sesuai platform (win32 → npm.cmd). */
+function npmExe() {
+  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
+}
+
+/**
+ * argv npm run <script> untuk ProcessManager spawn NO-SHELL:
+ * - POSIX: ['npm', ...] (spawn script shebang aman; sesuai kontrak adapter).
+ * - win32: [node, npm-cli.js, ...] — spawn 'npm.cmd' tanpa shell = EINVAL
+ *   (Node >= 20.12); node + npm-cli.js di samping process.execPath tetap
+ *   no-shell murni. npm-cli.js tidak ditemukan → VALIDATION.
+ */
+function npmRunArgv(args) {
+  if (process.platform !== 'win32') {
+    return ['npm', ...args];
+  }
+  const npmCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (!fs.existsSync(npmCli)) {
+    throw new VmPanelError(VALIDATION, 'npm-cli.js tidak ditemukan (instalasi Node tidak lengkap)', {
+      npmCli,
+    });
+  }
+  return [process.execPath, npmCli, ...args];
+}
+
+/** True jika workspace berisi package-lock.json (menentukan npm ci vs npm install). */
+function hasLockfile(workspace) {
+  try {
+    return fs.statSync(path.join(workspace, 'package-lock.json')).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** True jika pkg.scripts[name] string non-kosong. */
+function hasScript(pkg, name) {
+  const s = pkg?.scripts;
+  return !!(s && typeof s === 'object' && typeof s[name] === 'string' && s[name].trim() !== '');
+}
 
 /** Jalankan execFile (callback-style) sebagai Promise; err dibawa utuh (stdout/stderr menempel). */
 function runExecFile(ef, file, args, opts) {
@@ -91,9 +136,7 @@ export class NodeAdapter extends BaseAdapter {
     }
     const pkg = readPackageJson(workspace);
     const hasMain = typeof pkg.main === 'string' && pkg.main.trim() !== '';
-    const hasStart =
-      pkg.scripts && typeof pkg.scripts === 'object' &&
-      typeof pkg.scripts.start === 'string' && pkg.scripts.start.trim() !== '';
+    const hasStart = hasScript(pkg, 'start');
     if (!hasMain && !hasStart) {
       throw new VmPanelError(VALIDATION, 'node adapter requires main atau scripts.start', {
         workspacePath: workspace,
@@ -113,26 +156,70 @@ export class NodeAdapter extends BaseAdapter {
   }
 
   /**
-   * Instalasi dependency: `npm ci --ignore-scripts` di workspace, timeout 120s.
-   * Executable: win32 → 'npm.cmd', selain itu 'npm'.
+   * Instalasi dependency + build:
+   * - package-lock.json ADA → `npm ci --ignore-scripts` (pinned, perilaku lama).
+   * - TANPA lockfile → `npm install --no-audit --no-fund` (repo Next.js-style).
+   * - package.json punya scripts.build → `npm run build` setelah install
+   *   (env NEXT_TELEMETRY_DISABLED=1, timeout 15 menit; gagal → install gagal
+   *   dengan pesan jelas).
+   * Executable: win32 → 'npm.cmd' (via shell — Node >= 20.12 menolak spawn
+   * .cmd tanpa shell; argumen statis jadi aman), selain itu 'npm'.
    * @param {object} [ctx]
    * @param {{execFile?: Function}} [deps] injeksi eksekutor untuk testability
-   * @returns {Promise<{ok: boolean, output: string}>} output di-clamp 4KB
+   * @returns {Promise<{ok: boolean, steps: string[], output: string}>} output di-clamp 4KB
    */
   async install(ctx = {}, deps = {}) {
     const workspace = this.assertWorkspace(ctx);
     const ef = deps.execFile ?? execFile;
-    const exe = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-    const opts = { cwd: workspace, timeout: INSTALL_TIMEOUT_MS, windowsHide: true };
-    let output = '';
+    const exe = npmExe();
+    const baseOpts = {
+      cwd: workspace,
+      timeout: INSTALL_TIMEOUT_MS,
+      windowsHide: true,
+      ...(process.platform === 'win32' ? { shell: true } : {}),
+    };
+
+    const useCi = hasLockfile(workspace);
+    const installArgs = useCi
+      ? ['ci', '--ignore-scripts']
+      : ['install', '--no-audit', '--no-fund'];
+    const steps = [`install:${useCi ? 'ci' : 'install'}`];
+    const outputs = [];
     try {
-      const { stdout, stderr } = await runExecFile(ef, exe, ['ci', '--ignore-scripts'], opts);
-      output = String(stdout) + String(stderr);
-      return { ok: true, output: clampOutput(output) };
+      const { stdout, stderr } = await runExecFile(ef, exe, installArgs, baseOpts);
+      outputs.push(String(stdout), String(stderr));
     } catch (e) {
-      output = String(e?.stdout ?? '') + String(e?.stderr ?? '') + String(e?.message ?? '');
-      return { ok: false, output: clampOutput(output) };
+      const output = String(e?.stdout ?? '') + String(e?.stderr ?? '') + String(e?.message ?? '');
+      return { ok: false, steps, output: clampOutput(output) };
     }
+
+    // Build (opsional): scripts.build ada → npm run build SEBELUM service start.
+    let pkg = null;
+    try {
+      pkg = readPackageJson(workspace);
+    } catch {
+      pkg = null; // package.json korup/hilang — install sudah jalan, biarkan start/validate yang melapor
+    }
+    if (hasScript(pkg, 'build')) {
+      steps.push('build');
+      const buildOpts = {
+        ...baseOpts,
+        timeout: BUILD_TIMEOUT_MS,
+        env: { ...process.env, NEXT_TELEMETRY_DISABLED: '1' },
+      };
+      try {
+        const { stdout, stderr } = await runExecFile(ef, exe, ['run', 'build'], buildOpts);
+        outputs.push(String(stdout), String(stderr));
+      } catch (e) {
+        const output =
+          `npm run build gagal: ${String(e?.message ?? e)}\n` +
+          String(e?.stdout ?? '') +
+          String(e?.stderr ?? '');
+        return { ok: false, steps, output: clampOutput(output) };
+      }
+    }
+
+    return { ok: true, steps, output: clampOutput(outputs.join('\n')) };
   }
 
   /**
@@ -142,17 +229,53 @@ export class NodeAdapter extends BaseAdapter {
   startSpec(service = {}) {
     const workspace = this.assertWorkspace(service);
     const cfg = { ...this.config, ...service?.config };
-    const main = cfg.main ?? this.pkg?.main;
-    if (!main) {
-      throw new VmPanelError(VALIDATION, 'node adapter requires main (package.json "main")', {
-        workspacePath: workspace,
-      });
-    }
     const port = this.requirePort(service);
+
+    // Jalur npm (Next.js-style): flag eksplisit config.npmStart menang atas
+    // cfg.main — main stale dari revision lama tidak boleh dipakai.
+    if (cfg.npmStart !== true) {
+      const main = cfg.main ?? this.pkg?.main;
+      if (typeof main === 'string' && main.trim() !== '') {
+        return {
+          argv: [process.execPath, path.resolve(workspace, main)],
+          cwd: workspace,
+          env: { PORT: String(port) },
+          port,
+        };
+      }
+    }
+
+    // Tanpa cfg.main/pkg.main: baca package.json workspace — main ada → jalur
+    // node <main> (tahan banting bila service config tidak membawa main);
+    // scripts.start ada → `npm run start`; keduanya tidak ada → VALIDATION.
+    let pkg = this.pkg;
+    if (!pkg) {
+      try {
+        pkg = readPackageJson(workspace);
+      } catch {
+        pkg = null;
+      }
+    }
+    const wsMain = typeof pkg?.main === 'string' && pkg.main.trim() !== '' ? pkg.main : null;
+    if (wsMain) {
+      return {
+        argv: [process.execPath, path.resolve(workspace, wsMain)],
+        cwd: workspace,
+        env: { PORT: String(port) },
+        port,
+      };
+    }
+    if (!hasScript(pkg, 'start')) {
+      throw new VmPanelError(
+        VALIDATION,
+        'node adapter requires main (package.json "main") atau scripts.start',
+        { workspacePath: workspace },
+      );
+    }
     return {
-      argv: [process.execPath, path.resolve(workspace, main)],
+      argv: npmRunArgv(['run', 'start']),
       cwd: workspace,
-      env: { PORT: String(port) },
+      env: { PORT: String(port), NEXT_TELEMETRY_DISABLED: '1' },
       port,
     };
   }

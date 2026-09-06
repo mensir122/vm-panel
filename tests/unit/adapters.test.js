@@ -287,7 +287,7 @@ describe('node adapter', () => {
     assert.deepEqual(ad.healthCheckSpec({ config: { port: 8131, healthCheck: hc } }), hc);
   });
 
-  test('install: execFile di-inject — argv npm ci --ignore-scripts, cwd workspace, output clamp 4KB', async () => {
+  test('install: execFile di-inject — tanpa lockfile → npm install; output clamp 4KB', async () => {
     const ws = makeNodeFixture();
     const calls = [];
     const fakeExecFile = (file, args, opts, cb) => {
@@ -299,10 +299,61 @@ describe('node adapter', () => {
     assert.equal(calls.length, 1);
     const expectedExe = process.platform === 'win32' ? 'npm.cmd' : 'npm';
     assert.equal(calls[0].file, expectedExe);
-    assert.deepEqual(calls[0].args, ['ci', '--ignore-scripts']);
+    // Fallback baru: TANPA package-lock.json → npm install (bukan npm ci).
+    assert.deepEqual(calls[0].args, ['install', '--no-audit', '--no-fund']);
     assert.equal(calls[0].opts.cwd, ws);
     assert.ok(calls[0].opts.timeout <= 120_000);
     assert.ok(res.output.length <= 4096, `output: ${res.output.length}`);
+  });
+
+  test('install: dengan package-lock.json → npm ci --ignore-scripts', async () => {
+    const ws = makeNodeFixture();
+    fs.writeFileSync(path.join(ws, 'package-lock.json'), '{"lockfileVersion":3}');
+    const calls = [];
+    const fakeExecFile = (file, args, opts, cb) => {
+      calls.push({ file, args, opts });
+      cb(null, 'ok', '');
+    };
+    const res = await new NodeAdapter({ workspacePath: ws }).install({}, { execFile: fakeExecFile });
+    assert.equal(res.ok, true);
+    assert.deepEqual(calls[0].args, ['ci', '--ignore-scripts']);
+  });
+
+  test('install: scripts.build ada → npm run build dipanggil setelah install', async () => {
+    const ws = makeNodeFixture({ main: 'server.js' });
+    // tambahkan scripts.build ke package.json fixture
+    const pkgPath = path.join(ws, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    pkg.scripts = { ...(pkg.scripts ?? {}), build: 'node build.js' };
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg));
+    const calls = [];
+    const fakeExecFile = (file, args, opts, cb) => {
+      calls.push({ file, args, opts });
+      cb(null, 'ok', '');
+    };
+    const res = await new NodeAdapter({ workspacePath: ws }).install({}, { execFile: fakeExecFile });
+    assert.equal(res.ok, true);
+    assert.equal(calls.length, 2, 'install + build');
+    assert.deepEqual(calls[0].args, ['install', '--no-audit', '--no-fund']);
+    assert.deepEqual(calls[1].args, ['run', 'build']);
+  });
+
+  test('install: build gagal → ok:false dengan pesan build gagal', async () => {
+    const ws = makeNodeFixture({ main: 'server.js' });
+    const pkgPath = path.join(ws, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    pkg.scripts = { ...(pkg.scripts ?? {}), build: 'node build.js' };
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg));
+    const calls = [];
+    const fakeExecFile = (file, args, opts, cb) => {
+      calls.push({ file, args, opts });
+      if (calls.length === 2) cb(new Error('next build boom'));
+      else cb(null, 'ok', '');
+    };
+    const res = await new NodeAdapter({ workspacePath: ws }).install({}, { execFile: fakeExecFile });
+    assert.equal(res.ok, false);
+    assert.ok(res.output.includes('build gagal'));
+    assert.ok(res.output.includes('next build boom'));
   });
 
   test('install: kegagalan execFile → { ok: false } (tidak crash)', async () => {

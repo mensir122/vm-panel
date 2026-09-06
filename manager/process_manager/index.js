@@ -175,7 +175,11 @@ export class ProcessManager {
       env: finalEnv,
       stdio: ['ignore', 'ignore', 'ignore'],
       windowsHide: true,
-      detached: false,
+      // POSIX: detached = process group sendiri → stopProcess bisa mematikan
+      // SELURUH group (npm run start memunculkan child server; membunuh npm
+      // saja menyisakan zombie yang masih memegang port). Windows: taskkill
+      // /T sudah mematikan tree, detached tidak diperlukan.
+      detached: !IS_WIN,
       shell: false,
     });
 
@@ -280,20 +284,31 @@ export class ProcessManager {
         /* sudah mati / sudah tidak ada -> poll di bawah yang memutuskan */
       }
     } else {
+      // POSIX: detached spawn = child punya process group sendiri (-pid)
+      // → SIGTERM/SIGKILL ke group mematikan npm DAN child server sekaligus.
       try {
-        process.kill(pid, 'SIGTERM');
+        process.kill(-pid, 'SIGTERM');
       } catch {
-        /* sudah mati */
+        try {
+          process.kill(pid, 'SIGTERM');
+        } catch {
+          /* sudah mati */
+        }
       }
     }
 
     const dead = await this._waitForDeath(pid, startTimeHint, graceMs);
     if (!dead && !IS_WIN) {
-      // POSIX: eskalasi SIGKILL lalu tunggu sekali lagi.
+      // POSIX: eskalasi SIGKILL ke process group (detached spawn), fallback
+      // direct kill bila group sudah bubar.
       try {
-        process.kill(pid, 'SIGKILL');
+        process.kill(-pid, 'SIGKILL');
       } catch {
-        /* sudah mati */
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* sudah mati */
+        }
       }
       const deadAfterKill = await this._waitForDeath(pid, startTimeHint, graceMs);
       if (!deadAfterKill) {

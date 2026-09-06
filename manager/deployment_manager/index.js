@@ -390,7 +390,18 @@ export class DeploymentManager {
     if (project.type === 'node') {
       const adapter = createAdapter('node', { workspacePath: rootDir, config: {} });
       const v = adapter.validate({ workspacePath: rootDir });
-      return { main: v.main ?? null };
+      // main ada = jalur node <main> klasik. npmStart:false eksplisit agar
+      // re-deploy menimpa npmStart:true stale di config service lama.
+      if (v.main) return { main: v.main, npmStart: false };
+      // main null + scripts.start ada = project Next.js-style (npm run start)
+      // → TANPA key main sama sekali (bukan undefined) agar startSpec memilih
+      // jalur npm-script; sertakan port untuk startSpec di run berikutnya.
+      if (v.hasStart !== true) {
+        throw new VmPanelError(VALIDATION, 'node adapter requires main atau scripts.start', {
+          workspacePath: rootDir,
+        });
+      }
+      return { npmStart: true, ...(Number.isInteger(project.port) ? { port: project.port } : {}) };
     }
     if (project.type === 'python') {
       const adapter = createAdapter('python', { workspacePath: rootDir, config: {} });
@@ -432,6 +443,7 @@ export class DeploymentManager {
         return this.serviceManager.updateConfig(svc.id, {
           rootDir,
           ...cfgExtra,
+          ...(Number.isInteger(project.port) ? { port: project.port } : {}),
           ...(healthCheck ? { healthCheck } : {}),
         });
       }
@@ -450,7 +462,12 @@ export class DeploymentManager {
       name,
       type: project.type,
       port: project.port,
-      config: { rootDir, ...cfgExtra, ...(healthCheck ? { healthCheck } : {}) },
+      config: {
+        rootDir,
+        ...cfgExtra,
+        ...(Number.isInteger(project.port) ? { port: project.port } : {}),
+        ...(healthCheck ? { healthCheck } : {}),
+      },
     });
   }
 

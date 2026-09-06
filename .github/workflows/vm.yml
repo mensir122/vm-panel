@@ -79,6 +79,10 @@ jobs:
 
       - name: Health gate (manager + panel wajib lulus)
         run: bash scripts/health_check.sh
+      - name: Auto-deploy projects dari manifest
+        run: bash scripts/apply_projects.sh
+        env:
+          MANAGER_API_PORT: ${{ vars.MANAGER_API_PORT || '8097' }}
 
       - name: Services + supervisor + keepalive + self-chain
         run: bash scripts/keepalive.sh
