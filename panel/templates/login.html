@@ -64,9 +64,9 @@
         <div class="field">
           <label class="field__label" for="totp">2FA code</label>
           <input class="field__input field__input--mono" type="text" id="totp" name="totp"
-                 inputmode="numeric" autocomplete="one-time-code" maxlength="6"
-                 placeholder="000000">
-          <p class="field__hint">6-digit code from your authenticator app. Leave blank if 2FA is not enabled.</p>
+                 autocomplete="one-time-code" maxlength="8"
+                 placeholder="000000 / ab12cd34">
+          <p class="field__hint">Kode 6 digit dari authenticator, ATAU salah satu recovery code kamu (8 huruf). Kosongkan jika 2FA tidak aktif.</p>
         </div>
 
         <button class="btn btn--primary btn--block" type="submit">Sign in</button>
