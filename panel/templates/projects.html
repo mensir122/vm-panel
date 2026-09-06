@@ -11,6 +11,14 @@
     [user]              escaped username.
     [banner|raw]        optional banner fragment (div.alert...), or empty.
     [flash|raw]         one-shot flash fragment, or empty.
+    [githubSync|raw]    owner-only "GitHub Sync" card (section.card
+                        id="github-sync"), or empty for non-owner: shows the
+                        current projects.auto.json manifest content
+                        (<pre class="mono">) + project count + a
+                        "Sync ke GitHub" button
+                        (POST /projects/sync-to-github, CSRF hidden input,
+                        data-confirm="Commit projects.auto.json ke GitHub?")
+                        plus a green success alert with repo link after sync.
     [projectsTable|raw] either the registry table:
                         <div class="table-wrap">
                           <table class="table">
@@ -19,6 +27,7 @@
                               <th scope="col">Name</th>
                               <th scope="col">Type</th>
                               <th scope="col">Status</th>
+                              <th scope="col">Sync</th>
                               <th scope="col">Port</th>
                               <th scope="col">Last deploy</th>
                             </tr></thead>
@@ -99,6 +108,7 @@
         </div>
 
         <div class="page__stack">
+          {{githubSync|raw}}
           {{projectsTable|raw}}
         </div>
       </main>

@@ -5,7 +5,12 @@
 // (tidak crash). F4 Wave 2: halaman menarik data dari Manager API (/system/status,
 // /projects, /services, /deployments, /health-state, /recovery/status, /backups,
 // /audit, /logs/:serviceId) + aksi POST (/projects, /projects/:id/deploy,
-// /services/:id/start|stop|restart|retry, /backups). Render mengikuti kontrak
+// /projects/sync-to-github, /services/:id/start|stop|restart|retry, /backups).
+// Sync ke GitHub: POST /projects/sync-to-github (owner) menulis manifest
+// projects.auto.json di repo root lalu git add+commit+push origin main via
+// execFile (kredensial dari config git user — TIDAK ada token di kode);
+// GET /projects/sync-status membaca manifest dari disk.
+// Render mengikuti kontrak
 // VARS blok komentar templates (nav, user, banner, flash + fragmen raw per
 // halaman) memakai kelas CSS panel/static/panel.css (table, badge, dot, card,
 // grid, empty, bar, kv, log). First-run: GET/POST /bootstrap — token sekali-pakai
@@ -22,7 +27,9 @@ import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { renderTemplate, escapeHtml } from './render.js';
 import { PanelAuth, SESSION_COOKIE, CSRF_COOKIE } from './auth.js';
 import { ManagerClient } from '../../lib/api-client.js';
@@ -38,6 +45,14 @@ const DEFAULT_MANAGER_API_PORT = 8097;
 const MANAGER_DOWN_BANNER = 'Manager tidak terjangkau';
 const ENDPOINT_TODO_NOTE = 'endpoint belum tersedia (F5)';
 const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
+const GIT_TIMEOUT_MS = 60_000;
+const GIT_COMMIT_MSG = 'sync: update projects.auto.json dari panel';
+const GIT_PUSH_REF = 'main';
+/** Cache detail project (badge sync) — sejajar window rate limit manager. */
+const PROJECT_DETAIL_CACHE_TTL_MS = 60_000;
+const PROJECT_DETAIL_MAX = 100;
+/** execFile git tanpa shell (argumen aman); timeout melindungi dari hang. */
+const execFileP = promisify(execFile);
 const FAVICON_SVG =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E";
 
@@ -179,6 +194,20 @@ function badgeHtml(text, variant = '') {
   return `<span class="${cls}">${escapeHtml(String(text ?? ''))}</span>`;
 }
 
+/** Detail error git untuk pesan ke user — baris terakhir, tanpa kredensial URL. */
+function gitErrDetail(e) {
+  const raw =
+    String(e?.stderr ?? '').trim() || String(e?.stdout ?? '').trim() || String(e?.message ?? e ?? 'unknown error');
+  return raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(-3)
+    .join(' | ')
+    .replace(/(https?:\/\/)([^@/\s]+)@/i, '$1***@') // buang userinfo (token) dari URL
+    .slice(0, 300);
+}
+
 function deployBadgeVariant(status) {
   const s = String(status ?? '').toLowerCase();
   if (s === 'success') return 'ok';
@@ -309,6 +338,7 @@ export class PanelServer {
     this.#auth = new PanelAuth({ dataDir, auditManager, sessionTtlMs: ttlMin * 60_000 });
     this.#auditManager = auditManager ?? null;
     this.#managerClient = managerClient ?? null;
+    this.#rootDir = resolve(rootDir ?? process.cwd());
     this.#managerApiPort = cfg.manager?.apiPort ?? DEFAULT_MANAGER_API_PORT;
     this.#managerTokenFile = resolve(
       rootDir ?? process.cwd(),
@@ -336,6 +366,9 @@ export class PanelServer {
   #rateBuckets = new Map();
   #auditManager;
   #bootstrapTokens = new Map(); // token sekali-pakai → expiresAt (ms)
+  #rootDir; // repo root: lokasi projects.auto.json + cwd git sync
+  #lastSync = null; // hasil sync GitHub terakhir (alert sukses kartu GitHub Sync)
+  #detailCache = { at: 0, map: new Map() }; // name → repoUrl (badge sync, TTL)
 
   // --- lifecycle -----------------------------------------------------------
 
@@ -842,6 +875,10 @@ export class PanelServer {
       return this.#renderManaged(res, await this.#pageDashboard(session, pathname));
     }
     if (pathname === '/projects') return this.#renderManaged(res, await this.#pageProjects(session, pathname));
+    // NB: harus SEBELUM regex detail /projects/:id — 'sync-status' bukan id project.
+    if (pathname === '/projects/sync-status') {
+      return this.#sendJson(res, 200, this.#readManifestStatus());
+    }
     const detail = pathname.match(/^\/projects\/([^/]+)$/);
     if (detail) return this.#renderManaged(res, await this.#pageProjectDetail(session, detail[1], '/projects'));
     if (pathname === '/services') return this.#renderManaged(res, await this.#pageServices(session, pathname));
@@ -870,6 +907,198 @@ export class PanelServer {
       }
     }
     return this.#sendHtml(res, page.status ?? 200, html);
+  }
+
+  // --- sync ke GitHub (manifest projects.auto.json + git push) ---------------
+
+  /**
+   * Baca manifest projects.auto.json dari disk (repo root) — sumber untuk
+   * GET /projects/sync-status dan kartu GitHub Sync di halaman projects.
+   */
+  #readManifestStatus() {
+    const manifestPath = join(this.#rootDir, 'projects.auto.json');
+    try {
+      const raw = readFileSync(manifestPath, 'utf8');
+      const st = statSync(manifestPath);
+      let content = null;
+      try {
+        content = JSON.parse(raw);
+      } catch {
+        content = null; // JSON invalid → content null (exists tetap true)
+      }
+      return { exists: true, content, lastModified: st.mtime.toISOString() };
+    } catch {
+      return { exists: false, content: null, lastModified: null };
+    }
+  }
+
+  /** Detail semua project (camelCase repoUrl/branch/port) via GET /projects/:id. */
+  async #fetchProjectDetails() {
+    const list = await this.#managerGet('/projects');
+    if (!list.ok || !Array.isArray(list.data)) {
+      throw new VmPanelError('INTERNAL', 'Manager tidak terjangkau — daftar project tidak dapat dibaca. Pastikan manager berjalan lalu coba lagi.');
+    }
+    const details = [];
+    for (const row of list.data) {
+      const id = String(row?.id ?? '');
+      if (id === '') continue;
+      try {
+        const p = await this.#getManager().request('GET', `/projects/${encodeURIComponent(id)}`);
+        if (p && typeof p === 'object' && String(p.id ?? '') === id) details.push(p);
+      } catch {
+        /* detail gagal (dihapus konkuren/manager down) → skip project ini */
+      }
+    }
+    return details;
+  }
+
+  /**
+   * Peta name → repoUrl (untuk badge synced/lokal). GET /projects (inti) tidak
+   * membawa repoUrl → ambil via /projects/:id, di-cache in-memory TTL 60 dtk
+   * (sejajar rate limit manager per-token) supaya render halaman tidak
+   * meledakkan kuota manager. Fallback terakhir: repoUrl di manifest.
+   */
+  async #repoUrlMapForBadges(rows) {
+    const now = Date.now();
+    if (now - this.#detailCache.at > PROJECT_DETAIL_CACHE_TTL_MS) {
+      const map = new Map();
+      for (const row of rows.slice(0, PROJECT_DETAIL_MAX)) {
+        const id = String(row?.id ?? '');
+        if (id === '') continue;
+        try {
+          const p = await this.#getManager().request('GET', `/projects/${encodeURIComponent(id)}`);
+          if (p && typeof p === 'object' && String(p.id ?? '') === id) {
+            const name = String(p.name ?? '').trim();
+            if (name !== '' && typeof p.repoUrl === 'string' && p.repoUrl.trim() !== '') {
+              map.set(name, p.repoUrl.trim());
+            }
+          }
+        } catch {
+          /* detail gagal → project ini tanpa indikator sync */
+        }
+      }
+      this.#detailCache = { at: now, map };
+    }
+    const map = this.#detailCache.map;
+    // Fallback: project yang tidak ter-cache (baru dibuat) tapi sudah di
+    // manifest → anggap repo_url-nya dari manifest.
+    const manifest = this.#readManifestStatus();
+    const entries = Array.isArray(manifest.content) ? manifest.content : [];
+    for (const e of entries) {
+      const name = String(e?.name ?? '').trim();
+      if (name !== '' && !map.has(name) && typeof e?.repo_url === 'string' && e.repo_url.trim() !== '') {
+        map.set(name, e.repo_url.trim());
+      }
+    }
+    return map;
+  }
+
+  /** remote URL origin (best-effort) → URL web GitHub bila bisa dipetakan. */
+  async #gitRemoteWebUrl() {
+    try {
+      const { stdout } = await execFileP(
+        process.platform === 'win32' ? 'git.exe' : 'git',
+        ['remote', 'get-url', 'origin'],
+        { cwd: this.#rootDir, timeout: GIT_TIMEOUT_MS, windowsHide: true },
+      );
+      const s = String(stdout).trim();
+      if (/^https?:\/\//i.test(s)) return s.replace(/\.git\/?$/i, '');
+      const ssh = s.match(/^git@([^:]+):(.+?)(?:\.git)?$/);
+      if (ssh) return `https://${ssh[1]}/${ssh[2]}`;
+      return null; // path lokal/ssh lain → bukan link web
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Sync semua project (yang punya repo_url) ke manifest projects.auto.json
+   * di repo root, lalu git add + commit + push origin main — 3 perintah
+   * execFile TERPISAH, cwd repo root. Kredensial mengikuti konfigurasi git
+   * user (credential.helper yang sudah jalan) — TIDAK ada token di kode.
+   * Return {ok, projectCount, committed, repoUrl} atau {ok:false, message}.
+   */
+  async #runGithubSync() {
+    // (a+b) detail tiap project via /projects/:id; skip tanpa repo_url.
+    const detail = await this.#fetchProjectDetails();
+    const entries = detail
+      .filter((p) => typeof p?.repoUrl === 'string' && p.repoUrl.trim() !== '')
+      .map((p) => {
+        const port = Number(p.port);
+        return {
+          name: String(p.name ?? ''),
+          type: String(p.type ?? 'static'),
+          port: Number.isInteger(port) && port > 0 ? port : null,
+          repo_url: String(p.repoUrl).trim(),
+          git_branch: typeof p.branch === 'string' && p.branch.trim() !== '' ? p.branch.trim() : 'main',
+          enabled: true,
+        };
+      });
+
+    // (c) tulis manifest (JSON 2-space + newline) di repo root.
+    const manifestPath = join(this.#rootDir, 'projects.auto.json');
+    try {
+      writeFileSync(manifestPath, `${JSON.stringify(entries, null, 2)}\n`, 'utf8');
+    } catch (e) {
+      return { ok: false, message: `Gagal menulis projects.auto.json: ${gitErrDetail(e)}` };
+    }
+
+    const git = process.platform === 'win32' ? 'git.exe' : 'git';
+    const opts = { cwd: this.#rootDir, timeout: GIT_TIMEOUT_MS, windowsHide: true };
+
+    // (d1) git add
+    try {
+      await execFileP(git, ['add', 'projects.auto.json'], opts);
+    } catch (e) {
+      return { ok: false, message: `git add gagal — folder panel bukan repo git atau file tidak bisa di-stage. Detail: ${gitErrDetail(e)}` };
+    }
+
+    // (d2) git commit — "nothing to commit" (isi manifest sama) → bukan error.
+    let committed = true;
+    try {
+      await execFileP(git, ['commit', '-m', GIT_COMMIT_MSG], opts);
+    } catch (e) {
+      const out = `${e?.stdout ?? ''}\n${e?.stderr ?? ''}`;
+      if (/nothing to commit|no changes added/i.test(out)) {
+        committed = false;
+      } else {
+        return { ok: false, message: `git commit gagal — pastikan identitas git (user.name/user.email) sudah di-set di repo ini. Detail: ${gitErrDetail(e)}` };
+      }
+    }
+
+    // (d3) git push origin main — gagal → pesan pemula yang jelas.
+    try {
+      await execFileP(git, ['push', 'origin', GIT_PUSH_REF], opts);
+    } catch (e) {
+      return {
+        ok: false,
+        message: `git push gagal — pastikan remote origin sudah di-set dan kredensial GitHub valid. Detail: ${gitErrDetail(e)}`,
+      };
+    }
+
+    const repoUrl = await this.#gitRemoteWebUrl();
+    return { ok: true, projectCount: entries.length, committed, repoUrl };
+  }
+
+  /** POST /projects/sync-to-github (dipanggil dari #handleProtectedPost). */
+  async #handleSyncToGithubPost(session, res) {
+    let result;
+    try {
+      result = await this.#runGithubSync();
+    } catch (e) {
+      result = { ok: false, message: `Sync ke GitHub gagal: ${gitErrDetail(e)}` };
+    }
+    if (!result.ok) {
+      this.#lastSync = null; // jangan tampilkan alert sukses basi
+      const page = await this.#pageProjects(session, '/projects', {
+        banner: alertFrag('error', result.message),
+      });
+      return this.#renderManaged(res, { ...page, status: 502 });
+    }
+    // Alert sukses dirender #pageProjects dari #lastSync (in-memory, sekali
+    // sesi server) + redirect pola #handleProjectCreate.
+    this.#lastSync = { projectCount: result.projectCount, committed: result.committed, repoUrl: result.repoUrl ?? null, at: new Date().toISOString() };
+    return this.#redirect(res, '/projects');
   }
 
   async #pageDashboard(session, pathname) {
@@ -1015,6 +1244,17 @@ export class PanelServer {
       this.#managerGet('/deployments', { limit: 100 }),
     ]);
     const rows = Array.isArray(projects.data) ? projects.data : [];
+
+    // GitHub Sync: manifest projects.auto.json di disk → badge synced/lokal
+    // per row + kartu "GitHub Sync" (owner). repoUrl via cache TTL (lihat
+    // #repoUrlMapForBadges) — manager down → tanpa badge, halaman tetap render.
+    const manifest = this.#readManifestStatus();
+    const manifestEntries = Array.isArray(manifest.content) ? manifest.content : [];
+    const syncedNames = new Set(
+      manifestEntries.map((e) => String(e?.name ?? '').trim()).filter((n) => n !== ''),
+    );
+    const repoUrlByName = await this.#repoUrlMapForBadges(rows);
+
     const portByProject = new Map();
     if (services.ok && Array.isArray(services.data?.rows)) {
       for (const s of services.data.rows) {
@@ -1052,6 +1292,41 @@ export class PanelServer {
         `<button class="btn btn--primary" type="submit">Create project</button>` +
         `</form></div></section>`
       : alertFrag('info', 'Membuat project khusus owner. Minta owner untuk membuat project baru.');
+    // Alert hijau hasil sync terakhir (in-memory; dirender setelah redirect POST).
+    const lastSync = this.#lastSync;
+    const syncAlert =
+      lastSync
+        ? `<div class="alert alert--success" role="alert">` +
+          escapeHtml(
+            `Sync berhasil — ${lastSync.projectCount} project ter-commit ke GitHub` +
+              (lastSync.committed === false ? ' (manifest tidak berubah, tidak ada commit baru)' : ''),
+          ) +
+          (lastSync.repoUrl
+            ? ` <a href="${escapeHtml(String(lastSync.repoUrl))}" target="_blank" rel="noopener">Buka repo ↗</a>`
+            : '') +
+          `</div>`
+        : '';
+    // Kartu GitHub Sync (owner-only): isi manifest + jumlah project + tombol
+    // sync (POST /projects/sync-to-github, CSRF, confirm). Project tanpa
+    // repo_url tidak ikut manifest (runner tidak berbagi filesystem panel).
+    const isOwner = session.user.role === 'owner';
+    const syncableCount = [...repoUrlByName.keys()].filter((n) => syncedNames.has(n)).length;
+    const githubSyncCard = isOwner
+      ? `<section class="card" id="github-sync"><header class="card__header"><h2 class="card__title">GitHub Sync</h2></header><div class="card__body">` +
+        `<p class="field__hint">Remote control untuk GitHub Actions runner: project dengan Git URL di-commit sebagai manifest <span class="mono">projects.auto.json</span> — runner men-deploy-nya otomatis tiap siklus. Project tanpa repo_url hanya lokal.</p>` +
+        syncAlert +
+        (manifest.exists && manifest.content
+          ? `<pre class="mono" aria-label="Isi projects.auto.json">${escapeHtml(JSON.stringify(manifest.content, null, 2))}</pre>`
+          : emptyState({ title: 'projects.auto.json belum ada.', hint: 'Klik Sync ke GitHub untuk membuat manifest pertama di repo.' })) +
+        `<p class="field__hint">${manifest.exists ? `Manifest ada · ${manifestEntries.length} project di manifest` : 'Manifest belum ada'} · project dengan repo_url yang sudah synced: ${syncableCount}</p>` +
+        actionForm('/projects/sync-to-github', {
+          label: 'Sync ke GitHub',
+          cls: 'btn btn--primary',
+          confirm: 'Commit projects.auto.json ke GitHub?',
+          csrf: session.csrfToken,
+        }) +
+        `</div></section>`
+      : '';
     const projectsTable =
       createSection +
       buildTable(
@@ -1060,6 +1335,16 @@ export class PanelServer {
           { label: 'Name', cell: (r) => `<a href="/projects/${encodeURIComponent(String(r.id ?? ''))}">${escapeHtml(String(r.name ?? r.id ?? ''))}</a>` },
           { label: 'Type', cell: (r) => badgeHtml(r.type ?? '') },
           { label: 'Status', cell: (r) => statusCell(r.status) },
+          {
+            label: 'Sync',
+            cell: (r) => {
+              const name = String(r?.name ?? '').trim();
+              const hasRepo = repoUrlByName.has(name);
+              if (hasRepo && syncedNames.has(name)) return badgeHtml('synced', 'ok');
+              if (hasRepo) return badgeHtml('lokal', 'warn');
+              return '';
+            },
+          },
           { label: 'Port', cls: 'mono', cell: (r) => escapeHtml(String(portByProject.get(r.id) ?? '—')) },
           { label: 'Last deploy', cls: 'mono', cell: (r) => escapeHtml(lastDeploy.has(r.id) ? fmtTime(lastDeploy.get(r.id)) : '—') },
         ],
@@ -1073,6 +1358,7 @@ export class PanelServer {
         rows,
         rowsJson: JSON.stringify(rows),
         projectsTable,
+        githubSync: githubSyncCard,
       }),
     };
   }
@@ -1627,6 +1913,15 @@ export class PanelServer {
       const body = await readAndCsrf();
       this.#requirePermission(session, 'project.create');
       return this.#handleProjectCreate(session, body, res);
+    }
+
+    if (pathname === '/projects/sync-to-github') {
+      await readAndCsrf();
+      this.#requirePermission(session, 'project.create');
+      if (session.user.role !== 'owner') {
+        throw new VmPanelError(PERMISSION_DENIED, 'Sync ke GitHub khusus owner.');
+      }
+      return await this.#handleSyncToGithubPost(session, res);
     }
 
     let     m = pathname.match(/^\/projects\/([^/]+)\/deploy$/);
