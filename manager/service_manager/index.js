@@ -183,8 +183,11 @@ export class ServiceManager {
     this.processManager.assertPortLegal(port);
 
     // config JSON (kontrak adapter.startSpec): rootDir default = workspacePath
-    // project (untuk static), healthCheck untuk health lane.
+    // project (untuk static), healthCheck untuk health lane. Key tambahan dari
+    // config param (mis. `main` hasil inspect DeploymentManager) dipertahankan
+    // — NodeAdapter/PythonAdapter.startSpec membacanya (cfg.main).
     const mergedConfig = {
+      ...(config ?? {}),
       type,
       rootDir: config?.rootDir ?? startSpec?.rootDir ?? this._projectWorkspacePath(projectId) ?? null,
       healthCheck: config?.healthCheck ?? healthCheck ?? null,
@@ -242,6 +245,29 @@ export class ServiceManager {
       .prepare(sql)
       .all(...params)
       .map((r) => this._rowToRecord(r));
+  }
+
+  /**
+   * Update parsial config JSON service (merge dangkal). Dipakai
+   * DeploymentManager untuk menyinkronkan config.rootDir/config.main service
+   * yang di-reuse saat re-deploy (revision baru → clone/entry baru).
+   * Patch key dengan nilai null/undefined diabaikan (tidak menimpa existing).
+   * @param {string} serviceId
+   * @param {object} patch key→nilai
+   * @returns {object} record service terbaru
+   */
+  updateConfig(serviceId, patch = {}) {
+    const rec = this.getService(serviceId); // NOT_FOUND guard
+    const clean = {};
+    for (const [k, v] of Object.entries(patch ?? {})) {
+      if (v !== null && v !== undefined) clean[k] = v;
+    }
+    if (Object.keys(clean).length === 0) return rec;
+    const merged = { ...(rec.config ?? {}), ...clean };
+    this.store.db
+      .prepare('UPDATE services SET config = ?, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify(merged), nowIso(), serviceId);
+    return this.getService(serviceId);
   }
 
   /** service-like object untuk adapter (kontrak adapter.startSpec). */

@@ -71,6 +71,53 @@ function assertSafeId(id, label) {
   return id;
 }
 
+// ── Git project (kelola project via UI web) ────────────────────────────────
+
+/**
+ * repo_url: kosong → null (deploy pakai workspace). Else wajib https:// ATAU
+ * path lokal absolut (git clone path lokal works offline — dipakai E2E/sandbox;
+ * execFile tanpa shell jadi path aman). http://, file://, ssh://, git://,
+ * spasi, newline, backtick, quote, dsb. → VALIDATION (pesan jelas).
+ */
+function parseRepoUrlInput(raw) {
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  if (s === '') return null;
+  const isHttps = /^https:\/\/[^\s]+$/i.test(s);
+  const isLocalPath = /^(?:[A-Za-z]:[\\/][^\s]*|\/[^\s]*)$/.test(s);
+  if (!isHttps && !isLocalPath) {
+    throw new VmPanelError(
+      VALIDATION,
+      'repo_url wajib URL https:// atau path lokal absolut — http://, file://, ssh://, spasi, dan backtick tidak didukung',
+      { field: 'repo_url', value: s },
+    );
+  }
+  if (/[\u0000-\u001f\u007f`"<>|;&$]/.test(s)) {
+    throw new VmPanelError(VALIDATION, 'repo_url mengandung karakter terlarang (backtick/quote/control)', {
+      field: 'repo_url',
+    });
+  }
+  return s;
+}
+
+/**
+ * git_branch: kosong → default 'main'. Hanya [A-Za-z0-9._/-], tanpa '..',
+ * tidak boleh diawali '-' (anti arg-injection pada `git clone --branch`).
+ */
+function parseGitBranchInput(raw) {
+  if (raw === undefined || raw === null) return 'main';
+  const s = String(raw).trim();
+  if (s === '') return 'main';
+  if (!/^[A-Za-z0-9._/-]+$/.test(s) || s.includes('..') || s.startsWith('-') || s.startsWith('.')) {
+    throw new VmPanelError(
+      VALIDATION,
+      "git_branch hanya boleh [A-Za-z0-9._/-], tanpa '..', tidak diawali '-'/'.'",
+      { field: 'git_branch', value: s },
+    );
+  }
+  return s;
+}
+
 /**
  * Spesifikasi host + pemakaian (GET /system/specs). CPU/mem via node:os;
  * disk via fs.statfsSync(dataDir) (Node >= 18.15) — filesystem tanpa
@@ -445,6 +492,11 @@ export function registerDataRoutes({ manager } = {}) {
 
     // ── projects ────────────────────────────────────────────────────────────
     {
+      method: 'GET',
+      pattern: '/projects/:id',
+      handler: ({ params }) => requireMod(manager.projectManager).getProject(params.id),
+    },
+    {
       method: 'POST',
       pattern: '/projects',
       permission: 'project.create',
@@ -457,6 +509,11 @@ export function registerDataRoutes({ manager } = {}) {
         if (body?.port !== undefined && body?.port !== null && body?.port !== '') {
           input.port = Number(body.port);
         }
+        // Kelola project via UI: repo_url + git_branch opsional (kolom
+        // projects.repo_url/branch SUDAH ada di lib/schema.js — tidak perlu ALTER).
+        const repoUrl = parseRepoUrlInput(body?.repo_url);
+        if (repoUrl !== null) input.repoUrl = repoUrl;
+        input.branch = parseGitBranchInput(body?.git_branch);
         return pm.createProject(input);
       },
     },
@@ -464,14 +521,23 @@ export function registerDataRoutes({ manager } = {}) {
       method: 'POST',
       pattern: '/projects/:id/deploy',
       permission: 'project.deploy',
-      handler: async ({ params, user }) => {
+      handler: async ({ params, body, user }) => {
         const dm = requireMod(manager.deploymentManager);
+        // body.source opsional: default workspace; type 'git' → url/branch
+        // diambil dari project.repo_url/branch (validasi sama dengan create).
+        let source = { type: 'workspace' };
+        if (body?.source && typeof body.source === 'object' && body.source.type === 'git') {
+          const project = requireMod(manager.projectManager).getProject(params.id);
+          const repoUrl = parseRepoUrlInput(project.repoUrl ?? null);
+          if (!repoUrl) {
+            throw new VmPanelError(VALIDATION, 'project tidak punya repo_url — deploy git tidak tersedia', {
+              projectId: params.id,
+            });
+          }
+          source = { type: 'git', url: repoUrl, branch: parseGitBranchInput(project.branch ?? 'main') };
+        }
         // Sinkron: tunggu pipeline selesai (sukses/gagal) → hasil dikirim.
-        return dm.deploy({
-          projectId: params.id,
-          source: { type: 'workspace' },
-          actor: user ?? 'system',
-        });
+        return dm.deploy({ projectId: params.id, source, actor: user ?? 'system' });
       },
     },
 

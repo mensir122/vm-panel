@@ -45,9 +45,9 @@
                         </div>
 
     Notes for the integrator:
-    - "New project" is a server-rendered disabled button with
-      title="F5" (project creation ships in phase F5). Kept in
-      markup, not a var, so it never disappears.
+    - "New project" in page__actions is an anchor to the working
+      form (section#new-project) rendered inside projectsTable
+      (owner-only; operator/viewer get an info alert instead).
     - Status dot variants: dot--healthy | dot--degraded |
       dot--unhealthy | dot--crash_loop | dot--stopped |
       dot--disabled | dot--unknown (see docs/DESIGN.md Lampiran B).
@@ -93,8 +93,7 @@
             <p class="page__meta">Registered deployable units on this host</p>
           </div>
           <div class="page__actions">
-            <button class="btn btn--primary" type="button" disabled
-                    title="F5">New project</button>
+            <a class="btn btn--primary" href="#new-project">New project</a>
           </div>
         </div>
 

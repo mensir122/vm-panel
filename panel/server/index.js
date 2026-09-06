@@ -1003,7 +1003,11 @@ export class PanelServer {
     };
   }
 
-  async #pageProjects(session, pathname) {
+  /**
+   * Halaman /projects. opts.banner → alert error dari POST (form ulang),
+   * opts.form → nilai form untuk diisi ulang setelah error validasi.
+   */
+  async #pageProjects(session, pathname, opts = {}) {
     this.#requirePermission(session, PAGE_ACTIONS['/projects']);
     const [projects, services, deployments] = await Promise.all([
       this.#managerGet('/projects'),
@@ -1024,19 +1028,40 @@ export class PanelServer {
         if (pid && !lastDeploy.has(pid)) lastDeploy.set(pid, d.started_at ?? d.finished_at ?? '');
       }
     }
-    const banner = projects.ok ? '' : alertFrag('warn', MANAGER_DOWN_BANNER);
-    const projectsTable = buildTable(
-      [
-        { label: 'ID', cls: 'mono', cell: (r) => escapeHtml(String(r.id ?? '')) },
-        { label: 'Name', cell: (r) => `<a href="/projects/${encodeURIComponent(String(r.id ?? ''))}">${escapeHtml(String(r.name ?? r.id ?? ''))}</a>` },
-        { label: 'Type', cell: (r) => badgeHtml(r.type ?? '') },
-        { label: 'Status', cell: (r) => statusCell(r.status) },
-        { label: 'Port', cls: 'mono', cell: (r) => escapeHtml(String(portByProject.get(r.id) ?? '—')) },
-        { label: 'Last deploy', cls: 'mono', cell: (r) => escapeHtml(lastDeploy.has(r.id) ? fmtTime(lastDeploy.get(r.id)) : '—') },
-      ],
-      rows,
-      { empty: { title: 'No projects registered.', hint: 'Create one via vmctl project create.' } },
-    );
+    const banner = opts.banner ?? (projects.ok ? '' : alertFrag('warn', MANAGER_DOWN_BANNER));
+    // Form "New Project" hanya owner (project.create); operator/viewer lihat pesan.
+    const canCreate = this.#auth.perm
+      .checkPermission({ userId: session.user.userId, action: 'project.create' }).allowed;
+    const f = opts.form ?? {};
+    const typeOptions = ['static', 'node', 'python']
+      .map((t) => `<option value="${t}"${String(f.type ?? '') === t ? ' selected' : ''}>${t}</option>`)
+      .join('');
+    const createSection = canCreate
+      ? `<section class="card" id="new-project"><header class="card__header"><h2 class="card__title">New project</h2></header><div class="card__body">` +
+        `<form method="post" action="/projects">` +
+        csrfInput(session.csrfToken) +
+        `<div class="field"><label class="field__label" for="np-name">Nama</label><input class="field__input" id="np-name" name="name" value="${escapeHtml(String(f.name ?? ''))}" required minlength="2" maxlength="63" pattern="[a-z0-9][a-z0-9-]{1,62}" autocapitalize="none" spellcheck="false"></div>` +
+        `<div class="field"><label class="field__label" for="np-type">Tipe</label><select class="field__input" id="np-type" name="type">${typeOptions}</select></div>` +
+        `<div class="field"><label class="field__label" for="np-port">Port (opsional)</label><input class="field__input" id="np-port" name="port" type="number" min="10000" max="65535" value="${escapeHtml(String(f.port ?? ''))}"></div>` +
+        `<div class="field"><label class="field__label" for="np-repo">Git URL (opsional, https://)</label><input class="field__input" id="np-repo" name="repo_url" value="${escapeHtml(String(f.repo_url ?? ''))}" autocapitalize="none" spellcheck="false" placeholder="https://github.com/user/repo.git"><p class="field__hint">Kosong = deploy dari isi workspace project. Diisi = deploy bisa pakai git source.</p></div>` +
+        `<div class="field"><label class="field__label" for="np-branch">Branch</label><input class="field__input" id="np-branch" name="git_branch" value="${escapeHtml(String(f.git_branch ?? 'main'))}"></div>` +
+        `<button class="btn btn--primary" type="submit">Create project</button>` +
+        `</form></div></section>`
+      : alertFrag('info', 'Membuat project khusus owner. Minta owner untuk membuat project baru.');
+    const projectsTable =
+      createSection +
+      buildTable(
+        [
+          { label: 'ID', cls: 'mono', cell: (r) => escapeHtml(String(r.id ?? '')) },
+          { label: 'Name', cell: (r) => `<a href="/projects/${encodeURIComponent(String(r.id ?? ''))}">${escapeHtml(String(r.name ?? r.id ?? ''))}</a>` },
+          { label: 'Type', cell: (r) => badgeHtml(r.type ?? '') },
+          { label: 'Status', cell: (r) => statusCell(r.status) },
+          { label: 'Port', cls: 'mono', cell: (r) => escapeHtml(String(portByProject.get(r.id) ?? '—')) },
+          { label: 'Last deploy', cls: 'mono', cell: (r) => escapeHtml(lastDeploy.has(r.id) ? fmtTime(lastDeploy.get(r.id)) : '—') },
+        ],
+        rows,
+        { empty: { title: 'No projects registered.', hint: 'Create one via vmctl project create.' } },
+      );
     return {
       template: 'projects',
       vars: this.#pageVars(session, pathname, banner, {
@@ -1048,7 +1073,7 @@ export class PanelServer {
     };
   }
 
-  async #pageProjectDetail(session, id, pathname) {
+  async #pageProjectDetail(session, id, pathname, opts = {}) {
     this.#requirePermission(session, PAGE_ACTIONS['/projects']);
     const [projects, services, deployments] = await Promise.all([
       this.#managerGet('/projects'),
@@ -1057,6 +1082,18 @@ export class PanelServer {
     ]);
     const rows = Array.isArray(projects.data) ? projects.data : [];
     const project = rows.find((p) => p && String(p.id ?? '') === String(id));
+    // NB: GET /projects (route inti) tidak membawa repoUrl → ambil record
+    // penuh via data route /projects/:id untuk kartu Deploy (best-effort).
+    let projectFull = null;
+    try {
+      const pf = await this.#getManager().request('GET', `/projects/${encodeURIComponent(String(id))}`);
+      if (pf && typeof pf === 'object' && String(pf.id ?? '') === String(id)) projectFull = pf;
+    } catch {
+      projectFull = null; // NOT_FOUND (project tak ada) / manager down → null
+    }
+    if (projectFull) {
+      project = projectFull; // pakai record penuh (repoUrl/branch terisi)
+    }
     const svcRows =
       services.ok && Array.isArray(services.data?.rows)
         ? services.data.rows.filter((s) => s && String(s.projectId ?? '') === String(id))
@@ -1065,7 +1102,7 @@ export class PanelServer {
       deployments.ok && Array.isArray(deployments.data?.rows)
         ? deployments.data.rows.filter((d) => d && String(d.project_id ?? '') === String(id))
         : [];
-    const banner = projects.ok ? '' : alertFrag('warn', MANAGER_DOWN_BANNER);
+    const banner = opts.banner ?? (projects.ok ? '' : alertFrag('warn', MANAGER_DOWN_BANNER));
     const svc = svcRows[0] ?? null;
 
     let overviewGrid;
@@ -1099,6 +1136,34 @@ export class PanelServer {
       depRows,
       { empty: { title: 'No deployments yet.' } },
     );
+
+    // Kartu Deploy: tombol "Deploy sekarang" (owner+operator via project.deploy)
+    // + sumber deploy (git repo_url/branch ATAU workspace) + status deploy
+    // terakhir. Viewer → tombol disembunyikan (listProjects sudah punya repoUrl).
+    const canDeploy = this.#auth.perm
+      .checkPermission({ userId: session.user.userId, action: 'project.deploy' }).allowed;
+    const hasRepo = typeof project?.repoUrl === 'string' && project.repoUrl.trim() !== '';
+    const lastDep = depRows[0] ?? null;
+    const deployCard =
+      `<section class="card" id="deploy-now"><header class="card__header"><h2 class="card__title">Deploy</h2></header><div class="card__body"><dl class="kv">` +
+      `<dt class="kv__key">Source</dt><dd class="kv__value mono">${hasRepo ? `git (${escapeHtml(String(project.branch ?? 'main'))})` : 'workspace'}</dd>` +
+      (hasRepo
+        ? `<dt class="kv__key">Repo URL</dt><dd class="kv__value mono">${escapeHtml(String(project.repoUrl))}</dd>` +
+          `<dt class="kv__key">Branch</dt><dd class="kv__value mono">${escapeHtml(String(project.branch ?? 'main'))}</dd>`
+        : '') +
+      `<dt class="kv__key">Last deploy</dt><dd class="kv__value">${lastDep ? `${badgeHtml(String(lastDep.status ?? ''), deployBadgeVariant(lastDep.status))} <span class="mono muted">${escapeHtml(fmtTime(lastDep.started_at ?? lastDep.finished_at))}</span>` : '—'}</dd>` +
+      `</dl>` +
+      (canDeploy
+        ? actionForm(`/projects/${encodeURIComponent(String(id))}/deploy`, {
+            label: 'Deploy sekarang',
+            cls: 'btn btn--primary btn--sm',
+            confirm: 'Deploy project ini?',
+            csrf: session.csrfToken,
+          })
+        : `<p class="field__hint">Deploy khusus owner/operator.</p>`) +
+      `</div></section>`;
+
+    const depTableWithDeploy = deployCard + depTable;
 
     let healthState = null;
     if (svc) {
@@ -1153,7 +1218,7 @@ export class PanelServer {
         note: project ? '' : ENDPOINT_TODO_NOTE,
         projectJson: JSON.stringify(project ?? null),
         overviewGrid,
-        deploymentsTable: depTable,
+        deploymentsTable: depTableWithDeploy,
         healthSection,
         logsSection,
         settingsForm,
@@ -1557,12 +1622,35 @@ export class PanelServer {
       return this.#handleProjectCreate(session, body, res);
     }
 
-    let m = pathname.match(/^\/projects\/([^/]+)\/deploy$/);
+    let     m = pathname.match(/^\/projects\/([^/]+)\/deploy$/);
     if (m) {
       await readAndCsrf();
       this.#requirePermission(session, 'project.deploy');
       const id = decodeURIComponent(m[1]);
-      await this.#getManager().request('POST', `/projects/${encodeURIComponent(id)}/deploy`, { body: {} });
+      try {
+        // Project punya repo_url → deploy pakai git source; tanpa → workspace.
+        // NB: GET /projects (route inti) tidak membawa repoUrl → pakai detail
+        // /projects/:id (data route, record penuh via projectManager).
+        let body = {};
+        try {
+          const p = await this.#getManager().request('GET', `/projects/${encodeURIComponent(id)}`);
+          if (p && typeof p.repoUrl === 'string' && p.repoUrl.trim() !== '') {
+            body = { source: { type: 'git' } };
+          }
+        } catch {
+          /* best-effort: gagal baca project → deploy workspace default */
+        }
+        await this.#getManager().request('POST', `/projects/${encodeURIComponent(id)}/deploy`, { body });
+      } catch (e) {
+        if (e instanceof VmPanelError) {
+          // Error → alert di halaman detail (pola graceful; tanpa crash).
+          const page = await this.#pageProjectDetail(session, id, '/projects', {
+            banner: alertFrag('error', e.message),
+          });
+          return this.#renderManaged(res, { ...page, status: STATUS_BY_CODE[e.code] ?? 500 });
+        }
+        throw e;
+      }
       return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
     }
 
@@ -1590,16 +1678,38 @@ export class PanelServer {
     return this.#sendError(res, { url: pathname }, 404, NOT_FOUND, 'endpoint tidak ditemukan');
   }
 
-  /** POST /projects → buat project via manager (name/type/port dari form). */
+  /**
+   * POST /projects → buat project via manager (name/type/port + repo_url/
+   * git_branch opsional). Sukses → redirect ke detail project; error
+   * VALIDATION → form /projects dirender ulang dengan alert error.
+   */
   async #handleProjectCreate(session, body, res) {
-    void session;
     const name = String(body.name ?? '').trim();
     const type = String(body.type ?? '').trim();
     const portRaw = String(body.port ?? '').trim();
+    const repoUrl = String(body.repo_url ?? '').trim();
+    const branch = String(body.git_branch ?? '').trim();
     const input = { name, type };
     if (portRaw !== '') input.port = Number(portRaw);
-    await this.#getManager().request('POST', '/projects', { body: input });
-    return this.#redirect(res, '/projects');
+    if (repoUrl !== '') input.repo_url = repoUrl;
+    if (branch !== '') input.git_branch = branch;
+    let created;
+    try {
+      created = await this.#getManager().request('POST', '/projects', { body: input });
+    } catch (e) {
+      if (e instanceof VmPanelError) {
+        // Form ulang + alert error (nilai form dipertahankan); validasi
+        // kanonik ada di manager (parseRepoUrlInput/parseGitBranchInput).
+        const page = await this.#pageProjects(session, '/projects', {
+          banner: alertFrag('error', e.message),
+          form: { name, type, port: portRaw, repo_url: repoUrl, git_branch: branch || 'main' },
+        });
+        return this.#renderManaged(res, { ...page, status: STATUS_BY_CODE[e.code] ?? 500 });
+      }
+      throw e;
+    }
+    const newId = created && typeof created === 'object' && typeof created.id === 'string' ? created.id : null;
+    return this.#redirect(res, newId ? `/projects/${encodeURIComponent(newId)}` : '/projects');
   }
 
   /** /users POST actions (owner only, di-gate user.manage sebelum panggil ini). */

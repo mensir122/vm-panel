@@ -13,8 +13,9 @@
 // sweepDisconnected → RollbackManager.
 //
 // Kontrak service: satu service per project — dibuat sekali saat switching
-// (serviceManager.createService, config {rootDir: workspacePath}); deploy
-// berikutnya stop→start ulang dengan workspace/revision baru.
+// (serviceManager.createService, config {type, rootDir, main, port,
+// healthCheck}); deploy berikutnya stop→start ulang dengan workspace/revision
+// baru (rootDir/main config service di-update saat re-deploy).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -378,12 +379,64 @@ export class DeploymentManager {
   }
 
   /**
-   * Service untuk deploy: existing (listServices project) dipakai ulang;
-   * belum ada → createService (config {rootDir}). Port dari project.port.
+   * Inspect workspace hasil deploy → config tambahan untuk service
+   * (kontrak adapter.startSpec): node → package.json "main" (pkg.main di
+   * NodeAdapter tidak persist antar instance adapter), python → entry script
+   * workspace via konvensi adapter (main.py / app.py — pola detect()); project
+   * python tanpa entry keduanya → config tanpa main (stage 'validating' yang
+   * melaporkan 'python adapter requires config.main'). static/custom → null.
+   */
+  _deriveServiceConfigExtra(project, rootDir) {
+    if (project.type === 'node') {
+      const adapter = createAdapter('node', { workspacePath: rootDir, config: {} });
+      const v = adapter.validate({ workspacePath: rootDir });
+      return { main: v.main ?? null };
+    }
+    if (project.type === 'python') {
+      const adapter = createAdapter('python', { workspacePath: rootDir, config: {} });
+      for (const candidate of ['main.py', 'app.py']) {
+        try {
+          if (fs.statSync(path.join(rootDir, candidate)).isFile()) {
+            return { main: candidate };
+          }
+        } catch {
+          /* coba kandidat berikutnya */
+        }
+      }
+      const v = adapter.validate({ workspacePath: rootDir }); // error jelas bila tanpa entry
+      return { main: v.main ?? null };
+    }
+    return {};
+  }
+
+  /** healthCheck project (kolom health_url diisi via updateProject) → config service. */
+  _projectHealthCheck(project) {
+    return project.healthCheck && typeof project.healthCheck === 'object'
+      ? project.healthCheck
+      : null;
+  }
+
+  /**
+   * Service untuk deploy: existing (listServices project) dipakai ulang —
+   * config.rootDir/config.main di-update ke hasil deploy ini; belum ada →
+   * createService (config {type, rootDir, main, port, healthCheck}). Port
+   * dari project.port.
    */
   _resolveServiceForDeploy(project, rootDir) {
+    const cfgExtra = this._deriveServiceConfigExtra(project, rootDir);
+    const healthCheck = this._projectHealthCheck(project);
     const existing = this.serviceManager.listServices({ projectId: project.id });
-    if (existing && existing.length > 0) return existing[0];
+    if (existing && existing.length > 0) {
+      const svc = existing[0];
+      if (typeof this.serviceManager.updateConfig === 'function') {
+        return this.serviceManager.updateConfig(svc.id, {
+          rootDir,
+          ...cfgExtra,
+          ...(healthCheck ? { healthCheck } : {}),
+        });
+      }
+      return svc;
+    }
     if (!Number.isInteger(project.port)) {
       throw new VmPanelError(
         VALIDATION,
@@ -397,7 +450,7 @@ export class DeploymentManager {
       name,
       type: project.type,
       port: project.port,
-      config: { rootDir },
+      config: { rootDir, ...cfgExtra, ...(healthCheck ? { healthCheck } : {}) },
     });
   }
 
