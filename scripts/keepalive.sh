@@ -37,6 +37,12 @@ cat > "${CHAIN_LOCK_DIR}/chain-lock.json" <<EOF
 EOF
 echo "[keepalive] chain-lock expires_at=${EXPIRES_ISO} (job started_at=${STARTED_ISO})"
 
+# --- tulis runner-specs.json (ekspresi identik step "Runner specs" vm.yml
+#     + runnerId/capturedAt) — file non-secret, di-commit ke branch 'state'
+#     pada fase drain (lihat bagian commit di bawah) ---
+RUN_ID="$RUN_ID" node -p "JSON.stringify((()=>{const os=require('os'),fs=require('fs');const s=fs.statfsSync('.');return {CPU:os.cpus()[0].model.trim(),Cores:os.cpus().length,RAM_GB:+(os.totalmem()/2**30).toFixed(1),Disk_free_GB:+(s.bfree*s.bsize/2**30).toFixed(1),Disk_total_GB:+(s.blocks*s.bsize/2**30).toFixed(1),OS:os.type()+' '+os.release(),runnerId:String(process.env.RUN_ID||''),capturedAt:new Date().toISOString()}})())" > "${CHAIN_LOCK_DIR}/runner-specs.json"
+echo "[keepalive] runner-specs ditulis: ${CHAIN_LOCK_DIR}/runner-specs.json"
+
 DRAIN_EPOCH=$(( EXPIRES_EPOCH - DRAIN_MIN * 60 ))
 
 # --- loop utama ---
@@ -71,6 +77,48 @@ done
 # --- drain: tolak deployment baru (manager: flag via API kalau ada) + tunggu queue kosong ---
 echo "[keepalive] drain: tunggu queue kosong (max ${DRAIN_MIN} menit)"
 sleep 60
+
+# --- VAULT BRANCH: commit runner-specs.json ke branch 'state' (JUGA) ---
+# Duplikasi disiplin pola vault_put di backup_final.sh (gh api PUT
+# contents/<file>, sha lama / auto-create branch) — file kecil non-secret,
+# sengaja tidak dipindahkan ke modul bersama agar pola tiap script tetap
+# self-contained seperti desain scripts/ yang ada.
+SPECS_FILE="${CHAIN_LOCK_DIR}/runner-specs.json"
+if [ -n "${GH_TOKEN:-}" ] && [ -n "${REPO:-}" ] && [ -s "${SPECS_FILE}" ]; then
+  SPECS_B64=$(base64 -w0 "${SPECS_FILE}")
+  specs_vault_put() {
+    local OLD_SHA="$1" BODY
+    # NB: kirim data via ENV, bukan argv — pola yang sama dengan vault_put
+    # di backup_final.sh (`node -e` punya model argv berbeda).
+    BODY=$(
+      export RUN_ID SPECS_B64 OLD_SHA
+      node --input-type=module -e "
+        console.log(JSON.stringify({
+          message: 'state: runner-specs run ' + (process.env.RUN_ID || 'unknown') + ' (auto)',
+          branch: 'state',
+          content: process.env.SPECS_B64,
+          sha: process.env.OLD_SHA || undefined,
+        }));
+      "
+    )
+    gh api -X PUT "repos/${REPO}/contents/runner-specs.json" --input - <<< "${BODY}" > /dev/null 2>&1
+  }
+  OLD_SPECS_SHA=$(gh api "repos/${REPO}/contents/runner-specs.json?ref=state" --jq '.sha // empty' 2>/dev/null || true)
+  if specs_vault_put "${OLD_SPECS_SHA}"; then
+    echo "[keepalive] runner-specs.json di-commit ke branch 'state'"
+  else
+    # branch 'state' mungkin belum ada -> buat dari HEAD, lalu retry sekali
+    HEAD_SHA=$(gh api "repos/${REPO}/git/refs/heads/${GITHUB_REF_NAME:-main}" --jq '.object.sha' 2>/dev/null || true)
+    if gh api -X POST "repos/${REPO}/git/refs" -f ref=refs/heads/state -f sha="${HEAD_SHA}" > /dev/null 2>&1 \
+       && specs_vault_put ""; then
+      echo "[keepalive] branch 'state' dibuat + runner-specs.json tersimpan"
+    else
+      echo "[keepalive] PERINGATAN: commit runner-specs gagal (artifact chain tetap jalan)"
+    fi
+  fi
+else
+  echo "[keepalive] GH_TOKEN/REPO/specs tidak lengkap — skip commit runner-specs"
+fi
 
 # --- self-chain: dispatch runner berikutnya ---
 # NB: karena concurrency group 'vm-chain', run baru akan berstatus QUEUED

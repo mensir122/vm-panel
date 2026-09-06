@@ -134,6 +134,107 @@ function clampPct01(n) {
   return Math.max(0, Math.min(100, Math.round(n * 100) / 100));
 }
 
+// ── GitHub runner status (GET /system/github) ──────────────────────────────
+// Dashboard menampilkan status chain Actions + specs runner tanpa membuka
+// github.com/.../actions. Sumber: REST API publik (repo default mensir122/
+// vm-panel, override via env GITHUB_REPO; GITHUB_TOKEN opsional → header
+// Authorization). Fail-soft TOTAL: gagal apa pun → {available:false, reason,
+// fetchedAt} — TIDAK PERNAH melempar (dispatcher api.js akan 500 kalau throw).
+
+const GITHUB_API_BASE = 'https://api.github.com';
+const GITHUB_REPO_DEFAULT = 'mensir122/vm-panel';
+const GITHUB_CACHE_MS = 60_000; // cache in-memory 60 detik
+const GITHUB_TIMEOUT_MS = 5_000; // timeout fetch 5 detik (AbortController)
+
+/** Cache in-memory status GitHub: { at: epochMs, data } atau null. */
+let githubStatusCache = null;
+
+/** GET JSON dari GitHub REST API; timeout 5s; token opsional; 404 → err.status=404. */
+async function ghGetJson(pathname, { raw = false } = {}) {
+  const headers = {
+    Accept: raw ? 'application/vnd.github.raw' : 'application/vnd.github+json',
+    'User-Agent': 'vm-panel',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  const tok = process.env.GITHUB_TOKEN;
+  if (tok) headers.Authorization = `Bearer ${tok}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), GITHUB_TIMEOUT_MS);
+  try {
+    const r = await fetch(`${GITHUB_API_BASE}${pathname}`, { headers, signal: ctrl.signal });
+    if (!r.ok) {
+      const err = new Error(`GitHub API ${pathname} → HTTP ${r.status}`);
+      err.status = r.status;
+      throw err;
+    }
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Workflow run API → shape panel {runId, status, conclusion, createdAt, url}. */
+function mapGhRun(r) {
+  if (!r || typeof r !== 'object') return null;
+  return {
+    runId: r.id ?? null,
+    status: typeof r.status === 'string' ? r.status : null,
+    conclusion: r.conclusion ?? null,
+    createdAt: r.created_at ?? null,
+    url: r.html_url ?? null,
+  };
+}
+
+/**
+ * Kumpulkan status GitHub runner: runs vm.yml (5 terbaru) → activeRun
+ * (status != completed terbaru) + lastRun (conclusion != null terbaru);
+ * specs dari contents/runner-specs.json?ref=state (404 → null).
+ * Gagal apa pun → {available:false, reason, fetchedAt} — tidak pernah throw.
+ */
+async function collectGithubRunnerStatus() {
+  const repo = process.env.GITHUB_REPO || GITHUB_REPO_DEFAULT;
+  try {
+    const runsData = await ghGetJson(`/repos/${repo}/actions/workflows/vm.yml/runs?per_page=5`);
+    const runs = Array.isArray(runsData?.workflow_runs) ? runsData.workflow_runs : [];
+    // API mengembalikan runs terbaru-dulu → find() = yang terbaru.
+    const activeRaw = runs.find((r) => r?.status !== 'completed') ?? null;
+    const lastRaw = runs.find((r) => r?.conclusion != null) ?? null;
+    let specs = null;
+    try {
+      specs = await ghGetJson(`/repos/${repo}/contents/runner-specs.json?ref=state`, { raw: true });
+    } catch (e) {
+      if (e?.status === 404) {
+        specs = null; // branch 'state' / file belum ada (chain pertama)
+      } else {
+        throw e;
+      }
+    }
+    return {
+      available: true,
+      activeRun: activeRaw ? mapGhRun(activeRaw) : null,
+      lastRun: lastRaw ? mapGhRun(lastRaw) : null,
+      specs: specs && typeof specs === 'object' && !Array.isArray(specs) ? specs : null,
+      fetchedAt: new Date().toISOString(),
+    };
+  } catch (e) {
+    return {
+      available: false,
+      reason: String(e?.message ?? e ?? 'unknown error'),
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+}
+
+/** Status GitHub runner dengan cache in-memory 60 detik. */
+async function getGithubRunnerStatus() {
+  if (githubStatusCache && Date.now() - githubStatusCache.at < GITHUB_CACHE_MS) {
+    return githubStatusCache.data;
+  }
+  const data = await collectGithubRunnerStatus();
+  githubStatusCache = { at: Date.now(), data };
+  return data;
+}
+
 /** Tail file: N baris terakhir. File tidak ada → NOT_FOUND. */
 function tailLines(filePath, maxLines) {
   let raw;
@@ -380,6 +481,15 @@ export function registerDataRoutes({ manager } = {}) {
       pattern: '/system/specs',
       // Tanpa permission tambahan — bagian system, dibaca oleh panel dashboard.
       handler: () => collectSystemSpecs(manager.dataDir),
+    },
+
+    // ── system: GitHub runner (chain Actions + specs, tanpa buka Actions UI) ─
+    {
+      method: 'GET',
+      pattern: '/system/github',
+      // Tanpa permission tambahan — bagian system, dibaca oleh panel dashboard.
+      // Handler fail-soft: gagal apa pun → 200 {available:false, reason}.
+      handler: () => getGithubRunnerStatus(),
     },
 
     // ── logs ────────────────────────────────────────────────────────────────

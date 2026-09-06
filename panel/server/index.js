@@ -165,6 +165,15 @@ function statusCell(status, dotClsOverride) {
   return `<span class="status"><span class="dot ${dot}" role="img" aria-label="status: ${escapeHtml(s.toLowerCase())}"></span>${escapeHtml(s)}</span>`;
 }
 
+/** Dot GitHub Actions: in_progress/queued→warn, success→healthy, failure/cancelled→unhealthy, null→off. */
+function githubDotClass(status) {
+  const s = String(status ?? '').toLowerCase();
+  if (['in_progress', 'queued', 'waiting', 'pending'].includes(s)) return 'dot--degraded';
+  if (s === 'success') return 'dot--healthy';
+  if (['failure', 'cancelled', 'canceled', 'timed_out', 'startup_failure'].includes(s)) return 'dot--unhealthy';
+  return 'dot--stopped'; // null/kosong → chain off
+}
+
 function badgeHtml(text, variant = '') {
   const cls = variant ? `badge badge--${variant}` : 'badge';
   return `<span class="${cls}">${escapeHtml(String(text ?? ''))}</span>`;
@@ -855,20 +864,46 @@ export class PanelServer {
 
   async #pageDashboard(session, pathname) {
     this.#requirePermission(session, PAGE_ACTIONS['/']);
-    const [status, projects, services, specs] = await Promise.all([
+    const [status, projects, services, specs, github] = await Promise.all([
       this.#managerGet('/system/status'),
       this.#managerGet('/projects'),
       this.#managerGet('/services'),
       this.#managerGet('/system/specs'),
+      this.#managerGet('/system/github'), // best-effort (fail-soft via #tryData)
     ]);
     const rows = Array.isArray(projects.data) ? projects.data : [];
     const banner = status.ok && projects.ok ? '' : alertFrag('warn', MANAGER_DOWN_BANNER);
 
     const st = status.ok && status.data && typeof status.data === 'object' ? status.data : null;
     const sp = specs.ok && specs.data && typeof specs.data === 'object' ? specs.data : null;
+    const gh = github.ok && github.data && typeof github.data === 'object' ? github.data : null;
     const cpus = Math.max(os.cpus().length, 1);
     const loadPct = clampPct((os.loadavg()[0] / cpus) * 100);
     const memPct = clampPct(((os.totalmem() - os.freemem()) / os.totalmem()) * 100);
+
+    // GitHub Runner: data /system/github (best-effort) — manager down atau
+    // GitHub gagal → kartu '—' (pola graceful sama dengan kartu lain).
+    const ghUp = gh?.available === true;
+    const ghActive = ghUp ? (gh.activeRun ?? null) : null;
+    const ghLast = ghUp ? (gh.lastRun ?? null) : null;
+    const ghSpecs = ghUp && gh.specs && typeof gh.specs === 'object' ? gh.specs : null;
+    const ghRunUrl = ghActive?.url ?? ghLast?.url ?? null;
+    const ghRunCell = ghRunUrl
+      ? `<a href="${escapeHtml(String(ghRunUrl))}" target="_blank" rel="noopener">run #${escapeHtml(String(ghActive?.runId ?? ghLast?.runId ?? ''))} ↗</a>`
+      : '—';
+    const githubCard =
+      `<section class="card"><header class="card__header"><h2 class="card__title">GitHub Runner</h2></header><div class="card__body"><dl class="kv">` +
+      `<dt class="kv__key">Chain</dt><dd class="kv__value">${gh ? (ghActive ? statusCell(ghActive.status, githubDotClass(ghActive.status)) : statusCell('idle', githubDotClass(null))) : '—'}</dd>` +
+      `<dt class="kv__key">Last run</dt><dd class="kv__value">${ghLast ? `${statusCell(ghLast.conclusion ?? 'unknown', githubDotClass(ghLast.conclusion))} <span class="mono muted">${escapeHtml(fmtTime(ghLast.createdAt))}</span>` : '—'}</dd>` +
+      `<dt class="kv__key">Run</dt><dd class="kv__value">${ghRunCell}</dd>` +
+      (ghSpecs
+        ? `<dt class="kv__key">CPU</dt><dd class="kv__value mono">${escapeHtml(String(ghSpecs.CPU ?? '—'))}</dd>` +
+          `<dt class="kv__key">Cores</dt><dd class="kv__value mono">${escapeHtml(String(ghSpecs.Cores ?? '—'))}</dd>` +
+          `<dt class="kv__key">RAM (GB)</dt><dd class="kv__value mono">${escapeHtml(String(ghSpecs.RAM_GB ?? '—'))}</dd>` +
+          `<dt class="kv__key">Disk free (GB)</dt><dd class="kv__value mono">${escapeHtml(String(ghSpecs.Disk_free_GB ?? '—'))}</dd>` +
+          `<dt class="kv__key">Captured</dt><dd class="kv__value mono">${escapeHtml(fmtTime(ghSpecs.capturedAt))}</dd>`
+        : '') +
+      `</dl></div></section>`;
 
     const systemCards = `<div class="grid grid--3">` +
       `<section class="card"><header class="card__header"><h2 class="card__title">System status</h2></header><div class="card__body"><dl class="kv">` +
@@ -907,7 +942,9 @@ export class PanelServer {
       `<dt class="kv__key">Hostname</dt><dd class="kv__value mono">${escapeHtml(String(sp?.host?.hostname ?? '—'))}</dd>` +
       `<dt class="kv__key">Host uptime</dt><dd class="kv__value mono">${sp ? escapeHtml(fmtDuration(sp.host?.uptimeSec)) : '—'}</dd>` +
       `<dt class="kv__key">Node</dt><dd class="kv__value mono">${escapeHtml(String(sp?.host?.nodeVersion ?? '—'))}</dd>` +
-      `</dl></div></section></div>`;
+      `</dl></div></section>` +
+      githubCard +
+      `</div>`;
 
     // Alerts: checks gagal/warn per service (best-effort; kosong → empty state).
     const alerts = [];
