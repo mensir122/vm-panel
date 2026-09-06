@@ -202,11 +202,27 @@
 
   function onClick(e) {
     var trigger = e.target && e.target.closest
-      ? e.target.closest('a[data-confirm]')
+      ? e.target.closest('a[data-confirm], button[data-confirm]')
       : null;
     if (!trigger) return;
     e.preventDefault();
     openConfirm(trigger);
+  }
+
+  /* ---------- Reveal hidden sections (data-reveal="#id") ---------- */
+
+  function onClickReveal(e) {
+    var btn = e.target && e.target.closest
+      ? e.target.closest('[data-reveal]')
+      : null;
+    if (!btn) return;
+    e.preventDefault();
+    var target = document.querySelector(btn.getAttribute("data-reveal"));
+    if (!target) return;
+    target.hidden = false;
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+    var first = target.querySelector("input, select, textarea");
+    if (first) first.focus();
   }
 
   /* ---------- Log auto-scroll ---------- */
@@ -231,6 +247,7 @@
 
   function init() {
     document.addEventListener("submit", onSubmit, true);
+    document.addEventListener("click", onClickReveal, true);
     document.addEventListener("click", onClick, true);
     var logs = document.querySelectorAll("[data-autoscroll]");
     for (var i = 0; i < logs.length; i++) initLog(logs[i]);

@@ -173,8 +173,23 @@ describe('projects-ui (kelola project via web)', () => {
     assert.ok(text.includes('name="repo_url"'), 'field Git URL');
     assert.ok(text.includes('name="git_branch"'), 'field Branch');
     assert.ok(text.includes('name="_csrf"'), 'CSRF hidden input');
-    assert.ok(text.includes('href="#new-project"'), 'tombol placeholder diganti anchor ke form');
+    // Perilaku baru: form tersembunyi sampai tombol "New project" diklik.
+    assert.ok(text.includes('data-reveal="#new-project"'), 'tombol New project me-reveal form');
+    assert.ok(text.includes('id="new-project" hidden'), 'form tersembunyi secara default');
     assert.ok(!text.includes('type="button" disabled'), 'tidak ada tombol placeholder disabled');
+  });
+
+  test('(1b) error submit → form TERBUKA (tidak hidden) + alert + nilai dipertahankan', async () => {
+    const res = await req(ctx.port, 'POST', '/projects', {
+      jar: ctx.ownerJar,
+      headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
+      body: form({ name: 'bad url', type: 'node', repo_url: 'https://contoh dengan spasi.git' }),
+    });
+    assert.equal(res.status, 400);
+    const text = await res.text();
+    assert.ok(!text.includes('id="new-project" hidden'), 'form harus terbuka saat ada error submit');
+    assert.ok(text.includes('alert'), 'ada alert error');
+    assert.ok(text.includes('bad url'), 'nilai form dipertahankan');
   });
 
   test('(2) POST /projects (git URL lokal) → redirect detail + project tampil', async () => {

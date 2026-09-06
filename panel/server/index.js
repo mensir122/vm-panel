@@ -1036,8 +1036,12 @@ export class PanelServer {
     const typeOptions = ['static', 'node', 'python']
       .map((t) => `<option value="${t}"${String(f.type ?? '') === t ? ' selected' : ''}>${t}</option>`)
       .join('');
+    // Form "New Project": tersembunyi sampai tombol "New project" diklik
+    // (data-reveal di template); otomatis TERBUKA bila submit sebelumnya
+    // gagal (banner error + nilai form dipertahankan) — pola fail-friendly.
+    const formOpen = Boolean(opts.banner || Object.keys(f).length > 0);
     const createSection = canCreate
-      ? `<section class="card" id="new-project"><header class="card__header"><h2 class="card__title">New project</h2></header><div class="card__body">` +
+      ? `<section class="card" id="new-project"${formOpen ? '' : ' hidden'}><header class="card__header"><h2 class="card__title">New project</h2></header><div class="card__body">` +
         `<form method="post" action="/projects">` +
         csrfInput(session.csrfToken) +
         `<div class="field"><label class="field__label" for="np-name">Nama</label><input class="field__input" id="np-name" name="name" value="${escapeHtml(String(f.name ?? ''))}" required minlength="2" maxlength="63" pattern="[a-z0-9][a-z0-9-]{1,62}" autocapitalize="none" spellcheck="false"></div>` +
@@ -1060,7 +1064,7 @@ export class PanelServer {
           { label: 'Last deploy', cls: 'mono', cell: (r) => escapeHtml(lastDeploy.has(r.id) ? fmtTime(lastDeploy.get(r.id)) : '—') },
         ],
         rows,
-        { empty: { title: 'No projects registered.', hint: 'Create one via vmctl project create.' } },
+        { empty: { title: 'No projects registered.', hint: 'Gunakan tombol New project di atas untuk membuat project pertamamu.' } },
       );
     return {
       template: 'projects',

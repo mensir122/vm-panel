@@ -45,8 +45,9 @@
                         </div>
 
     Notes for the integrator:
-    - "New project" in page__actions is an anchor to the working
-      form (section#new-project) rendered inside projectsTable
+    - "New project" button in page__actions (data-reveal="#new-project")
+      reveals section#new-project (hidden by default; auto-open on submit
+      error) rendered inside projectsTable
       (owner-only; operator/viewer get an info alert instead).
     - Status dot variants: dot--healthy | dot--degraded |
       dot--unhealthy | dot--crash_loop | dot--stopped |
@@ -93,7 +94,7 @@
             <p class="page__meta">Registered deployable units on this host</p>
           </div>
           <div class="page__actions">
-            <a class="btn btn--primary" href="#new-project">New project</a>
+            <button class="btn btn--primary" type="button" data-reveal="#new-project">New project</button>
           </div>
         </div>
 
