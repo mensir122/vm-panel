@@ -1154,25 +1154,26 @@ export class PanelServer {
       `</dl></div></section>` +
       // Resources: data nyata dari manager /system/specs bila tersedia,
       // fallback advisory node:os lokal (manager down) — graceful.
+      // Label eksplisit "Panel Host" — user jangan salah paham ini spek VM GitHub.
       (sp
-        ? `<section class="card"><header class="card__header"><h2 class="card__title">Resources</h2></header><div class="card__body">` +
+        ? `<section class="card"><header class="card__header"><h2 class="card__title">Panel Host - Resources <span class="badge badge--info">laptop kamu</span></h2></header><div class="card__body">` +
           `${barHtml('CPU load (1m avg)', clampPct(sp.cpu?.usagePct))}` +
           `${barHtml(`Memory used (${fmtMb(sp.memory?.usedMb)} / ${fmtMb(sp.memory?.totalMb)})`, clampPct(sp.memory?.usedPct))}` +
           (sp.disk
             ? barHtml(`Disk used (${fmtMb(sp.disk.usedMb)} / ${fmtMb(sp.disk.totalMb)})`, clampPct(sp.disk.usedPct))
             : `<p class="field__hint">Disk usage is unavailable on this filesystem.</p>`) +
-          `<p class="field__hint">Host usage from manager /system/specs — sampled on page load.</p>` +
+          `<p class="field__hint">Spek mesin tempat panel ini berjalan (laptop). VM 24/7 kamu jalan di GitHub Actions - lihat kartu GitHub Runner.</p>` +
           `</div></section>`
-        : `<section class="card"><header class="card__header"><h2 class="card__title">Resources</h2></header><div class="card__body">` +
+        : `<section class="card"><header class="card__header"><h2 class="card__title">Panel Host - Resources <span class="badge badge--info">laptop kamu</span></h2></header><div class="card__body">` +
           `${barHtml('CPU load (advisory)', loadPct)}${barHtml('Memory used (advisory)', memPct)}` +
-          `<p class="field__hint">Host CPU/RAM via node:os — advisory, sampled on page load.</p>` +
+          `<p class="field__hint">Host CPU/RAM via node:os - advisory, sampled on page load.</p>` +
           `</div></section>`) +
-      `<section class="card"><header class="card__header"><h2 class="card__title">Runner</h2></header><div class="card__body"><dl class="kv">` +
+      `<section class="card"><header class="card__header"><h2 class="card__title">VM GitHub Actions <span class="badge badge--info">24/7</span></h2></header><div class="card__body"><dl class="kv">` +
       `<dt class="kv__key">Runner ID</dt><dd class="kv__value mono">${escapeHtml(String(st?.runnerId ?? '—'))}</dd>` +
       `<dt class="kv__key">Phase</dt><dd class="kv__value mono">${escapeHtml(String(st?.status ?? 'unknown'))}</dd>` +
       `<dt class="kv__key">Started</dt><dd class="kv__value mono">${fmtTime(st?.startedAt ?? null)}</dd>` +
       `</dl></div></section>` +
-      `<section class="card"><header class="card__header"><h2 class="card__title">Specs</h2></header><div class="card__body"><dl class="kv">` +
+      `<section class="card"><header class="card__header"><h2 class="card__title">Specs - Panel Host <span class="badge badge--info">laptop kamu</span></h2></header><div class="card__body"><dl class="kv">` +
       `<dt class="kv__key">CPU model</dt><dd class="kv__value mono">${escapeHtml(String(sp?.cpu?.model ?? '—'))}</dd>` +
       `<dt class="kv__key">Cores</dt><dd class="kv__value mono">${escapeHtml(String(sp?.cpu?.cores ?? '—'))}</dd>` +
       `<dt class="kv__key">Load (1m)</dt><dd class="kv__value mono">${escapeHtml(String(sp?.cpu?.load1 ?? '—'))}</dd>` +
