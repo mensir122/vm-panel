@@ -691,11 +691,21 @@ export class PanelServer {
     const body = await this.#readParsedBody(req);
     // Template desainer memakai name="totp"; kontrak lama memakai totpCode — terima keduanya.
     const totpRaw = typeof body.totpCode === 'string' && body.totpCode !== '' ? body.totpCode : body.totp;
+    // Kolom 2FA tunggal menerima TOTP ATAU recovery code (form hanya punya satu
+    // kolom "totp"; auth.login mencoba TOTP dulu, lalu fallback recovery —
+    // fix: sebelumnya recovery hanya dibaca dari field `recoveryCode` yang tidak
+    // pernah ada di form, sehingga kode backup selalu ditolak).
+    const secondFactorRaw =
+      typeof totpRaw === 'string' && totpRaw !== ''
+        ? totpRaw
+        : typeof body.recoveryCode === 'string' && body.recoveryCode !== ''
+          ? body.recoveryCode
+          : undefined;
     const result = this.#auth.login({
       username: typeof body.username === 'string' ? body.username : '',
       password: typeof body.password === 'string' ? body.password : '',
-      totpCode: typeof totpRaw === 'string' && totpRaw !== '' ? totpRaw : undefined,
-      recoveryCode: typeof body.recoveryCode === 'string' ? body.recoveryCode : undefined,
+      totpCode: secondFactorRaw,
+      recoveryCode: secondFactorRaw,
       ip,
       secure: this.#isHttps(req),
     });
