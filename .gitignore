@@ -4,6 +4,8 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/*.db.corrupt
+data/*.sqlite*
+data/git-sources/
 runtime/
 logs/
 backups/

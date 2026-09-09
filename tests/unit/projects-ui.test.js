@@ -77,7 +77,7 @@ before(async () => {
   for (let attempt = 0; attempt < 5; attempt++) {
     ctx.manager = new Manager({
       rootDir: ctx.dir,
-      config: { manager: { apiPort: randomHighPort(), hostMode: 'dev' } },
+      config: { manager: { apiPort: randomHighPort(), hostMode: 'dev', rateLimitMax: 1000 } },
       token: 'prjui-manager-token-0123456789abcdef',
     });
     try {
@@ -120,7 +120,17 @@ before(async () => {
 
 after(async () => {
   if (ctx.panel) await ctx.panel.close();
-  if (ctx.manager && ctx.manager.running) await ctx.manager.stop();
+  if (ctx.manager && ctx.manager.running) {
+    try {
+      const svcs = ctx.manager.serviceManager?.listServices() ?? [];
+      for (const s of svcs) {
+        try { await ctx.manager.serviceManager.stopService(s.id); } catch { /* best-effort */ }
+      }
+    } catch {
+      /* best-effort */
+    }
+    await ctx.manager.stop();
+  }
   // Windows: proses anak (git/static-server) bisa menahan handle sandbox
   // sesaat setelah stop → rmSync best-effort retry, gagal diabaikan (tmp OS
   // akan dibersihkan sistem). Jangan biarkan cleanup merusak hasil suite.
@@ -365,12 +375,12 @@ describe('projects-ui (kelola project via web)', () => {
 
   test('(6) POST tanpa CSRF → 403', async () => {
     const res = await req(ctx.port, 'POST', '/projects', {
-      jar: ctx.ownerJar,
+      jar: new Map(ctx.ownerJar),
       body: form({ name: 'x-no-csrf', type: 'static' }),
     });
     assert.equal(res.status, 403);
     const res2 = await req(ctx.port, 'POST', `/projects/${ctx.wsProjectId}/deploy`, {
-      jar: ctx.ownerJar,
+      jar: new Map(ctx.ownerJar),
       body: form({}),
     });
     assert.equal(res2.status, 403);

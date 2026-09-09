@@ -51,6 +51,15 @@
                          policy, health check config, port, env/secret
                          ref metadata (names + scopes only, never
                          values), or div.empty.
+    [configVaultSection|raw] owner-only "Config & Brankas" cards
+                         (rendered server-side in panel/server/index.js):
+                         Brankas (vault status + init button),
+                         Config koper (file table + upload form),
+                         Variabel rahasia (envName → secretName table
+                         + mapping form), Suntik otomatis (startup
+                         hook form/test/delete). Metadata only — secret
+                         values are never rendered. Empty string for
+                         roles without 'secret.view'.
 
   Notes for the integrator:
     - Tabs are in-page anchors (href="#overview" etc.). No JS tabs;
@@ -111,6 +120,7 @@
           <a class="tab" href="#health">Health</a>
           <a class="tab" href="#logs">Logs</a>
           <a class="tab" href="#settings">Settings</a>
+          <a class="tab" href="#config-vault">Config &amp; Brankas</a>
         </nav>
 
         <p class="page__hint">
@@ -142,6 +152,11 @@
           <section class="panel-section" id="settings" aria-labelledby="h-settings">
             <h2 class="sr-only" id="h-settings">Settings</h2>
             {{settingsForm|raw}}
+          </section>
+
+          <section class="panel-section" id="config-vault" aria-labelledby="h-config-vault">
+            <h2 class="sr-only" id="h-config-vault">Config &amp; Brankas</h2>
+            {{configVaultSection|raw}}
           </section>
         </div>
       </main>

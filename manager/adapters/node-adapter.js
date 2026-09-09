@@ -11,7 +11,7 @@ import { execFile } from 'node:child_process';
 import { VmPanelError, VALIDATION, NOT_FOUND } from '../../lib/errors.js';
 import { BaseAdapter } from './base.js';
 
-const INSTALL_TIMEOUT_MS = 120_000; // §desain fase F2
+const INSTALL_TIMEOUT_MS = 120_000; // 2 menit default; dapat dioverride via config.installTimeoutMs
 const BUILD_TIMEOUT_MS = 15 * 60_000; // build Next.js bisa 3-8 menit (budget 15)
 const OUTPUT_LIMIT = 4 * 1024; // output clamp 4KB
 
@@ -275,7 +275,12 @@ export class NodeAdapter extends BaseAdapter {
     return {
       argv: npmRunArgv(['run', 'start']),
       cwd: workspace,
-      env: { PORT: String(port), NEXT_TELEMETRY_DISABLED: '1' },
+      env: {
+        PORT: String(port),
+        NEXT_TELEMETRY_DISABLED: '1',
+        DATA_DIR: path.join(workspace, 'data-dir'),
+        APPDATA: path.join(workspace, 'data-dir'),
+      },
       port,
     };
   }

@@ -38,13 +38,17 @@ jobs:
           # Lock expired bila artifact 'vm-chain-lock' terbaru tidak ada, atau
           # isinya expires_at sudah lewat (watchdog hanya boleh dispatch jika
           # (a) DAN (b) terpenuhi — desain §15.1 anti split-brain).
-          RUN_ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=vm-chain-lock" --jq '.artifacts[0].id // empty')
+          RUN_ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=vm-chain-lock" --jq '[.artifacts[] | select(.expired == false)][0].id // empty')
           if [ -z "$RUN_ID" ]; then
             echo "expired=true" >> "$GITHUB_OUTPUT"
-            echo "chain-lock tidak ditemukan → anggap expired"
+            echo "chain-lock tidak ditemukan atau sudah expired → anggap expired"
             exit 0
           fi
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${RUN_ID}/zip" > lock.zip
+          if ! gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${RUN_ID}/zip" > lock.zip 2>/dev/null; then
+            echo "expired=true" >> "$GITHUB_OUTPUT"
+            echo "chain-lock gagal diunduh → anggap expired"
+            exit 0
+          fi
           python3 -c "
           import zipfile, json, sys
           z = zipfile.ZipFile('lock.zip')
@@ -61,15 +65,16 @@ jobs:
       - name: Dispatch vm.yml (chain baru dari backup valid terakhir)
         if: steps.active.outputs.in_progress == '0' && steps.lock.outputs.expired == 'true'
         run: |
-          gh workflow run vm.yml --ref "${GITHUB_REF_NAME:-main}"
+          gh workflow run vm.yml -R "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF_NAME:-main}"
           echo "watchdog: vm.yml dispatched"
 
       - name: Alert manusia (issue anti-duplikat) bila dispatch gagal
         if: failure()
         run: |
-          EXISTING=$(gh issue list --label runner-down --state open --json id --jq 'length // 0')
+          EXISTING=$(gh issue list -R "${GITHUB_REPOSITORY}" --label runner-down --state open --json id --jq 'length // 0')
           if [ "$EXISTING" = "0" ]; then
             gh issue create \
+              -R "${GITHUB_REPOSITORY}" \
               --title "[runner-down] self-chain GAGAL — perlu intervensi manual" \
               --label runner-down \
               --body "Watchdog recovery.yml gagal dispatch vm.yml. State terakhir ada di artifact vm-state-* terakhir yang valid. Prosedur manual: docs/OPERATIONS.md (bagian Disaster recovery)."

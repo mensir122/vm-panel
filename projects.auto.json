@@ -4,7 +4,7 @@
     "type": "node",
     "port": 20127,
     "repo_url": "https://github.com/decolua/9router",
-    "git_branch": "main",
+    "git_branch": "master",
     "enabled": true
   }
 ]

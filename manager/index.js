@@ -71,6 +71,7 @@ export class Manager {
     this.restoreManager = null;
     this.exportManager = null;
     this.importManager = null;
+    this.secretManager = null;
     this.internalSupervisor = null; // InternalSupervisor — TIDAK auto-start default
     this.supervisorStarted = false;
     this.cliTokenPath = null;
@@ -261,6 +262,14 @@ export class Manager {
 
     const { ImportManager } = await import('./import_manager/index.js');
     this.importManager = new ImportManager({ dataDir: this.dataDir });
+
+    const { SecretManager } = await import('./secret_manager/index.js');
+    this.secretManager = new SecretManager({
+      rootDir: this.rootDir,
+      dataDir: this.dataDir,
+      masterKey: process.env.VPANEL_MASTER_KEY,
+      projectsDb: this.dbs.projects?.db ?? null,
+    });
 
     const { InternalSupervisor } = await import('./recovery_manager/index.js');
     this.internalSupervisor = new InternalSupervisor({
@@ -465,6 +474,7 @@ export class Manager {
     this.restoreManager = null;
     this.exportManager = null;
     this.importManager = null;
+    this.secretManager = null;
     // 4. close DB
     for (const key of ['projects', 'services', 'platform']) {
       const h = this.dbs[key];

@@ -570,6 +570,161 @@ export function registerDataRoutes({ manager } = {}) {
         return { serviceId, lines, total, truncated: total > lines.length };
       },
     },
+
+    // ── secrets / brankas ───────────────────────────────────────────────────
+    {
+      method: 'GET',
+      pattern: '/secrets',
+      permission: 'secret.view',
+      handler: () => {
+        const sm = requireMod(manager.secretManager);
+        return { secrets: sm.listSecrets() };
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/secrets/init',
+      permission: 'secret.view',
+      handler: ({ body }) => {
+        const sm = requireMod(manager.secretManager);
+        return sm.init(body ?? {});
+      },
+    },
+
+    // ── project config files (koper) ────────────────────────────────────────
+    {
+      method: 'GET',
+      pattern: '/projects/:id/config',
+      permission: 'secret.view',
+      handler: ({ params }) => {
+        const sm = requireMod(manager.secretManager);
+        return { configs: sm.listConfigs(params.id) };
+      },
+    },
+    {
+      method: 'GET',
+      pattern: '/projects/:id/config/:filename',
+      permission: 'secret.view',
+      handler: ({ params }) => {
+        const sm = requireMod(manager.secretManager);
+        return sm.getConfig(params.id, params.filename);
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/config',
+      permission: 'secret.view',
+      handler: ({ params, body }) => {
+        const sm = requireMod(manager.secretManager);
+        return sm.saveConfig(params.id, body ?? {});
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/config/:filename/remove-request',
+      permission: 'secret.view',
+      handler: ({ params }) => {
+        const sm = requireMod(manager.secretManager);
+        return sm.issueConfirmToken('config', `${params.id}/${params.filename}`);
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/config/:filename/remove',
+      permission: 'secret.view',
+      handler: ({ params, body }) => {
+        const sm = requireMod(manager.secretManager);
+        sm.consumeConfirmToken(body?.confirmToken, 'config', `${params.id}/${params.filename}`);
+        return sm.removeConfig(params.id, params.filename);
+      },
+    },
+
+    // ── project env refs ────────────────────────────────────────────────────
+    {
+      method: 'GET',
+      pattern: '/projects/:id/env',
+      permission: 'secret.view',
+      handler: ({ params }) => {
+        const sm = requireMod(manager.secretManager);
+        return { env: sm.listProjectEnv(params.id) };
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/env',
+      permission: 'secret.view',
+      handler: ({ params, body }) => {
+        const sm = requireMod(manager.secretManager);
+        return sm.setProjectEnv(params.id, body ?? {});
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/env/:name/remove-request',
+      permission: 'secret.view',
+      handler: ({ params }) => {
+        const sm = requireMod(manager.secretManager);
+        return sm.issueConfirmToken('env', `${params.id}/${params.name}`);
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/env/:name/remove',
+      permission: 'secret.view',
+      handler: ({ params, body }) => {
+        const sm = requireMod(manager.secretManager);
+        sm.consumeConfirmToken(body?.confirmToken, 'env', `${params.id}/${params.name}`);
+        return sm.removeProjectEnv(params.id, params.name);
+      },
+    },
+
+    // ── project hooks (startup hook / suntik config) ────────────────────────
+    {
+      method: 'GET',
+      pattern: '/projects/:id/hook',
+      permission: 'secret.view',
+      handler: ({ params }) => {
+        const sm = requireMod(manager.secretManager);
+        return { hook: sm.getProjectHook(params.id) };
+      },
+    },
+    {
+      method: 'PUT',
+      pattern: '/projects/:id/hook',
+      permission: 'secret.view',
+      handler: ({ params, body }) => {
+        const sm = requireMod(manager.secretManager);
+        return sm.setProjectHook(params.id, body ?? {});
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/hook/test',
+      permission: 'secret.view',
+      handler: async ({ params }) => {
+        const sm = requireMod(manager.secretManager);
+        return sm.testProjectHook(params.id);
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/hook/remove-request',
+      permission: 'secret.view',
+      handler: ({ params }) => {
+        const sm = requireMod(manager.secretManager);
+        return sm.issueConfirmToken('hook', params.id);
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/hook/remove',
+      permission: 'secret.view',
+      handler: ({ params, body }) => {
+        const sm = requireMod(manager.secretManager);
+        sm.consumeConfirmToken(body?.confirmToken, 'hook', params.id);
+        return sm.removeProjectHook(params.id);
+      },
+    },
   ];
 }
 

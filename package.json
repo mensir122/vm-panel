@@ -1,4 +1,4 @@
-﻿{
+{
     "name":  "vm-panel",
     "version":  "0.1.0",
     "description":  "VM-Panel â€” VM deployment manager (fresh system; desain: docs/DESIGN.md)",
@@ -12,8 +12,8 @@
                 "vmctl":  "./bin/vmctl.js"
             },
     "scripts":  {
-                    "test":  "node --test",
-                    "test:unit":  "node --test",
+                    "test":  "node --test tests/unit/*.test.js",
+                    "test:unit":  "node --test tests/unit/*.test.js",
                     "test:integration":  "node --test tests/integration/*.test.js",
                     "test:security":  "node --test tests/security/*.test.js",
                     "test:recovery":  "node --test tests/recovery/*.test.js",

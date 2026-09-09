@@ -36,6 +36,14 @@ import { ManagerClient } from '../../lib/api-client.js';
 import { VmPanelError, VALIDATION, NOT_FOUND, PERMISSION_DENIED } from '../../lib/errors.js';
 
 const BODY_LIMIT_BYTES = 1024 * 1024; // 1MB
+/** Batas ukuran file config koper per project (client + server side). */
+const CONFIG_FILE_MAX_BYTES = 512 * 1024; // 512KB
+/** Potong tampilan isi config di kartu "Lihat" (file ≤512KB bisa panjang). */
+const CONFIG_VIEW_MAX_CHARS = 200_000;
+/** Maks file config yang isinya diambil untuk kartu "Lihat" per render. */
+const CONFIG_MAX_FILES_VIEW = 20;
+/** Action PermissionManager untuk Config & Brankas (owner-only, matriks §11.2). */
+const VAULT_ACTION = 'secret.view';
 const RATE_WINDOW_MS = 60_000;
 const DEFAULT_PORT = 8080;
 const DEFAULT_RATE_PER_MIN = 60;
@@ -143,14 +151,41 @@ function csrfInput(token) {
   return `<input type="hidden" name="_csrf" value="${escapeHtml(String(token ?? ''))}">`;
 }
 
-/** Form aksi POST (button opsional data-confirm / data-confirm-phrase). */
-function actionForm(action, { label, cls = 'btn btn--sm', confirm = '', phrase = '', csrf = '', hidden = {} } = {}) {
+/** Form aksi POST (button opsional data-confirm / -detail / -phrase). */
+function actionForm(action, { label, cls = 'btn btn--sm', confirm = '', detail = '', phrase = '', csrf = '', hidden = {} } = {}) {
   const hiddenHtml = Object.entries(hidden)
     .map(([k, v]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(v)}">`)
     .join('');
   const confirmAttr = confirm ? ` data-confirm="${escapeHtml(confirm)}"` : '';
+  const detailAttr = detail ? ` data-confirm-detail="${escapeHtml(detail)}"` : '';
   const phraseAttr = phrase ? ` data-confirm-phrase="${escapeHtml(phrase)}"` : '';
-  return `<form method="post" action="${escapeHtml(action)}">${hiddenHtml}${csrfInput(csrf)}<button class="${cls}" type="submit"${confirmAttr}${phraseAttr}>${escapeHtml(label)}</button></form>`;
+  return `<form method="post" action="${escapeHtml(action)}">${hiddenHtml}${csrfInput(csrf)}<button class="${cls}" type="submit"${confirmAttr}${detailAttr}${phraseAttr}>${escapeHtml(label)}</button></form>`;
+}
+
+/**
+ * Satu field form: label + kontrol + hint opsional (kelas CSS .field/…
+ * persis panel.css; dipakai kartu Config & Brankas supaya form tidak
+ * ditulis dua kali). Kontrol: textarea bila `rows` di-set, select bila
+ * `options` diisi, sisanya input text (mono bila `mono`).
+ */
+function fieldHtml(name, label, { hint = '', rows = 0, options = [], value = '', placeholder = '', mono = false, disabled = false } = {}) {
+  const id = `cv-${escapeHtml(name)}`;
+  const dis = disabled ? ' disabled' : '';
+  const ph = placeholder ? ` placeholder="${escapeHtml(placeholder)}"` : '';
+  const cls = mono ? 'field__input field__input--mono' : 'field__input';
+  let control;
+  if (rows > 0) {
+    control = `<textarea class="${cls}" id="${id}" name="${escapeHtml(name)}" rows="${escapeHtml(rows)}"${dis}${ph}>${escapeHtml(value)}</textarea>`;
+  } else if (options.length > 0) {
+    const opts = options
+      .map((o) => `<option value="${escapeHtml(o.value)}"${o.value === value ? ' selected' : ''}>${escapeHtml(o.label)}</option>`)
+      .join('');
+    control = `<select class="${cls}" id="${id}" name="${escapeHtml(name)}"${dis}>${opts}</select>`;
+  } else {
+    control = `<input class="${cls}" type="text" id="${id}" name="${escapeHtml(name)}" value="${escapeHtml(value)}"${dis}${ph} autocomplete="off" spellcheck="false">`;
+  }
+  const hintHtml = hint ? `<p class="field__hint">${escapeHtml(hint)}</p>` : '';
+  return `<div class="field"><label class="field__label" for="${id}">${escapeHtml(label)}</label>${control}${hintHtml}</div>`;
 }
 
 /** Mapping dot: healthy→ok, unhealthy/failed/crash_loop→fail, degraded→warn, stopped/disabled→off, unknown→unknown. */
@@ -312,6 +347,263 @@ function serviceActions(svc, csrf) {
   return `<div class="table__actions">${forms.join('')}</div>`;
 }
 
+// --- fragmen kartu Config & Brankas (halaman detail project) ------------------
+
+/** Encode filename/envName ke segmen URL path (aman dikonsumsi regex panel). */
+function cvPathSeg(v) {
+  return encodeURIComponent(String(v ?? '')).replaceAll('.', '%2E');
+}
+
+/** Validasi segmen dari URL (filename/envName): aman & non-kosong, else null. */
+function cvValidSeg(v) {
+  return typeof v === 'string' && v !== '' && !/[\\/\0]/.test(v) ? v : null;
+}
+
+/** decodeURIComponent yang aman (segmen rusak → null, bukan throw). */
+function safeDecode(seg) {
+  try {
+    return decodeURIComponent(String(seg ?? ''));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Kartu BRANKAS: status line ("Brankas aktif — N rahasia" / "Brankas belum
+ * diinisialisasi" / manager down) + tombol "Nyalakan Brankas". Setelah aktif,
+ * note "Simpan cadangan kunci .env di tempat aman" tampil di bawah status.
+ */
+function cvVaultCard({ vault, csrf, encId }) {
+  const statusLine = !vault.ok
+    ? 'Manager tidak merespons'
+    : vault.initialized
+      ? `Brankas aktif — ${vault.count} rahasia`
+      : 'Brankas belum diinisialisasi';
+  const initForm = vault.ok && !vault.initialized
+    ? actionForm(`/projects/${encId}/vault-init`, {
+        label: 'Nyalakan Brankas',
+        cls: 'btn btn--primary btn--sm',
+        confirm: 'Nyalakan Brankas sekarang?',
+        csrf,
+      })
+    : '';
+  const initNoteHtml = vault.ok && vault.initialized
+    ? alertFrag('info', 'Simpan cadangan kunci .env di tempat aman.')
+    : '';
+  const hint = vault.ok
+    ? vault.initialized
+      ? 'Rahasia tersimpan terenkripsi di disk panel.'
+      : 'Brankas menyimpan rahasia (password, token API) terenkripsi. Nyalakan sekali — lalu pasang variabel di bawah.'
+    : 'Periksa manager lalu muat ulang halaman.';
+  return (
+    `<section class="card"><header class="card__header"><h2 class="card__title">Brankas</h2></header>` +
+    `<div class="card__body"><dl class="kv"><dt class="kv__key">Status</dt>` +
+    `<dd class="kv__value">${escapeHtml(statusLine)}</dd></dl>` +
+    `<p class="field__hint">${escapeHtml(hint)}</p>` +
+    `${initNoteHtml}${initForm}</div></section>`
+  );
+}
+
+/**
+ * Kartu CONFIG KOPER: tabel file (nama/ukuran/tanggal) + per-baris "Lihat"
+ * (data-reveal → pre isi file hasil decode server-side) + "Hapus" (dialog
+ * data-confirm-phrase = filename; server yang men-chain remove-request→remove)
+ * + form unggah: file picker (hidden filename/contentBase64 diisi panel.js)
+ * + fallback textarea (filename + contentRaw) — keduanya POST urlencoded.
+ */
+function cvConfigCard({ configs, csrf, encId }) {
+  const enc = (f) => `${encId}/config/${cvPathSeg(f)}`;
+  const actionCells = [];
+  const views = [];
+  configs.forEach((c, i) => {
+    const f = String(c?.filename ?? '');
+    const viewId = `cv-view-${i}`;
+    views.push(
+      `<pre class="log" id="${viewId}" hidden>${escapeHtml(
+        String(c?.content ?? '').slice(0, CONFIG_VIEW_MAX_CHARS),
+      )}</pre>`,
+    );
+    actionCells.push(
+      `<div class="table__actions">` +
+        `<button type="button" class="btn btn--sm" data-reveal="#${viewId}">Lihat</button>` +
+        actionForm(`/projects/${enc(f)}/remove`, {
+          label: 'Hapus',
+          cls: 'btn btn--sm btn--danger',
+          confirm: `Hapus config "${f}"?`,
+          detail: 'File ini akan hilang permanen dari koper project.',
+          phrase: f,
+          csrf,
+        }) +
+        `</div>`,
+    );
+  });
+  const table = buildTable(
+    [
+      { label: 'Nama', cls: 'mono', cell: (r) => escapeHtml(String(r?.filename ?? '')) },
+      { label: 'Ukuran', cls: 'mono', cell: (r) => escapeHtml(fmtBytes(Number(r?.sizeBytes))) },
+      { label: 'Tanggal', cls: 'mono', cell: (r) => escapeHtml(fmtTime(r?.updatedAt)) },
+      { label: 'Aksi', cell: (r) => r?.actions ?? '' },
+    ],
+    configs.map((c, i) => ({ ...c, actions: actionCells[i] })),
+    {
+      empty: {
+        title: 'Belum ada config koper.',
+        hint: 'Unggah file config (maksimal 512 KB) di bawah.',
+      },
+    },
+  );
+  const uploadForm =
+    `<form method="post" action="/projects/${encId}/config" class="stack">` +
+    `<input type="hidden" name="filename" value="">` +
+    `<input type="hidden" name="contentBase64" value="">` +
+    csrfInput(csrf) +
+    `<div class="field"><label class="field__label" for="cv-config-file">Pilih file</label>` +
+    `<input class="field__input" type="file" id="cv-config-file" data-config-upload>` +
+    `<p class="field__hint" id="cv-config-file-status" data-config-upload-status>Maksimal 512 KB.</p></div>` +
+    `<div data-config-manual>` +
+    fieldHtml('filename', 'Nama file', { placeholder: 'app.env', mono: true }) +
+    `</div>` +
+    `<div data-config-manual>` +
+    fieldHtml('contentRaw', 'Tempel isi file', { rows: 4, placeholder: 'isi config', mono: true }) +
+    `</div>` +
+    `<button class="btn btn--primary" type="submit">Unggah config</button>` +
+    `</form>`;
+  return (
+    `<section class="card"><header class="card__header"><h2 class="card__title">Config koper</h2>` +
+    `<span class="mono muted">${escapeHtml(String(configs.length))} file</span></header><div class="card__body">` +
+    table +
+    views.join('') +
+    uploadForm +
+    `</div></section>`
+  );
+}
+
+/**
+ * Kartu ENV VARS: tabel envName → secretName (nama saja, tanpa nilai) +
+ * tombol Hapus (dialog data-confirm-phrase = envName; server yang men-chain
+ * remove-request→remove) + form pasang (pilih Rahasia + tulis nama variabel).
+ */
+function cvEnvCard({ vault, envRows, csrf, encId }) {
+  const enc = (n) => `${encId}/env/${cvPathSeg(n)}`;
+  const actionCells = envRows.map((r) => {
+    const n = String(r?.envName ?? '');
+    return actionForm(`/projects/${enc(n)}/remove`, {
+      label: 'Hapus',
+      cls: 'btn btn--sm btn--danger',
+      confirm: `Hapus variabel "${n}"?`,
+      detail: 'Aplikasi tidak akan menerima variabel ini lagi.',
+      phrase: n,
+      csrf,
+    });
+  });
+  const table = buildTable(
+    [
+      { label: 'Nama variabel', cls: 'mono', cell: (r) => escapeHtml(String(r?.envName ?? '')) },
+      { label: 'Rahasia', cls: 'mono', cell: (r) => escapeHtml(String(r?.secretName ?? '—')) },
+      { label: 'Aksi', cell: (r) => r?.actions ?? '' },
+    ],
+    envRows.map((r, i) => ({ ...r, actions: actionCells[i] })),
+    {
+      empty: {
+        title: 'Belum ada variabel terhubung.',
+        hint: 'Pasang satu di bawah — aplikasi menerima variabel ini sebagai environment saat berjalan.',
+      },
+    },
+  );
+  const form = vault.names.length
+    ? `<form method="post" action="/projects/${encId}/env" class="stack">` +
+      csrfInput(csrf) +
+      fieldHtml('envName', 'Nama variabel', { placeholder: 'DATABASE_URL', mono: true }) +
+      fieldHtml('secretName', 'Rahasia', {
+        options: vault.names.map((n) => ({ value: n, label: n })),
+      }) +
+      `<button class="btn btn--primary" type="submit">Pasang variabel</button>` +
+      `</form>`
+    : `<p class="field__hint">Brankas masih kosong — nyalakan Brankas dan buat rahasia dulu, lalu pasang di sini.</p>`;
+  return (
+    `<section class="card"><header class="card__header"><h2 class="card__title">Variabel rahasia (env)</h2>` +
+    `<span class="mono muted">${escapeHtml(String(envRows.length))} variabel</span></header><div class="card__body">` +
+    table +
+    form +
+    `</div></section>`
+  );
+}
+
+/**
+ * Kartu SUNTIK OTOMATIS (startup hook): belum ada → form url + pilih config
+ + satu field rahasia (nama field + pilih Rahasia). Sudah ada → status
+ * url/bodyFile/field + "Test sekarang" (badge hasil inline via ?hookTest=ok)
+ * + "Hapus" (dialog konfirmasi; server men-chain remove-request→remove).
+ */
+function cvHookCard({ hook, testBadge, configs, vault, csrf, encId }) {
+  const bodyFileOptions = configs.map((c) => ({
+    value: String(c?.filename ?? ''),
+    label: String(c?.filename ?? ''),
+  }));
+  const hookForm =
+    `<form method="post" action="/projects/${encId}/hook" class="stack">` +
+    csrfInput(csrf) +
+    fieldHtml('hookUrl', 'Alamat tujuan', {
+      placeholder: 'http://127.0.0.1:PORT/api/settings/database',
+      mono: true,
+    }) +
+    (bodyFileOptions.length
+      ? fieldHtml('hookBodyFile', 'Config sebagai isi', { options: bodyFileOptions })
+      : fieldHtml('hookBodyFile', 'Config sebagai isi', {
+          hint: 'Belum ada config — unggah dulu di kartu Config koper.',
+          options: [{ value: '', label: '(belum ada config)' }],
+        })) +
+    fieldHtml('hookFieldName', 'Nama field rahasia', { placeholder: 'password', mono: true }) +
+    (vault.names.length
+      ? fieldHtml('hookSecretName', 'Rahasia untuk field', {
+          options: vault.names.map((n) => ({ value: n, label: n })),
+        })
+      : fieldHtml('hookSecretName', 'Rahasia untuk field', {
+          hint: 'Brankas masih kosong — nyalakan Brankas dan buat rahasia dulu.',
+          options: [{ value: '', label: '(belum ada rahasia)' }],
+        })) +
+    `<button class="btn btn--primary" type="submit">Pasang suntikan</button>` +
+    `</form>`;
+  const testForm = hook
+    ? actionForm(`/projects/${encId}/hook/test`, {
+        label: 'Test sekarang',
+        cls: 'btn btn--primary btn--sm',
+        csrf,
+      })
+    : '';
+  const deleteForm = hook
+    ? actionForm(`/projects/${encId}/hook/remove`, {
+        label: 'Hapus',
+        cls: 'btn btn--sm btn--danger',
+        confirm: 'Hapus suntikan otomatis?',
+        detail: 'Project tidak akan disuntik konfigurasi lagi saat berjalan.',
+        csrf,
+      })
+    : '';
+  const hookStatus = hook
+    ? `<dl class="kv">` +
+      `<dt class="kv__key">Alamat</dt><dd class="kv__value mono">${escapeHtml(String(hook?.url ?? '—'))}</dd>` +
+      `<dt class="kv__key">Config</dt><dd class="kv__value mono">${escapeHtml(String(hook?.bodyFile ?? '—'))}</dd>` +
+      `<dt class="kv__key">Field rahasia</dt><dd class="kv__value mono">${escapeHtml(
+        String(hook?.secretFields?.[0]?.fieldName ?? '—'),
+      )}</dd>` +
+      `<dt class="kv__key">Dipasang</dt><dd class="kv__value mono">${escapeHtml(fmtTime(hook?.updatedAt))}</dd>` +
+      `</dl>`
+    : emptyState({
+        title: 'Suntikan belum dipasang.',
+        hint: 'Isi form di bawah — config + rahasia disuntikkan ke aplikasi saat berjalan.',
+      });
+  return (
+    `<section class="card"><header class="card__header"><h2 class="card__title">Suntik otomatis</h2></header>` +
+    `<div class="card__body">` +
+    (testBadge ?? '') +
+    hookStatus +
+    `<div class="table__actions">${testForm}${deleteForm}</div>` +
+    hookForm +
+    `</div></section>`
+  );
+}
+
 export class PanelServer {
   /**
    * @param {{rootDir?: string, config?: object, dataDir: string,
@@ -369,6 +661,9 @@ export class PanelServer {
   #rootDir; // repo root: lokasi projects.auto.json + cwd git sync
   #lastSync = null; // hasil sync GitHub terakhir (alert sukses kartu GitHub Sync)
   #detailCache = { at: 0, map: new Map() }; // name → repoUrl (badge sync, TTL)
+  // Hasil test "Suntik otomatis" terakhir per project (badge di kartu hook) —
+  // in-memory sekali sesi server, pola sama dengan #lastSync.
+  #lastHookTest = null; // { id, ok, status, attempts, error, at }
 
   // --- lifecycle -----------------------------------------------------------
 
@@ -618,6 +913,30 @@ export class PanelServer {
       return { ok: true, data: await fn() };
     } catch {
       return { ok: false, data: null };
+    }
+  }
+
+  /**
+   * Baca daftar secret (GET /secrets → {secrets:[…]}). NOT_FOUND dari manager
+   * → brankas memang belum diinisialisasi (bukan error); error transport/
+   * lainnya → ok:false ("Manager tidak merespons"). Metadata saja — TIDAK
+   * pernah ada nilai rahasia.
+   */
+  async #fetchVault() {
+    try {
+      const data = await this.#getManager().request('GET', '/secrets');
+      const rows = Array.isArray(data?.secrets) ? data.secrets : [];
+      const names = [];
+      for (const s of rows) {
+        const n = String(s?.name ?? '');
+        if (n !== '') names.push(n);
+      }
+      return { ok: true, initialized: true, count: rows.length, names };
+    } catch (e) {
+      if (e instanceof VmPanelError && e.code === NOT_FOUND) {
+        return { ok: true, initialized: false, count: 0, names: [] };
+      }
+      return { ok: false, initialized: false, count: 0, names: [] };
     }
   }
 
@@ -1502,6 +1821,67 @@ export class PanelServer {
         `</dl></div></section>`
       : emptyState({ title: 'No settings.', hint: 'Settings appear once the project is deployed.' });
 
+    // Config & Brankas owner-only: permission 'secret.view' (matriks §11.2)
+    // dicek sebelum fetch + render; tanpa izin → placeholder kosong (var
+    // template tetap ada, panel-section kosong di halaman).
+    let configVaultSection = '';
+    const canManageVault = project
+      ? this.#auth.perm.checkPermission({ userId: session.user.userId, action: VAULT_ACTION }).allowed
+      : false;
+    if (canManageVault) {
+      const encId = encodeURIComponent(String(id));
+      const [vault, configsRes, envRes, hookRes] = await Promise.all([
+        this.#fetchVault(),
+        this.#managerGet(`/projects/${encId}/config`),
+        this.#managerGet(`/projects/${encId}/env`),
+        this.#managerGet(`/projects/${encId}/hook`),
+      ]);
+
+      // configs: daftar GET /projects/:id/config + isi per-file via
+      // GET /projects/:id/config/:filename (decode server-side untuk "Lihat").
+      const configRows =
+        configsRes.ok && Array.isArray(configsRes.data?.configs) ? configsRes.data.configs : [];
+      const configs = [];
+      for (const c of configRows.slice(0, CONFIG_MAX_FILES_VIEW)) {
+        const f = cvValidSeg(String(c?.filename ?? ''));
+        let content;
+        if (f) {
+          // eslint-disable-next-line no-await-in-loop
+          const one = await this.#managerGet(`/projects/${encId}/config/${cvPathSeg(f)}`);
+          if (one.ok && one.data && typeof one.data.contentBase64 === 'string') {
+            try {
+              content = Buffer.from(one.data.contentBase64, 'base64').toString('utf8');
+            } catch {
+              content = undefined; // base64 rusak → tanpa pratinjau
+            }
+          }
+        }
+        configs.push({ ...c, content });
+      }
+
+      const envRows = envRes.ok && Array.isArray(envRes.data?.env) ? envRes.data.env : [];
+      const hook =
+        hookRes.ok && hookRes.data && typeof hookRes.data === 'object' ? hookRes.data.hook ?? null : null;
+
+      // Badge hasil "Test sekarang" terakhir (in-memory #lastHookTest, one-shot
+      // — pola sama dengan alert sukses GitHub Sync).
+      let testBadge = '';
+      if (hook && this.#lastHookTest && this.#lastHookTest.id === String(id)) {
+        const t = this.#lastHookTest;
+        this.#lastHookTest = null;
+        const detail = t.ok
+          ? `Tersambung — percobaan ke-${t.attempts}${t.status ? `, HTTP ${t.status}` : ''}`
+          : `Tidak tersambung: ${t.error ?? 'kesalahan tidak diketahui'} (${t.attempts} percobaan)`;
+        testBadge = alertFrag(t.ok ? 'success' : 'error', detail);
+      }
+
+      configVaultSection =
+        cvVaultCard({ vault, csrf: session.csrfToken, encId }) +
+        cvConfigCard({ configs, csrf: session.csrfToken, encId }) +
+        cvEnvCard({ vault, envRows, csrf: session.csrfToken, encId }) +
+        cvHookCard({ hook, testBadge, configs, vault, csrf: session.csrfToken, encId });
+    }
+
     return {
       template: 'project-detail',
       altTemplate: 'project_detail',
@@ -1516,6 +1896,7 @@ export class PanelServer {
         healthSection,
         logsSection,
         settingsForm,
+        configVaultSection,
       }),
     };
   }
@@ -1943,7 +2324,10 @@ export class PanelServer {
         } catch {
           /* best-effort: gagal baca project → deploy workspace default */
         }
-        await this.#getManager().request('POST', `/projects/${encodeURIComponent(id)}/deploy`, { body });
+        await this.#getManager().request('POST', `/projects/${encodeURIComponent(id)}/deploy`, {
+          body,
+          timeoutMs: 900_000,
+        });
       } catch (e) {
         if (e instanceof VmPanelError) {
           // Error → alert di halaman detail (pola graceful; tanpa crash).
@@ -1978,7 +2362,279 @@ export class PanelServer {
       return this.#redirect(res, '/backups');
     }
 
+    // --- Config & Brankas (owner-only via secret.view; manager API dipanggil
+    // dengan try/catch → error dirender sebagai banner di halaman detail,
+    // pola persis route deploy di atas) ---------------------------------------
+
+    // POST /projects/:id/vault-init → manager POST /secrets/init
+    m = pathname.match(/^\/projects\/([^/]+)\/vault-init$/);
+    if (m) {
+      await readAndCsrf();
+      this.#requirePermission(session, VAULT_ACTION);
+      const id = decodeURIComponent(m[1]);
+      try {
+        await this.#getManager().request('POST', '/secrets/init', { body: {} });
+      } catch (e) {
+        if (e instanceof VmPanelError) return this.#renderProjectError(session, id, res, e);
+        throw e;
+      }
+      return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
+    }
+
+    // POST /projects/:id/config → manager POST /projects/:id/config
+    // (filename + contentBase64; fallback textarea "contentRaw" di-encode
+    // server-side; cap 512KB di-hitung dari byte hasil decode).
+    m = pathname.match(/^\/projects\/([^/]+)\/config$/);
+    if (m) {
+      const body = await readAndCsrf();
+      this.#requirePermission(session, VAULT_ACTION);
+      const id = decodeURIComponent(m[1]);
+      const filename = String(body.filename ?? '').trim();
+      const rawB64 = String(body.contentBase64 ?? '');
+      const rawPlain = String(body.contentRaw ?? '');
+      if (!cvValidSeg(filename) || filename.length > 200) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, 'Nama file tidak valid (hindari / dan \\, maksimal 200 karakter).'),
+        );
+      }
+      let decoded;
+      let contentBase64;
+      if (rawB64 !== '') {
+        decoded = Buffer.from(rawB64, 'base64'); // dari file picker (panel.js)
+        contentBase64 = rawB64;
+      } else if (rawPlain !== '') {
+        decoded = Buffer.from(rawPlain, 'utf8'); // fallback textarea (tanpa JS)
+        contentBase64 = decoded.toString('base64');
+      } else {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, 'Isi file config kosong — pilih file atau tempel isinya.'),
+        );
+      }
+      if (decoded.length === 0) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, 'Isi file config kosong — pilih file atau tempel isinya.'),
+        );
+      }
+      if (decoded.length > CONFIG_FILE_MAX_BYTES) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, `File terlalu besar (${fmtBytes(decoded.length)}) — maksimal ${fmtBytes(CONFIG_FILE_MAX_BYTES)}.`),
+        );
+      }
+      try {
+        await this.#getManager().request('POST', `/projects/${encodeURIComponent(id)}/config`, {
+          body: { filename, contentBase64 },
+        });
+      } catch (e) {
+        if (e instanceof VmPanelError) return this.#renderProjectError(session, id, res, e);
+        throw e;
+      }
+      return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
+    }
+
+    // POST /projects/:id/config/:filename/remove → two-phase di panel:
+    // manager remove-request → remove (confirmToken TIDAK pernah ke UI;
+    // konfirmasi user lewat dialog data-confirm-phrase = filename).
+    m = pathname.match(/^\/projects\/([^/]+)\/config\/([^/]+)\/remove$/);
+    if (m) {
+      await readAndCsrf();
+      this.#requirePermission(session, VAULT_ACTION);
+      const id = decodeURIComponent(m[1]);
+      const filename = safeDecode(m[2]);
+      if (!cvValidSeg(filename)) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, 'Nama file tidak valid.'),
+        );
+      }
+      try {
+        await this.#vaultRemoveChain(
+          'POST',
+          `/projects/${encodeURIComponent(id)}/config/${cvPathSeg(filename)}`,
+        );
+      } catch (e) {
+        if (e instanceof VmPanelError) return this.#renderProjectError(session, id, res, e);
+        throw e;
+      }
+      return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
+    }
+
+    // POST /projects/:id/env → manager POST /projects/:id/env
+    m = pathname.match(/^\/projects\/([^/]+)\/env$/);
+    if (m) {
+      const body = await readAndCsrf();
+      this.#requirePermission(session, VAULT_ACTION);
+      const id = decodeURIComponent(m[1]);
+      const envName = String(body.envName ?? '').trim();
+      const secretName = String(body.secretName ?? '').trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, 'Nama variabel tidak valid — pakai huruf/angka/garis bawah, jangan mulai dengan angka.'),
+        );
+      }
+      if (secretName === '') {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, 'Pilih rahasia untuk variabel ini.'),
+        );
+      }
+      try {
+        await this.#getManager().request('POST', `/projects/${encodeURIComponent(id)}/env`, {
+          body: { envName, secretName },
+        });
+      } catch (e) {
+        if (e instanceof VmPanelError) return this.#renderProjectError(session, id, res, e);
+        throw e;
+      }
+      return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
+    }
+
+    // POST /projects/:id/env/:envName/remove → two-phase (sama seperti config)
+    m = pathname.match(/^\/projects\/([^/]+)\/env\/([^/]+)\/remove$/);
+    if (m) {
+      await readAndCsrf();
+      this.#requirePermission(session, VAULT_ACTION);
+      const id = decodeURIComponent(m[1]);
+      const envName = safeDecode(m[2]);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName ?? '')) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, 'Nama variabel tidak valid.'),
+        );
+      }
+      try {
+        await this.#vaultRemoveChain(
+          'POST',
+          `/projects/${encodeURIComponent(id)}/env/${cvPathSeg(envName)}`,
+        );
+      } catch (e) {
+        if (e instanceof VmPanelError) return this.#renderProjectError(session, id, res, e);
+        throw e;
+      }
+      return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
+    }
+
+    // POST /projects/:id/hook → manager PUT /projects/:id/hook
+    // (MVP: satu field rahasia → secretFields [{fieldName, secretName}])
+    m = pathname.match(/^\/projects\/([^/]+)\/hook$/);
+    if (m) {
+      const body = await readAndCsrf();
+      this.#requirePermission(session, VAULT_ACTION);
+      const id = decodeURIComponent(m[1]);
+      const url = String(body.hookUrl ?? '').trim();
+      const bodyFile = String(body.hookBodyFile ?? '').trim();
+      const fieldName = String(body.hookFieldName ?? '').trim();
+      const secretName = String(body.hookSecretName ?? '').trim();
+      let parsedUrl = null;
+      try {
+        parsedUrl = new URL(url);
+      } catch {
+        parsedUrl = null;
+      }
+      if (!parsedUrl || (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:')) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, 'Alamat tidak valid — pakai http:// atau https://.'),
+        );
+      }
+      if (!cvValidSeg(bodyFile)) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, 'Pilih file config sebagai isi suntikan.'),
+        );
+      }
+      if (fieldName !== '' && secretName === '') {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(VALIDATION, `Pilih rahasia untuk field "${fieldName}".`),
+        );
+      }
+      const payload = {
+        url,
+        bodyFile,
+        secretFields: fieldName !== '' ? [{ fieldName, secretName }] : [],
+      };
+      try {
+        await this.#getManager().request('PUT', `/projects/${encodeURIComponent(id)}/hook`, { body: payload });
+      } catch (e) {
+        if (e instanceof VmPanelError) return this.#renderProjectError(session, id, res, e);
+        throw e;
+      }
+      return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
+    }
+
+    // POST /projects/:id/hook/test → manager POST /projects/:id/hook/test;
+    // hasil disimpan in-memory (#lastHookTest) → redirect → badge di kartu.
+    m = pathname.match(/^\/projects\/([^/]+)\/hook\/test$/);
+    if (m) {
+      await readAndCsrf();
+      this.#requirePermission(session, VAULT_ACTION);
+      const id = decodeURIComponent(m[1]);
+      try {
+        const r = await this.#getManager().request('POST', `/projects/${encodeURIComponent(id)}/hook/test`, {
+          body: {},
+        });
+        this.#lastHookTest = {
+          id: String(id),
+          ok: r?.ok === true,
+          status: Number.isFinite(Number(r?.status)) ? Number(r.status) : null,
+          attempts: Number.isFinite(Number(r?.attempts)) ? Number(r.attempts) : 1,
+          error: typeof r?.error === 'string' ? r.error : '',
+          at: new Date().toISOString(),
+        };
+      } catch (e) {
+        if (e instanceof VmPanelError) return this.#renderProjectError(session, id, res, e);
+        throw e;
+      }
+      return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
+    }
+
+    // POST /projects/:id/hook/remove → two-phase (sama seperti config)
+    m = pathname.match(/^\/projects\/([^/]+)\/hook\/remove$/);
+    if (m) {
+      await readAndCsrf();
+      this.#requirePermission(session, VAULT_ACTION);
+      const id = decodeURIComponent(m[1]);
+      try {
+        await this.#vaultRemoveChain('POST', `/projects/${encodeURIComponent(id)}/hook`);
+      } catch (e) {
+        if (e instanceof VmPanelError) return this.#renderProjectError(session, id, res, e);
+        throw e;
+      }
+      return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
+    }
+
     return this.#sendError(res, { url: pathname }, 404, NOT_FOUND, 'endpoint tidak ditemukan');
+  }
+
+  /**
+   * Render ulang halaman detail project dengan banner error (pola route
+   * deploy: status dari STATUS_BY_CODE, tanpa crash).
+   */
+  async #renderProjectError(session, id, res, err) {
+    const page = await this.#pageProjectDetail(session, id, '/projects', {
+      banner: alertFrag('error', err.message),
+    });
+    return this.#renderManaged(res, { ...page, status: STATUS_BY_CODE[err.code] ?? 500 });
+  }
+
+  /**
+   * Two-phase remove di sisi panel: POST "<base>/remove-request" → ambil
+   * confirmToken → POST "<base>/remove" {confirmToken}. Token TIDAK pernah
+   * dikirim ke browser — konfirmasi user memakai dialog data-confirm-phrase.
+   */
+  async #vaultRemoveChain(method, basePath) {
+    const client = this.#getManager();
+    const rr = await client.request(method, `${basePath}/remove-request`, { body: {} });
+    const token = rr && typeof rr.confirmToken === 'string' ? rr.confirmToken : '';
+    if (token === '') {
+      throw new VmPanelError(VALIDATION, 'Manager tidak mengirim token konfirmasi — coba lagi.');
+    }
+    return client.request(method, `${basePath}/remove`, { body: { confirmToken: token } });
   }
 
   /**

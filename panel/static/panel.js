@@ -7,15 +7,23 @@
    Features:
    1. Two-phase confirm for destructive actions. Any element
       with data-confirm opens a native <dialog>:
-        data-confirm          short summary of the action (required)
-        data-confirm-detail   optional extra context lines
-        data-confirm-phrase   optional string the operator must
-                              type exactly to enable Confirm
+         data-confirm          short summary of the action (required)
+         data-confirm-detail   optional extra context lines
+         data-confirm-phrase   optional string the operator must
+                               type exactly to enable Confirm
       Works on buttons (inside a form), forms (form-level) and
       links. The dialog is injected here, not in templates.
    2. Log auto-scroll: elements with [data-autoscroll] stay
       pinned to the bottom while the operator is near the
       bottom; scrolling up releases the pin.
+   3. Config file upload (Config & Brankas): an input
+      [data-config-upload] inside a form fills the hidden
+      filename/contentBase64 fields via FileReader.readAsDataURL
+      (prefix stripped), shows the chosen name+size in
+      [data-config-upload-status] and locks the submit button
+      until a file (≤ 512 KB) is ready. Without JavaScript the
+      manual paste fields (data-config-manual) stay visible and
+      the form posts the same urlencoded action.
 
    No dependencies. No network calls. No storage writes.
    ============================================================ */
@@ -225,6 +233,71 @@
     if (first) first.focus();
   }
 
+  /* ---------- Config file upload (data-config-upload) ---------- */
+
+  var CONFIG_MAX_BYTES = 512 * 1024;
+
+  function initConfigUpload(input) {
+    var form = input.form || (input.closest ? input.closest("form") : null);
+    if (!form) return;
+    var hiddenName = form.querySelector('input[type="hidden"][name="filename"]');
+    var hiddenData = form.querySelector('input[type="hidden"][name="contentBase64"]');
+    var statusEl = form.querySelector("[data-config-upload-status]");
+    var submitBtn = form.querySelector('button[type="submit"]');
+    var manualFields = form.querySelectorAll("[data-config-manual]");
+    var defaultStatus = statusEl ? statusEl.textContent : "";
+
+    /* JS aktif → fallback tempel disembunyikan + dinonaktifkan (input
+       disabled tidak ikut disubmit, jadi tidak menimpa field tersembunyi),
+       submit dikunci sampai file siap. */
+    var manualControls = form.querySelectorAll(
+      '[data-config-manual] input, [data-config-manual] textarea'
+    );
+    for (var i = 0; i < manualFields.length; i++) manualFields[i].hidden = true;
+    for (var k = 0; k < manualControls.length; k++) manualControls[k].disabled = true;
+    if (submitBtn) submitBtn.disabled = true;
+
+    function reset(msg) {
+      if (hiddenName) hiddenName.value = "";
+      if (hiddenData) hiddenData.value = "";
+      if (submitBtn) submitBtn.disabled = true;
+      if (statusEl) statusEl.textContent = msg || defaultStatus;
+    }
+
+    function setReady(name, base64, infoText) {
+      if (hiddenName) hiddenName.value = name;
+      if (hiddenData) hiddenData.value = base64;
+      if (submitBtn) submitBtn.disabled = false;
+      if (statusEl) statusEl.textContent = infoText;
+    }
+
+    input.addEventListener("change", function () {
+      var file = input.files && input.files[0] ? input.files[0] : null;
+      if (!file) {
+        reset();
+        return;
+      }
+      if (file.size > CONFIG_MAX_BYTES) {
+        reset("File terlalu besar (" + file.size + " byte) — maksimal 512 KB.");
+        return;
+      }
+      var reader = new FileReader();
+      reader.onload = function () {
+        var result = String(reader.result || "");
+        var marker = result.indexOf("base64,");
+        setReady(
+          file.name,
+          marker >= 0 ? result.slice(marker + 7) : result,
+          "Siap diunggah: " + file.name + " (" + file.size + " byte)"
+        );
+      };
+      reader.onerror = function () {
+        reset("Gagal membaca file — coba lagi.");
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
   /* ---------- Log auto-scroll ---------- */
 
   function initLog(el) {
@@ -251,6 +324,8 @@
     document.addEventListener("click", onClick, true);
     var logs = document.querySelectorAll("[data-autoscroll]");
     for (var i = 0; i < logs.length; i++) initLog(logs[i]);
+    var uploads = document.querySelectorAll("[data-config-upload]");
+    for (var j = 0; j < uploads.length; j++) initConfigUpload(uploads[j]);
   }
 
   if (document.readyState === "loading") {

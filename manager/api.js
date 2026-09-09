@@ -302,7 +302,7 @@ function makeHandler({ manager, token, allow, logger, dataRoutes }) {
  * @returns {Promise<{server: http.Server, port: number, handler: Function,
  *                     close: () => Promise<void>}>}
  */
-export async function createApiServer({ manager, port, token, dataRoutes } = {}) {
+export async function createApiServer({ manager, port, token, dataRoutes, rateLimitMax } = {}) {
   if (!manager) throw new VmPanelError(VALIDATION, 'createApiServer: manager wajib');
   if (typeof token !== 'string' || token.length === 0) {
     throw new VmPanelError(VALIDATION, 'createApiServer: token wajib');
@@ -313,7 +313,8 @@ export async function createApiServer({ manager, port, token, dataRoutes } = {})
   }
 
   const logger = manager.logger ?? null;
-  const allow = makeRateLimiter();
+  const maxReq = rateLimitMax ?? manager.config?.manager?.rateLimitMax ?? RATE_LIMIT_MAX;
+  const allow = makeRateLimiter({ max: maxReq });
   const handler = makeHandler({ manager, token, allow, logger, dataRoutes });
 
   const server = http.createServer((req, res) => {

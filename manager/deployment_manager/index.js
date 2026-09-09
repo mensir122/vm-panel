@@ -39,8 +39,8 @@ const LOCK_WAIT_MS = 3000; // §3.2: lock per-project, tunggu maks 3 detik
 const LOCK_TTL_MS = 300_000; // ttl cukup untuk deploy panjang (git 120s)
 const GIT_TIMEOUT_MS = 120_000; // clone/rev-parse timeout 120s
 const EVENT_DETAIL_MAX = 2048; // detail event di-clamp 2KB
-const HEALTH_RETRIES = 5; // verifying: max 5 percobaan
-const HEALTH_RETRY_MS = 400;
+const HEALTH_RETRIES = 25; // verifying: max 25 percobaan (~12.5s cukup untuk booting cold start Next.js/node)
+const HEALTH_RETRY_MS = 500;
 const SWEEP_DEFAULT_OLDER_MS = 600_000; // §7.3: disconnected > 10 menit
 const LIST_LIMIT_DEFAULT = 50;
 const LIST_LIMIT_MAX = 1000;
@@ -503,6 +503,9 @@ export class DeploymentManager {
         workspacePath: service.rootDir ?? service.config?.rootDir ?? null,
         port: service.port,
       });
+      if (res && res.ok === false) {
+        throw new VmPanelError(VALIDATION, `${method} gagal: ${res.output ?? 'adapter step failed'}`);
+      }
       return res ?? { ok: true };
     } catch (e) {
       if (isNotImplemented(e)) {
