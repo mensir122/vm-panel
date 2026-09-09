@@ -34,6 +34,7 @@ import { renderTemplate, escapeHtml } from './render.js';
 import { PanelAuth, SESSION_COOKIE, CSRF_COOKIE } from './auth.js';
 import { ManagerClient } from '../../lib/api-client.js';
 import { VmPanelError, VALIDATION, NOT_FOUND, PERMISSION_DENIED } from '../../lib/errors.js';
+import { getAssistantStatus, handleAssistantChat } from './assistant.js';
 
 const BODY_LIMIT_BYTES = 1024 * 1024; // 1MB
 /** Batas ukuran file config koper per project (client + server side). */
@@ -1022,8 +1023,23 @@ export class PanelServer {
 
       // --- terproteksi (session wajib) ---
       const cookies = this.#parseCookies(req);
-      const session = this.#auth.getSession(cookies[SESSION_COOKIE]);
+      const sessionQuery = url.searchParams.get('session');
+      const sessionId = cookies[SESSION_COOKIE] || (sessionQuery ? sessionQuery.trim() : null);
+      const session = this.#auth.getSession(sessionId);
       if (!session) return this.#redirect(res, '/login');
+
+      if (sessionQuery && !cookies[SESSION_COOKIE]) {
+        res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${session.sessionId}; HttpOnly; SameSite=Strict; Path=/`);
+      }
+
+      // --- assistant API (Hermes Agent / 9Router bridge) ---
+      if (pathname === '/api/assistant/status' && method === 'GET') {
+        const st = await getAssistantStatus();
+        return this.#sendJson(res, 200, st);
+      }
+      if (pathname === '/api/assistant/chat' && method === 'POST') {
+        return await handleAssistantChat(req, res);
+      }
 
       if (method === 'GET') {
         return await this.#handleProtectedGet(pathname, url.searchParams, session, res);

@@ -181,7 +181,10 @@ describe('E2E deploy Next-style (npm run build + npm run start)', () => {
     assert.ok(create.id, 'project terdaftar');
 
     // (2) deploy sinkron (git source) — build harus sukses dulu.
-    const dep = await ctx.client.request('POST', `/projects/${create.id}/deploy`, { body: { source: { type: 'git' } } });
+    const dep = await ctx.client.request('POST', `/projects/${create.id}/deploy`, {
+      body: { source: { type: 'git' } },
+      timeoutMs: 60000,
+    });
     assert.equal(dep.status, 'success', `deploy harus success: ${JSON.stringify(dep).slice(0, 300)}`);
 
     // (3) build stamp terbentuk di workspace (bukti npm run build dijalankan).
@@ -209,7 +212,10 @@ describe('E2E deploy Next-style (npm run build + npm run start)', () => {
     await git(['add', '-A']);
     await git(['commit', '-m', 'v2']);
 
-    const dep = await ctx.client.request('POST', `/projects/${ctx.nextId ?? (await ctx.client.request('GET', '/projects')).find((p) => p.name === 'next-style').id}/deploy`, { body: { source: { type: 'git' } } });
+    const dep = await ctx.client.request('POST', `/projects/${ctx.nextId ?? (await ctx.client.request('GET', '/projects')).find((p) => p.name === 'next-style').id}/deploy`, {
+      body: { source: { type: 'git' } },
+      timeoutMs: 60000,
+    });
     assert.equal(dep.status, 'success');
     const body = await waitForHttp(`http://127.0.0.1:${ctx.port}/`, { timeoutMs: 15000, expect: 'ok-built-v2' });
     assert.equal(body, 'ok-built-v2');

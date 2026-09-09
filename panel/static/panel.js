@@ -326,6 +326,14 @@
     for (var i = 0; i < logs.length; i++) initLog(logs[i]);
     var uploads = document.querySelectorAll("[data-config-upload]");
     for (var j = 0; j < uploads.length; j++) initConfigUpload(uploads[j]);
+
+    // Load Hermes AI Assistant widget
+    if (document.body && !document.body.classList.contains("auth") && document.querySelector(".topbar")) {
+      var asScript = document.createElement("script");
+      asScript.src = "/static/assistant.js";
+      asScript.defer = true;
+      document.body.appendChild(asScript);
+    }
   }
 
   if (document.readyState === "loading") {
