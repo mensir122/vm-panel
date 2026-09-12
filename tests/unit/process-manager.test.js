@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ProcessManager, whitelistGlobalEnv } from '../../manager/process_manager/index.js';
+import { ProcessManager, whitelistGlobalEnv, processCreationTimeMs } from '../../manager/process_manager/index.js';
 import { VmPanelError, VALIDATION, PORT_ILLEGAL } from '../../lib/errors.js';
 
 /** Sandbox tmp: runtime/pid + runtime/processes dibuat oleh constructor. */
@@ -238,4 +238,180 @@ test('stale/corrupt PID file dianggap already-stopped', async (t) => {
   const res = await pm.stopProcess({ serviceId: 'svc-stale', graceMs: 1000 });
   assert.deepEqual(res, { stopped: true, exitCode: null });
   assert.equal(fs.existsSync(path.join(rootDir, 'runtime', 'pid', 'svc-stale.pid'), false), false);
+});
+
+// ── #30 — PID-reuse guard via creation-time ──────────────────────────────────
+
+/** Port bebas di rentang legal (dipakai uji #30/#32). */
+async function pickFreePort(pm) {
+  for (let i = 0; i < 60; i++) {
+    const port = 20000 + Math.floor(Math.random() * 10000);
+    // eslint-disable-next-line no-await-in-loop
+    if (await pm.portBindTest(port)) return port;
+  }
+  throw new Error('tidak ada port bebas');
+}
+
+test('#30 creation-time anak tercatat & cocok saat isAlive; hint berbeda → PID reuse', async (t) => {
+  const rootDir = makeSandbox(t);
+  const pm = new ProcessManager({ rootDir });
+  const realSelf = await processCreationTimeMs(process.pid);
+  if (realSelf == null) {
+    t.skip('creation-time proses tidak dapat dibaca di platform ini');
+    return;
+  }
+  const { pid, startTimeHint } = pm.startProcess({
+    serviceId: 'svc-reuse',
+    argv: [process.execPath, '-e', 'setTimeout(()=>{},30000)'],
+    cwd: rootDir,
+  });
+  assert.ok(Number.isInteger(startTimeHint), 'startTimeHint epoch ms harus tercatat');
+  assert.ok(Math.abs(startTimeHint - Date.now()) < 60_000, 'harus masuk akal terhadap clock');
+  assert.equal(await pm.isAlive(pid, startTimeHint), true, 'hint milik anak sendiri → hidup');
+  // Hint berbeda > toleransi 2s → proses yang memegang PID bukan anak kita.
+  assert.equal(await pm.isAlive(pid, startTimeHint + 600_000), false, 'PID reuse terdeteksi');
+  await pm.stopProcess({ serviceId: 'svc-reuse', graceMs: 3000 });
+
+  // Proses ASING yang hidup (pid test-runner) + hint creation-time asli → diakui;
+  // hint digeser → terdeteksi bukan milik kita. Tidak ada proses dibunuh di sini.
+  assert.equal(await pm.isAlive(process.pid), true, 'liveness polos harus tetap true');
+  assert.equal(await pm.isAlive(process.pid, realSelf), true);
+  assert.equal(await pm.isAlive(process.pid, realSelf + 600_000), false);
+  process.kill(process.pid, 0); // masih hidup (guard tidak pernah kill)
+});
+
+test('#30 stopProcess lewat PID file menolak membunuh proses asing (PID di-reuse)', async (t) => {
+  const rootDir = makeSandbox(t);
+  const pm = new ProcessManager({ rootDir });
+  const { spawn } = await import('node:child_process');
+  // Anak "asing": di-spawn di luar ProcessManager (bukan anak registry).
+  const foreign = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  t.after(() => {
+    try {
+      foreign.kill('SIGKILL');
+    } catch {
+      /* sudah mati */
+    }
+  });
+  const created = await processCreationTimeMs(foreign.pid);
+  if (created == null) {
+    t.skip('creation-time proses tidak dapat dibaca di platform ini');
+    return;
+  }
+  // PID file yatim menunjuk proses asing, tapi hint tercatat BEDA dari
+  // creation-time aslinya (simulasi PID di-reuse setelah manager crash).
+  fs.writeFileSync(path.join(rootDir, 'runtime', 'pid', 'svc-foreign.pid'), `${foreign.pid}\n`);
+  const res = await pm.stopProcess({
+    serviceId: 'svc-foreign',
+    graceMs: 1500,
+    startTimeHint: created + 600_000,
+  });
+  assert.equal(res.stopped, false, 'stop menolak: PID bukan anak kita');
+  assert.equal(res.reason, 'pid_reuse_by_other_process');
+  assert.equal(await pm.isAlive(foreign.pid, created), true, 'proses asing tidak boleh mati');
+});
+
+// ── #32 — port-tabrakan-lekas → reason di exit record ────────────────────────
+
+test('#32 exit ≠0 <5s dengan port masih terisi → reason port_taken_at_spawn', async (t) => {
+  const rootDir = makeSandbox(t);
+  const pm = new ProcessManager({ rootDir });
+  const port = await pickFreePort(pm);
+
+  // Service pertama: anak yang benar-benar bind port lalu bertahan.
+  pm.startProcess({
+    serviceId: 'svc-holder',
+    argv: [
+      process.execPath,
+      '-e',
+      `require('net').createServer().listen(${port},'127.0.0.1',()=>setTimeout(()=>{},30000))`,
+    ],
+    cwd: rootDir,
+    port,
+  });
+  // Tunggu bind benar-benar terjadi (deterministik, tanpa race asumsi).
+  const boundAt = Date.now();
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    if (!(await pm.portBindTest(port))) break;
+    if (Date.now() - boundAt > 8000) throw new Error('pemegang port tidak sempat bind');
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  // Service kedua di port yang sama: gagal segera (exit 3 dalam <5s).
+  const seen = [];
+  pm.setExitHandler((serviceId, info) => seen.push([serviceId, info]));
+  pm.startProcess({
+    serviceId: 'svc-victim',
+    argv: [process.execPath, '-e', 'process.exit(3)'],
+    cwd: rootDir,
+    port,
+  });
+
+  const recAt = Date.now();
+  let rec = null;
+  for (;;) {
+    rec = pm.getExitRecord('svc-victim');
+    if (rec) break;
+    if (Date.now() - recAt > 8000) throw new Error('exit record tidak pernah ditulis');
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.equal(rec.exitCode, 3);
+  assert.equal(rec.reason, 'port_taken_at_spawn', 'reason tabrakan port tercatat');
+  const info = seen.find(([sid]) => sid === 'svc-victim')?.[1];
+  assert.ok(info, 'exit handler menerima info svc-victim');
+  assert.equal(info.reason, 'port_taken_at_spawn');
+  assert.equal(info.port, port);
+  assert.ok(Number.isFinite(info.lifetimeMs) && info.lifetimeMs < 5000);
+
+  await pm.stopProcess({ serviceId: 'svc-holder', graceMs: 3000 });
+});
+
+test('#32 exit 0 (normal) → reason null; exit ≠0 dengan port bebas → reason null', async (t) => {
+  const rootDir = makeSandbox(t);
+  const pm = new ProcessManager({ rootDir });
+  const port = await pickFreePort(pm);
+
+  pm.startProcess({
+    serviceId: 'svc-ok',
+    argv: [process.execPath, '-e', 'process.exit(0)'],
+    cwd: rootDir,
+    port,
+  });
+  const at = Date.now();
+  let rec = null;
+  for (;;) {
+    rec = pm.getExitRecord('svc-ok');
+    if (rec) break;
+    if (Date.now() - at > 8000) throw new Error('exit record tidak ditulis');
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.equal(rec.exitCode, 0);
+  assert.equal(rec.reason, null, 'exit sukses tidak diberi alasan');
+
+  // Exit ≠0 tapi port BEBAS → bukan tabrakan port → reason null.
+  const port2 = await pickFreePort(pm);
+  pm.startProcess({
+    serviceId: 'svc-crash',
+    argv: [process.execPath, '-e', 'process.exit(4)'],
+    cwd: rootDir,
+    port: port2,
+  });
+  const at2 = Date.now();
+  let rec2 = null;
+  for (;;) {
+    rec2 = pm.getExitRecord('svc-crash');
+    if (rec2) break;
+    if (Date.now() - at2 > 8000) throw new Error('exit record tidak ditulis');
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.equal(rec2.exitCode, 4);
+  assert.equal(rec2.reason, null, 'port bebas → crash biasa, bukan port_taken');
 });

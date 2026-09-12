@@ -1,0 +1,19 @@
+{
+  "git.autorefresh": true,
+  "git.ignoreLimitWarning": true,
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/node_modules/**": true,
+    "**/workspaces/**": true,
+    "**/scratch/**": true,
+    "**/dist/**": true,
+    "**/data/*.db*": true
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/workspaces": true,
+    "**/scratch": true,
+    "**/dist": true
+  }
+}

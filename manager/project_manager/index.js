@@ -27,7 +27,7 @@ const LEGAL_TRANSITIONS = Object.freeze({
 });
 
 /** Kolom projects.db yang boleh di-update via updateProject. */
-const UPDATABLE_FIELDS = ['port', 'restartPolicy', 'healthCheck', 'branch'];
+const UPDATABLE_FIELDS = ['port', 'restartPolicy', 'healthCheck', 'branch', 'startCmd'];
 
 function nowIso() {
   return new Date().toISOString();
@@ -73,7 +73,11 @@ export class ProjectManager {
       port: row.port,
       resourceLimits: row.resource_limits ? JSON.parse(row.resource_limits) : null,
       restartPolicy: row.restart_policy,
-      healthCheck: row.health_url ?? null,
+      healthCheck: row.health_url
+        ? (typeof row.health_url === 'string' && row.health_url.trim().startsWith('{')
+            ? (function () { try { return JSON.parse(row.health_url); } catch { return row.health_url; } })()
+            : row.health_url)
+        : null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       archivedAt: row.archived_at,
@@ -221,6 +225,7 @@ export class ProjectManager {
       restartPolicy: 'restart_policy',
       healthCheck: 'health_url',
       branch: 'branch',
+      startCmd: 'start_cmd',
     };
     const assignments = Object.keys(sets)
       .map((f) => `${colMap[f]} = ?`)
@@ -302,7 +307,12 @@ export class ProjectManager {
     });
 
     if (fs.existsSync(rec.workspacePath)) {
-      fs.rmSync(rec.workspacePath, { recursive: true, force: true });
+      fs.rmSync(rec.workspacePath, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 150,
+      });
     }
     return { removed: true, id };
   }

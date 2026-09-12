@@ -10,8 +10,8 @@ import { BackupManager } from './manager/backup_manager/index.js';
 const bm = new BackupManager({ dataDir: 'data', backupsRoot: 'backups', lockDir: 'runtime/locks' });
 const res = await bm.createBackup({ trigger: 'pre-shutdown', retentionClass: 'manual' });
 const v = await bm.verifyBackup(res.backupId);
-if (!v.ok && v.verification_status !== 'valid' && v.verification_status !== undefined) {
-  console.error('[backup_final] VERIFIKASI GAGAL:', v.error ?? v.verification_status);
+if (!v.ok) {
+  console.error('[backup_final] VERIFIKASI GAGAL:', v.error ?? 'unknown');
   process.exit(1);
 }
 console.log(res.backupId);

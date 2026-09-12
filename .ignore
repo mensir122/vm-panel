@@ -1,0 +1,4 @@
+# Ignore untuk OpenCode: tampilkan state deepwork yang di-gitignore
+!.slim/
+!.slim/deepwork/
+!.slim/deepwork/**

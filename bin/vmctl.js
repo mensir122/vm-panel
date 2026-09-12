@@ -419,7 +419,10 @@ async function cmdProjectDeploy(parsed) {
   const id = parsed.args[0];
   if (!id) throw new VmPanelError(VALIDATION, 'project deploy butuh <projectId>');
   const client = makeClient(parsed.flags);
-  const r = await client.request('POST', `/projects/${encodeURIComponent(id)}/deploy`, { body: {} });
+  const r = await client.request('POST', `/projects/${encodeURIComponent(id)}/deploy`, {
+    body: {},
+    timeoutMs: 900_000,
+  });
   stdout(
     [
       labelLine('Deployment', r.deploymentId ?? '-'),
@@ -428,6 +431,36 @@ async function cmdProjectDeploy(parsed) {
     ].join('\n'),
   );
   return r.status === 'success' ? 0 : 1;
+}
+
+async function cmdProjectRemove(parsed) {
+  const id = parsed.args[0];
+  if (!id) throw new VmPanelError(VALIDATION, 'project remove butuh <projectId>');
+  const client = makeClient(parsed.flags);
+  const p = await client.request('GET', `/projects/${encodeURIComponent(id)}`);
+  const reqRes = await client.request('POST', `/projects/${encodeURIComponent(id)}/remove-request`, { body: {} });
+  const confirmToken = reqRes?.confirmToken;
+  if (!confirmToken) {
+    throw new VmPanelError(VALIDATION, 'Gagal mendapatkan token konfirmasi');
+  }
+  const phrase = p.name || id;
+  const confirmed = await confirmTwoPhase(
+    [
+      'Two-phase confirmation required (DESTRUCTIVE CLEAN PURGE).',
+      `Target: Project ${p.name} (${id})`,
+      'Semua service, proses, alokasi port, riwayat deployment, dan file workspace akan dihapus bersih tanpa sisa.',
+    ],
+    phrase,
+  );
+  if (!confirmed) {
+    process.stderr.write('aborted: confirmation did not match (operation NOT executed)\n');
+    return 1;
+  }
+  await client.request('POST', `/projects/${encodeURIComponent(id)}/remove`, {
+    body: { confirmToken },
+  });
+  stdout(`Project '${p.name}' (${id}) dan seluruh proses/service/workspace berhasil dihapus bersih.`);
+  return 0;
 }
 
 async function cmdServiceList(parsed) {
@@ -649,6 +682,7 @@ async function dispatch(parsed) {
       if (parsed.verb === 'list') return cmdProjectList(parsed);
       if (parsed.verb === 'create') return cmdProjectCreate(parsed);
       if (parsed.verb === 'deploy') return cmdProjectDeploy(parsed);
+      if (parsed.verb === 'remove') return cmdProjectRemove(parsed);
       return notImplemented(parsed);
     case 'service':
       if (parsed.verb === 'list') return cmdServiceList(parsed);

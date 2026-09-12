@@ -414,4 +414,52 @@ describe('cache 60s + invalidasi', () => {
       true,
     );
   });
+
+  // A2#11: perm_epoch di meta users.db — dua instance PermissionManager di
+  // users.db yang sama (simulasi proses panel vs manager) tidak boleh saling
+  // menyajikan role/scope basi sampai TTL 60 dtk habis.
+  test('A2#11: dua instance DB sama — setRole di B terlihat A TANPA invalidate lokal', () => {
+    const { owner, operator } = setupUsers();
+    const pm2 = new PermissionManager({ dataDir: dir });
+    try {
+      // A hangatkan cache entry operator (role lama tersimpan + epoch saat ini)
+      assert.equal(pm.checkPermission({ userId: operator.userId, action: 'project.deploy' }).allowed, true);
+      // B (proses lain) turunkan role via API normal → bump epoch dalam tx
+      pm2.setRole(operator.userId, 'viewer', owner.userId);
+      // A: cache-HIT tapi epoch beda → reload → role baru langsung terlihat
+      const after = pm.checkPermission({ userId: operator.userId, action: 'project.deploy' });
+      assert.equal(after.role, 'viewer');
+      assert.equal(after.allowed, false);
+    } finally {
+      pm2.close();
+    }
+  });
+
+  test('A2#11: dua instance DB sama — setProjectScope & approveUser di B terlihat A', () => {
+    const { owner, operator, inactive } = setupUsers();
+    const pm2 = new PermissionManager({ dataDir: dir });
+    try {
+      // scope: A sudah cache operator tanpa scope → deploy project lain lolos
+      assert.equal(
+        pm.checkPermission({ userId: operator.userId, action: 'project.deploy', projectId: 'prj_LAIN' }).allowed,
+        true,
+      );
+      pm2.setProjectScope(operator.userId, 'prj_MILIK', true); // B bump epoch
+      assert.equal(
+        pm.checkPermission({ userId: operator.userId, action: 'project.deploy', projectId: 'prj_LAIN' }).allowed,
+        false,
+        'scope rows B terlihat A: prj_LAIN bukan whitelist → denied',
+      );
+      assert.equal(
+        pm.checkPermission({ userId: operator.userId, action: 'project.deploy', projectId: 'prj_MILIK' }).allowed,
+        true,
+      );
+      // status: approveUser di B → A tidak boleh lagi menolak user inactive
+      assert.equal(pm.checkPermission({ userId: inactive.userId, action: 'project.view' }).allowed, false);
+      pm2.approveUser(inactive.userId, owner.userId);
+      assert.equal(pm.checkPermission({ userId: inactive.userId, action: 'project.view' }).allowed, true);
+    } finally {
+      pm2.close();
+    }
+  });
 });

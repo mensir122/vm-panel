@@ -84,6 +84,37 @@ test('extraValues: escape regex — nilai dengan meta karakter tetap exact-match
   assert.equal(rd('key p@$$w0rd.*[x]+(y) ok'), `key ${R} ok`);
 });
 
+test('F14: pola key=value nama sensitif direduksi (gaya env/query-string)', () => {
+  assert.equal(redact('token=abc123'), `token=${R}`);
+  assert.equal(redact('password=hunter2'), `password=${R}`);
+  assert.equal(redact('api_key=AKIA123'), `api_key=${R}`);
+  assert.equal(redact('secret = "nil ai"'), `secret = ${R}`);
+  assert.equal(redact('SESSION=xyz'), `SESSION=${R}`);
+  // query-string: '&' menghentikan nilai agar param berikutnya tak ikut
+  assert.equal(redact('GET /x?a=1&token=abc&b=2'), `GET /x?a=1&token=${R}&b=2`);
+  // delimiter ',' dan ';' tetap menghentikan nilai
+  assert.equal(redact('token=abc, host=x'), `token=${R}, host=x`);
+  assert.equal(redact('otp=123456;'), `otp=${R};`);
+});
+
+test('F14: key=value TANPA over-redact — kata bukan-sensitive utuh', () => {
+  assert.equal(redact('port=8080 host=localhost'), 'port=8080 host=localhost');
+  // boundary \b utuh: imbuhan word-char di kanan-kiri TIDAK memicu pola
+  assert.equal(redact('session_id=42'), 'session_id=42');
+  assert.equal(redact('num_tokens=99'), 'num_tokens=99');
+  assert.equal(redact('reset_token_flag=1'), 'reset_token_flag=1');
+  // values object dengan key netral tak tersentuh
+  assert.deepEqual(redact({ port: '8080', session: 'sid=abc' }), {
+    port: '8080',
+    session: R,
+  });
+});
+
+test('F14: key=value digabung extraValues dan bentuk lain tetap konsisten', () => {
+  const rd = makeRedactor({ extraValues: new Set(['ZZtopsecret']) });
+  assert.equal(rd('spawn token.env TOKEN_REF=ZZtopsecret done'), `spawn token.env TOKEN_REF=${R} done`);
+});
+
 test('clamp: string hasil > 8192 char dipotong', () => {
   const long = 'x'.repeat(20_000);
   const out = redact(long);

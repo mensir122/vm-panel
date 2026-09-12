@@ -18,6 +18,7 @@ import { randomToken } from '../../lib/crypto.js';
 import { createLogger } from '../../lib/log.js';
 
 const INPUT_MAX_BYTES = 8 * 1024; // §14.2: input max 8KB
+const ERROR_MAX_BYTES = 2 * 1024; // F13: field error di-clamp 2KB POST-redaksi
 const PURGE_META_PREFIX = 'purge_request:';
 const DEFAULT_PURGE_TTL_MS = 10 * 60 * 1000; // token purge kedaluwarsa 10 menit
 const PURGE_OP = 'AUDIT_PURGE';
@@ -184,7 +185,12 @@ export class AuditManager {
       deploymentId: normText(event.deploymentId),
       runnerId: normText(event.runnerId),
       recoveryAction: normText(event.recoveryAction),
-      error: normText(event.error) === null ? null : this.#redactor(String(event.error)),
+      // F13: redaksi DULU baru clamp ≤2KB (clamp pasca-redaksi — marker
+      // ***REDACTED*** tidak boleh terpotong oleh clamp mentah).
+      error:
+        normText(event.error) === null
+          ? null
+          : clampUtf8(String(this.#redactor(String(event.error))), ERROR_MAX_BYTES),
       result: normText(event.result),
     };
     const info = this.#insEvent.run(row);

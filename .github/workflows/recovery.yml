@@ -1,8 +1,10 @@
 # VM-Panel — watchdog eksternal (twin workflow).
 # Desain: docs/DESIGN.md §15.3, D8a.
-# Cron tiap 15 menit; hanya dispatch vm.yml bila:
-#   (a) tidak ada run vm.yml yang in-progress, DAN
-#   (b) chain-lock artifact terakhir sudah expired (atau tidak ada).
+# Cron tiap 15 menit; dispatch vm.yml bila TIDAK ada run aktif (in_progress ATAU
+# queued — keduanya "sibuk") DAN salah satu berlaku:
+#   (b1) chain-lock artifact terakhir sudah expired (atau tidak ada), ATAU
+#   (b2) run vm.yml TERAKHIR conclusion != success (chain putus keras: runner mati
+#        sebelum self-chain sempat dispatch → tidak ada run baru yang queued).
 # Jika dispatch gagal berkali-kali → buat issue alert (anti-duplikat).
 
 name: recovery
@@ -27,17 +29,27 @@ jobs:
       - name: Cek run vm.yml aktif
         id: active
         run: |
-          COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/vm.yml/runs?status=in_progress" --jq '.total_count // 0')
-          echo "in_progress=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "vm.yml in-progress runs: $COUNT"
+          # "Sibuk" = in_progress ATAU queued. Run hasil self-chain berada di grup
+          # concurrency 'vm-chain' → berstatus queued sampai run lama selesai.
+          # Tanpa menghitung queued, watchdog akan dispatch ganda (split-brain).
+          IN_PROGRESS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/vm.yml/runs?status=in_progress" --jq '.total_count // 0')
+          QUEUED=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/vm.yml/runs?status=queued" --jq '.total_count // 0')
+          echo "in_progress=$IN_PROGRESS" >> "$GITHUB_OUTPUT"
+          echo "queued=$QUEUED" >> "$GITHUB_OUTPUT"
+          echo "busy=$(( IN_PROGRESS + QUEUED ))" >> "$GITHUB_OUTPUT"
+          echo "vm.yml aktif: in_progress=$IN_PROGRESS queued=$QUEUED"
 
       - name: Cek chain-lock expiry
-        if: steps.active.outputs.in_progress == '0'
+        if: steps.active.outputs.busy == '0'
         id: lock
         run: |
           # Lock expired bila artifact 'vm-chain-lock' terbaru tidak ada, atau
-          # isinya expires_at sudah lewat (watchdog hanya boleh dispatch jika
-          # (a) DAN (b) terpenuhi — desain §15.1 anti split-brain).
+          # isinya expires_at sudah lewat. chain-lock kini di-refresh sebagai
+          # HEARTBEAT oleh keepalive.sh (expires_at = now + TTL), jadi expiry di
+          # sini berarti heartbeat runner berhenti.
+          # Parsing tanggal memakai node Date.parse (konsisten dengan scripts/):
+          # parser ISO interpreter lain gagal pada suffix 'Z' di runtime bawaan
+          # image runner lama -> step crash / salah simpulkan expired.
           RUN_ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=vm-chain-lock" --jq '[.artifacts[] | select(.expired == false)][0].id // empty')
           if [ -z "$RUN_ID" ]; then
             echo "expired=true" >> "$GITHUB_OUTPUT"
@@ -49,24 +61,70 @@ jobs:
             echo "chain-lock gagal diunduh → anggap expired"
             exit 0
           fi
-          python3 -c "
-          import zipfile, json, sys
-          z = zipfile.ZipFile('lock.zip')
-          names = z.namelist()
-          target = [n for n in names if n.endswith('chain-lock.json')][0]
-          lock = json.loads(z.read(target))
-          from datetime import datetime, timezone
-          exp = datetime.fromisoformat(lock['expires_at'])
-          now = datetime.now(timezone.utc)
-          print('expired=true' if now >= exp else 'expired=false')
-          print('lock_detail=', lock)
-          " >> "$GITHUB_OUTPUT"
+          if ! UNZIP=$(command -v unzip 2>/dev/null); then
+            echo "expired=true" >> "$GITHUB_OUTPUT"
+            echo "unzip tidak tersedia → anggap expired"
+            exit 0
+          fi
+          LOCK_JSON=$(unzip -p lock.zip '*chain-lock.json' 2>/dev/null || true)
+          if [ -z "$LOCK_JSON" ]; then
+            echo "expired=true" >> "$GITHUB_OUTPUT"
+            echo "chain-lock.json tidak ada di artifact → anggap expired"
+            exit 0
+          fi
+          RESULT=$(printf '%s' "$LOCK_JSON" | node -e '
+            let raw = "";
+            process.stdin.on("data", (c) => { raw += c; });
+            process.stdin.on("end", () => {
+              let lock = null;
+              try { lock = JSON.parse(raw); } catch { /* rusak */ }
+              const exp = lock ? Date.parse(String(lock.expires_at || "")) : NaN;
+              if (!Number.isFinite(exp)) {
+                console.log("expired=true");
+                console.log("lock_detail=expires_at tidak terbaca");
+                return;
+              }
+              console.log(Date.now() >= exp ? "expired=true" : "expired=false");
+              console.log("lock_detail=run=" + (lock.run_id ?? "?") + " expires_at=" + lock.expires_at);
+            });
+          ' 2>/dev/null) || RESULT=""
+          if [ -z "$RESULT" ]; then
+            RESULT="expired=true"
+            echo "chain-lock gagal diparsing → anggap expired"
+          fi
+          printf '%s\n' "$RESULT" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$RESULT"
+
+      - name: Cek run vm.yml terakhir (rule dispatch tambahan)
+        if: steps.active.outputs.busy == '0'
+        id: last
+        run: |
+          # Rantai putus keras: tidak ada run aktif DAN run terakhir gagal/error/
+          # cancelled/timeout → self-chain tidak menghasilkan penerus. Dispatch lagi.
+          # (Rule expiry chain-lock di atas TETAP aktif — kondisi dispatch = OR.)
+          LAST_CONCLUSION=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/vm.yml/runs?per_page=1" \
+            --jq '.workflow_runs[0].conclusion // "none"')
+          echo "conclusion=$LAST_CONCLUSION" >> "$GITHUB_OUTPUT"
+          if [ "$LAST_CONCLUSION" != "success" ] && [ "$LAST_CONCLUSION" != "none" ]; then
+            echo "broken=true" >> "$GITHUB_OUTPUT"
+            echo "run vm.yml terakhir conclusion=$LAST_CONCLUSION → chain putus, dispatch perlu"
+          else
+            echo "broken=false" >> "$GITHUB_OUTPUT"
+            echo "run vm.yml terakhir conclusion=$LAST_CONCLUSION"
+          fi
 
       - name: Dispatch vm.yml (chain baru dari backup valid terakhir)
-        if: steps.active.outputs.in_progress == '0' && steps.lock.outputs.expired == 'true'
+        if: >-
+          steps.active.outputs.busy == '0'
+          && (steps.lock.outputs.expired == 'true' || steps.last.outputs.broken == 'true')
         run: |
+          REASON=""
+          if [ "${{ steps.lock.outputs.expired }}" = "true" ]; then REASON="chain-lock expired"; fi
+          if [ "${{ steps.last.outputs.broken }}" = "true" ]; then
+            REASON="${REASON:+$REASON + }run terakhir != success"
+          fi
           gh workflow run vm.yml -R "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF_NAME:-main}"
-          echo "watchdog: vm.yml dispatched"
+          echo "watchdog: vm.yml dispatched (${REASON:-tidak ada run aktif})"
 
       - name: Alert manusia (issue anti-duplikat) bila dispatch gagal
         if: failure()

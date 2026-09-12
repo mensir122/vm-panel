@@ -5,14 +5,22 @@
 // Revisions table: marker 'success' = revision terbukti sehat; rollback sukses
 // menandai target 'rollback-target'.
 
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { openDatabase } from '../../lib/db.js';
 import { genId } from '../../lib/ids.js';
-import { VmPanelError, VALIDATION, NOT_FOUND } from '../../lib/errors.js';
+import { VmPanelError, VALIDATION, NOT_FOUND, DEPLOY_IN_PROGRESS } from '../../lib/errors.js';
+import { withLock } from '../../lib/lock.js';
 import { makeRedactor } from '../../lib/redact.js';
 
 const HEALTH_RETRIES = 3;
+// F5: rollback = operasi tulis terhadap service yang sama dengan deploy →
+// wajib memegang lock 'deploy-<projectId>' yang SAMA (sadar re-entrancy:
+// pemanggil yang sudah memegang lock mengirim `lock: false`).
+const ROLLBACK_LOCK_TTL_MS = 300_000;
+const ROLLBACK_LOCK_WAIT_MS = 3_000;
+const ROLLBACK_LOCK_HEARTBEAT_MS = 30_000;
 
 function nowIso() {
   return new Date().toISOString();
@@ -40,11 +48,19 @@ export class RollbackManager {
    *   dataDir: string,
    *   serviceManager: import('../service_manager/index.js').ServiceManager,
    *   healthManager?: object|null,
+   *   lockDir?: string|null,
    *   nowFn?: () => Date|number|string,
    *   sleepFn?: (ms: number) => Promise<void>,
    * }} opts
    */
-  constructor({ dataDir, serviceManager, healthManager = null, nowFn = null, sleepFn = null }) {
+  constructor({
+    dataDir,
+    serviceManager,
+    healthManager = null,
+    lockDir = null,
+    nowFn = null,
+    sleepFn = null,
+  }) {
     if (!dataDir || typeof dataDir !== 'string') {
       throw new VmPanelError(VALIDATION, 'RollbackManager: dataDir wajib');
     }
@@ -54,9 +70,13 @@ export class RollbackManager {
     this.dataDir = dataDir;
     this.serviceManager = serviceManager;
     this.healthManager = healthManager;
+    // default SAMA dengan DeploymentManager → lock 'deploy-<id>' benar-benar
+    // satu kunci untuk deploy dan rollback project yang sama.
+    this.lockDir = path.resolve(lockDir ?? path.join(this.dataDir, 'locks'));
     this._nowFn = nowFn ?? (() => new Date());
     this._sleep = sleepFn ?? sleep;
     this._redact = makeRedactor();
+    fs.mkdirSync(this.lockDir, { recursive: true });
     const opened = openDatabase(path.join(this.dataDir, 'deployments.db'), {
       schemaName: 'deployments',
     });
@@ -88,14 +108,48 @@ export class RollbackManager {
 
   /**
    * Rollback project ke revision sukses (§7.3).
-   * @param {{projectId: string, actor?: string, targetRevision?: string}} input
+   *
+   * F5: seluruh operasi di-guard lock `deploy-<projectId>` (kunci yang sama
+   * dengan DeploymentManager.deploy) sehingga rollback tidak pernah balapan
+   * dengan deploy yang sedang jalan. RE-ENTRANCY: file lock tidak bisa
+   * diambil-alih oleh pemegang yang sama → pemanggil yang SUDAH memegang
+   * lock (mis. sweepDisconnected) wajib mengirim `{ lock: false }`.
+   *
+   * @param {{projectId: string, actor?: string, targetRevision?: string|null,
+   *   lock?: boolean}} input
    * @returns {Promise<{deploymentId: string, status: string, from: string|null, to: string}>}
    */
-  async rollback({ projectId, actor = null, targetRevision = null } = {}) {
+  async rollback({ projectId, actor = null, targetRevision = null, lock = true } = {}) {
     if (!projectId || typeof projectId !== 'string') {
       throw new VmPanelError(VALIDATION, 'rollback: projectId wajib', { projectId });
     }
+    if (lock === false) return this._rollbackUnderLock({ projectId, actor, targetRevision });
+    try {
+      return await withLock(
+        `deploy-${projectId}`,
+        {
+          dir: this.lockDir,
+          ttlMs: ROLLBACK_LOCK_TTL_MS,
+          maxWaitMs: ROLLBACK_LOCK_WAIT_MS,
+          heartbeatMs: ROLLBACK_LOCK_HEARTBEAT_MS,
+        },
+        () => this._rollbackUnderLock({ projectId, actor, targetRevision }),
+      );
+    } catch (e) {
+      if (e && e.code === 'LOCK_HELD') {
+        throw new VmPanelError(DEPLOY_IN_PROGRESS, 'deployment/rollback sedang berjalan untuk project ini', {
+          projectId,
+        });
+      }
+      throw e;
+    }
+  }
 
+  /**
+   * Inti rollback — WAJIB dipanggil DI DALAM lock 'deploy-<projectId>'
+   * (oleh rollback() di atas atau oleh pemanggil yang sudah memegang lock).
+   */
+  async _rollbackUnderLock({ projectId, actor = null, targetRevision = null }) {
     // (1) Baca revisions project yang pernah sukses, urut terbaru (at DESC).
     // Marker 'rollback-target' tetap jadi kandidat — revision hasil rollback
     // pernah sukses dan harus tetap bisa jadi target rollback berikutnya.

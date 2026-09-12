@@ -34,7 +34,18 @@ import { renderTemplate, escapeHtml } from './render.js';
 import { PanelAuth, SESSION_COOKIE, CSRF_COOKIE } from './auth.js';
 import { ManagerClient } from '../../lib/api-client.js';
 import { VmPanelError, VALIDATION, NOT_FOUND, PERMISSION_DENIED } from '../../lib/errors.js';
+import { TIMEOUT, UNREACHABLE } from '../../lib/api-client.js';
 import { getAssistantStatus, handleAssistantChat } from './assistant.js';
+import {
+  deepInspectProjectFolder,
+  cleanRepoUrl,
+  copyWorkspaceFiles,
+  upsertEnvFile,
+  sanitizeProjectName,
+  allocateSafePort,
+  portBindTest,
+  RESERVED_PORTS,
+} from '../../desktop/deployer.js';
 
 const BODY_LIMIT_BYTES = 1024 * 1024; // 1MB
 /** Batas ukuran file config koper per project (client + server side). */
@@ -52,8 +63,21 @@ const DEFAULT_LOGIN_RATE_PER_MIN = 10;
 const DEFAULT_SESSION_TTL_MIN = 480;
 const DEFAULT_MANAGER_API_PORT = 8097;
 const MANAGER_DOWN_BANNER = 'Manager tidak terjangkau';
+// A4-H6: varian empty-state saat probe manager GAGAL. Jangan render empty-state
+// normal ("No services." dll) yang menyiratkan "semua baik-baik saja, hanya
+// belum ada data" — itu kontradiktif dengan banner "manager down". Judul &
+// hint ini menjelaskan bahwa kekosongan bisa jadi karena daemon mati.
+const MANAGER_DOWN_EMPTY = {
+  title: 'Data tidak tersedia',
+  hint: 'Manager tidak terjangkau — data di bawah mungkin basi/kosong karena daemon mati.',
+};
 const ENDPOINT_TODO_NOTE = 'endpoint belum tersedia (F5)';
 const BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
+/** A2#13: token konfirmasi destruktif dua-fase sisi panel (in-memory, sekali pakai). */
+const CONFIRM_TOKEN_TTL_MS = 10 * 60 * 1000;
+/** A2#24: rentang port legal untuk deploy via panel/desktop. */
+const DEPLOY_PORT_MIN = 10000;
+const DEPLOY_PORT_MAX = 65535;
 const GIT_TIMEOUT_MS = 60_000;
 const GIT_COMMIT_MSG = 'sync: update projects.auto.json dari panel';
 const GIT_PUSH_REF = 'main';
@@ -77,6 +101,9 @@ const STATUS_BY_CODE = {
   [PERMISSION_DENIED]: 403,
   RATE_LIMITED: 429,
   BODY_TOO_LARGE: 413,
+  // A2#28: error transport manager → 502 dengan pesan jelas (bukan 500 'INTERNAL').
+  [TIMEOUT]: 502,
+  [UNREACHABLE]: 502,
 };
 
 /** Halaman terproteksi → action PermissionManager (matriks §11.2). */
@@ -324,6 +351,22 @@ function fmtMb(mb) {
 function clampPct(n) {
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+// REM1: indikator workload non-listening (bot Telegram/Discord/WhatsApp,
+// Hermes agent, pustaka bot di package.json) → health lane 'process'.
+// Deployment manager kini men-FAIL-kan tcp/http check yang tak pernah
+// listening, jadi dropzone wajib menandai bot secara eksplisit.
+const BOT_FRAMEWORK_RE = /telegram|discord|whatsapp|hermes|Bot\b|grammy|telethon|pyrogram|aiogram|telegraf/i;
+const BOT_DEP_RE = /^(?:@?(?:telegraf|grammy|discord\.js|grammyjs)|aiogram|telethon|pyrogram|python-telegram-bot|node-telegram-bot-api|telebot|pytelegrambotapi)/i;
+
+function isBotLikeInspection(inspection) {
+  if (!inspection || typeof inspection !== 'object') return false;
+  if (inspection.details?.isHermesAgent) return true;
+  if (BOT_FRAMEWORK_RE.test(String(inspection.framework ?? ''))) return true;
+  const deps = inspection.details?.dependencies;
+  if (Array.isArray(deps) && deps.some((d) => BOT_DEP_RE.test(String(d)))) return true;
+  return false;
 }
 
 function barHtml(label, pct) {
@@ -627,8 +670,9 @@ export class PanelServer {
       ? panelCfg.loginRatePerMin
       : DEFAULT_LOGIN_RATE_PER_MIN;
     const ttlMin = Number.isInteger(panelCfg.sessionTtlMin) ? panelCfg.sessionTtlMin : DEFAULT_SESSION_TTL_MIN;
+    const localhostBypass2fa = panelCfg.localhostBypass2fa !== undefined ? Boolean(panelCfg.localhostBypass2fa) : true;
 
-    this.#auth = new PanelAuth({ dataDir, auditManager, sessionTtlMs: ttlMin * 60_000 });
+    this.#auth = new PanelAuth({ dataDir, auditManager, sessionTtlMs: ttlMin * 60_000, localhostBypass2fa });
     this.#auditManager = auditManager ?? null;
     this.#managerClient = managerClient ?? null;
     this.#rootDir = resolve(rootDir ?? process.cwd());
@@ -651,12 +695,19 @@ export class PanelServer {
   #auth;
   #managerClient;
   #defaultManager;
+  #defaultManagerToken;
   #managerApiPort;
   #managerTokenFile;
   #templatesDir;
   #staticDir;
   #server;
   #rateBuckets = new Map();
+  #rateBucketsPrunedAt = Date.now();
+  // A2#17: status manager terakhir yang diprobe controller ('unknown' sampai
+  // probe /system/status pertama selesai — bukan 'running' hardcoded).
+  #managerLastStatus = 'unknown';
+  // A2#13: token konfirmasi destruktif dua-fase: token → { key, userId, expiresAt }.
+  #pendingConfirms = new Map();
   #auditManager;
   #bootstrapTokens = new Map(); // token sekali-pakai → expiresAt (ms)
   #rootDir; // repo root: lokasi projects.auto.json + cwd git sync
@@ -807,14 +858,26 @@ export class PanelServer {
   #isRateLimited(key, limit) {
     const now = Date.now();
     const arr = (this.#rateBuckets.get(key) ?? []).filter((t) => t > now - RATE_WINDOW_MS);
-    arr.push(now);
+    // A2#30: evaluasi batas SEBELUM mencatat timestamp — request yang ditolak
+    // tidak menambah isi bucket (sebelumnya penyerang bisa terus mengisi
+    // window lewat request yang sudah diblokir).
+    const limited = arr.length >= limit;
+    if (!limited) arr.push(now);
     this.#rateBuckets.set(key, arr);
+    // Prune berkala (≤ 1x per window): bucket yang seluruh timestampnya basi
+    // dihapus, bukan hanya saat Map melewati 10k kunci.
+    if (now - this.#rateBucketsPrunedAt >= RATE_WINDOW_MS) {
+      this.#rateBucketsPrunedAt = now;
+      for (const [k, v] of this.#rateBuckets) {
+        if (v.length === 0 || v[v.length - 1] <= now - RATE_WINDOW_MS) this.#rateBuckets.delete(k);
+      }
+    }
     if (this.#rateBuckets.size > 10_000) {
       for (const [k, v] of this.#rateBuckets) {
         if (v.every((t) => t <= now - RATE_WINDOW_MS)) this.#rateBuckets.delete(k);
       }
     }
-    return arr.length > limit;
+    return limited;
   }
 
   // --- render ----------------------------------------------------------------
@@ -825,8 +888,19 @@ export class PanelServer {
       : renderTemplate(templateName, vars);
   }
 
-  #requirePermission(session, action) {
-    const check = this.#auth.perm.checkPermission({ userId: session.user.userId, action });
+  #requirePermission(session, action, projectId) {
+    // A2#12: teruskan projectId ke checkPermission untuk gerbang aksi PER-project
+    // (deploy/start/stop/remove/view detail) agar operator ber-scope hanya bisa
+    // menyentuh project dalam whitelist-nya. Halaman LIST (project.view tanpa
+    // projectId) tetap global: kosong = lihat semua (manajer menafsirkan pid=''
+    // sebagai tanpa-scope hanya bila user tak punya baris scope).
+    const check = this.#auth.perm.checkPermission({
+      userId: session.user.userId,
+      action,
+      ...(projectId === undefined || projectId === null || projectId === ''
+        ? {}
+        : { projectId: String(projectId) }),
+    });
     if (!check.allowed) {
       throw new VmPanelError(PERMISSION_DENIED, `permission ditolak: ${action}`);
     }
@@ -834,7 +908,7 @@ export class PanelServer {
 
   /** Vars dasar halaman sesuai kontrak VARS templates: nav, user, banner, flash. */
   #pageVars(session, pathname, banner = '', extra = {}) {
-    return {
+    const vars = {
       username: session?.user?.username ?? '',
       role: session?.user?.role ?? '',
       csrfToken: session?.csrfToken ?? '',
@@ -842,8 +916,16 @@ export class PanelServer {
       user: session?.user?.username ?? '',
       banner: banner || '',
       flash: '',
+      managerStatus: this.#managerLastStatus,
+      nodeVersionStr: process.version,
+      osPlatformStr: process.platform,
       ...extra,
     };
+    // A3-dead-note: controller mengirim `note` (ENDPOINT_TODO_NOTE saat manager
+    // down, '' saat ok) dan template services/deployments/recovery/backups/logs/
+    // settings merendernya sebagai teks ESCAPED biasa ({{note}} — BUKAN |raw;
+    // mesin auto-escape key non-raw, dan mock test memakai note={{note}}).
+    return vars;
   }
 
   #sendError(res, req, status, code, message) {
@@ -887,22 +969,37 @@ export class PanelServer {
     if (err instanceof VmPanelError) {
       status = STATUS_BY_CODE[err.code] ?? 500;
       code = err.code;
-      if (status !== 500) message = err.message;
+      // A2#28: transport error manager → pesan kanonik, JANGAN bocorkan
+      // detail socket/host dari err.message ke response.
+      if (err.code === TIMEOUT || err.code === UNREACHABLE) {
+        message = MANAGER_DOWN_BANNER;
+      } else if (status !== 500) {
+        message = err.message;
+      }
     }
     return this.#sendError(res, req, status, code, message);
+  }
+
+  /** A2#28: teks error aman-untuk-user (banner halaman) — transport manager dipetakan ke pesan kanonik. */
+  #userSafeErrorText(err) {
+    if (err instanceof VmPanelError && (err.code === TIMEOUT || err.code === UNREACHABLE)) {
+      return MANAGER_DOWN_BANNER;
+    }
+    return typeof err?.message === 'string' && err.message !== '' ? err.message : 'Terjadi kesalahan internal.';
   }
 
   // --- manager client (lazy, inject-able) ------------------------------------
 
   #getManager() {
     if (this.#managerClient) return this.#managerClient;
-    if (!this.#defaultManager) {
-      let token;
-      try {
-        token = readFileSync(this.#managerTokenFile, 'utf8').trim() || undefined;
-      } catch {
-        token = undefined;
-      }
+    let token;
+    try {
+      token = readFileSync(this.#managerTokenFile, 'utf8').trim() || undefined;
+    } catch {
+      token = undefined;
+    }
+    if (!this.#defaultManager || this.#defaultManagerToken !== token) {
+      this.#defaultManagerToken = token;
       this.#defaultManager = new ManagerClient({ port: this.#managerApiPort, token });
     }
     return this.#defaultManager;
@@ -955,7 +1052,16 @@ export class PanelServer {
       '/audit': () => client.listAudit(query ?? {}),
     };
     const fn = map[path] ?? (() => client.request('GET', path, { query }));
-    return this.#tryData(fn);
+    return this.#tryData(fn).then((result) => {
+      // A2#17: catat hasil probe untuk widget sidebar (dipakai ulang oleh
+      // #pageVars; dashboard tetap override eksplisit dari status fresnya).
+      if (path === '/system/status') {
+        this.#managerLastStatus = result.ok
+          ? String(result.data?.status ?? 'unknown') || 'unknown'
+          : 'unknown';
+      }
+      return result;
+    });
   }
 
   // --- routing utama -----------------------------------------------------------
@@ -987,11 +1093,16 @@ export class PanelServer {
       } catch {
         return this.#sendError(res, req, 400, VALIDATION, 'path tidak valid');
       }
-      return await this.#serveStatic(res, rest);
+      // A2#21: static JUGA dibatasi rate limit global (sebelumnya lolos
+      // total); /health dikecualikan — probe monitoring tidak boleh di-throttle.
+      if (pathname !== '/health' && this.#isRateLimited(`g:${ip}`, this.#ratePerMin)) {
+        return this.#sendError(res, req, 429, 'RATE_LIMITED', 'Terlalu banyak permintaan. Coba lagi nanti.');
+      }
+      return await this.#serveStatic(req, res, rest);
     }
 
     try {
-      if (this.#isRateLimited(`g:${ip}`, this.#ratePerMin)) {
+      if (pathname !== '/health' && this.#isRateLimited(`g:${ip}`, this.#ratePerMin)) {
         return this.#sendError(res, req, 429, 'RATE_LIMITED', 'Terlalu banyak permintaan. Coba lagi nanti.');
       }
 
@@ -1023,14 +1134,11 @@ export class PanelServer {
 
       // --- terproteksi (session wajib) ---
       const cookies = this.#parseCookies(req);
-      const sessionQuery = url.searchParams.get('session');
-      const sessionId = cookies[SESSION_COOKIE] || (sessionQuery ? sessionQuery.trim() : null);
+      // A2#10: session ID HANYA dari cookie HttpOnly. Jalur ?session= dihapus —
+      // ID di query string bocor ke history, log proxy, dan referrer.
+      const sessionId = cookies[SESSION_COOKIE] || null;
       const session = this.#auth.getSession(sessionId);
       if (!session) return this.#redirect(res, '/login');
-
-      if (sessionQuery && !cookies[SESSION_COOKIE]) {
-        res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${session.sessionId}; HttpOnly; SameSite=Strict; Path=/`);
-      }
 
       // --- assistant API (Hermes Agent / 9Router bridge) ---
       if (pathname === '/api/assistant/status' && method === 'GET') {
@@ -1038,7 +1146,71 @@ export class PanelServer {
         return this.#sendJson(res, 200, st);
       }
       if (pathname === '/api/assistant/chat' && method === 'POST') {
-        return await handleAssistantChat(req, res);
+        // A2#8/#26: CSRF wajib (pola deploy-folder) + body dibaca DI RUTE lewat
+        // #readBody (batas 1MB; overflow → BODY_TOO_LARGE → 413 via #handleError)
+        // + validasi payload. Sebelumnya route meneruskan stream mentah apa adanya.
+        const csrf = req.headers['x-csrf-token'];
+        if (!csrf || !this.#csrfOk(session, cookies, csrf)) {
+          return this.#sendJson(res, 403, { ok: false, error: 'CSRF token tidak valid' });
+        }
+        const raw = await this.#readBody(req); // reject BODY_TOO_LARGE → tangani terpusat (413)
+        let payload;
+        try {
+          payload = JSON.parse(raw || '{}');
+        } catch {
+          return this.#sendJson(res, 400, { ok: false, error: 'Invalid JSON body' });
+        }
+        payload = payload && typeof payload === 'object' ? payload : {};
+        const { message, history } = payload;
+        if (!message || typeof message !== 'string' || message.trim() === '') {
+          return this.#sendJson(res, 400, { ok: false, error: 'Field message wajib diisi' });
+        }
+        if (message.length > 4000) {
+          return this.#sendJson(res, 400, { ok: false, error: 'message terlalu panjang (maks 4000 karakter)' });
+        }
+        if (
+          history !== undefined &&
+          (history === null ||
+            typeof history !== 'object' ||
+            !Array.isArray(history) ||
+            history.length > 10 ||
+            history.some(
+              (h) =>
+                !h ||
+                typeof h !== 'object' ||
+                (h.role !== 'user' && h.role !== 'assistant') ||
+                typeof h.content !== 'string'
+            ))
+        ) {
+          return this.#sendJson(res, 400, { ok: false, error: 'history tidak valid (maks 10 item role user/assistant)' });
+        }
+        const chatCtx = {
+          payload,
+          // A2#5/#6: Hermes tool jadi terikat sesi — managerClient nyata +
+          // gerbang permission berbasis userId/role (fail-closed di assistant.js).
+          managerClient: this.#getManager(),
+          session: { userId: session.user.userId, role: session.user.role },
+          checkPermission: (action) =>
+            this.#auth.perm.checkPermission({ userId: session.user.userId, action }).allowed === true,
+          rootDir: this.#rootDir,
+        };
+        chatCtx.managerGet = (p) => chatCtx.managerClient.request('GET', p);
+        return await handleAssistantChat(req, res, chatCtx);
+      }
+
+      // --- desktop deploy/inspect API (session + CSRF; permission di handler) ---
+      if (
+        (pathname === '/api/desktop/deploy-folder' || pathname === '/api/desktop/inspect-folder') &&
+        method === 'POST'
+      ) {
+        const csrf = req.headers['x-csrf-token'];
+        if (!csrf || !this.#csrfOk(session, cookies, csrf)) {
+          return this.#sendJson(res, 403, { ok: false, error: 'CSRF token tidak valid' });
+        }
+        if (pathname === '/api/desktop/inspect-folder') {
+          return await this.#handleDesktopInspectFolder(req, res, session);
+        }
+        return await this.#handleDesktopDeployFolder(req, res, session);
       }
 
       if (method === 'GET') {
@@ -1135,11 +1307,10 @@ export class PanelServer {
   #handleBootstrapGet(res) {
     if (this.#hasOwner()) return this.#redirect(res, '/login');
     const token = randomBytes(32).toString('hex');
-    const now = Date.now();
-    for (const [k, exp] of this.#bootstrapTokens) {
-      if (exp <= now) this.#bootstrapTokens.delete(k);
-    }
-    this.#bootstrapTokens.set(token, now + BOOTSTRAP_TTL_MS);
+    // A2#27: hanya SATU token bootstrap aktif — GET baru membatalkan semua
+    // token lama (sebelumnya token menumpuk dan tetap valid sampai TTL).
+    this.#bootstrapTokens.clear();
+    this.#bootstrapTokens.set(token, Date.now() + BOOTSTRAP_TTL_MS);
     return this.#sendHtml(res, 200, this.#bootstrapFormHtml('', token));
   }
 
@@ -1153,6 +1324,7 @@ export class PanelServer {
 
     const reissue = (error, status = 400) => {
       const fresh = randomBytes(32).toString('hex');
+      this.#bootstrapTokens.clear(); // A2#27: tetap satu token aktif
       this.#bootstrapTokens.set(fresh, Date.now() + BOOTSTRAP_TTL_MS);
       return this.#sendHtml(res, status, this.#bootstrapFormHtml(error, fresh, username));
     };
@@ -1182,7 +1354,7 @@ export class PanelServer {
 
   // --- static ----------------------------------------------------------------
 
-  async #serveStatic(res, rest) {
+  async #serveStatic(req, res, rest) {
     const base = this.#staticDir;
     const target = resolve(base, rest);
     if (target !== base && !target.startsWith(base + sep)) {
@@ -1192,6 +1364,20 @@ export class PanelServer {
     if (!type) {
       return this.#sendError(res, { url: '/static/' }, 404, NOT_FOUND, 'file static tidak ditemukan');
     }
+    // A2#21: ETag dari mtime+size + dukungan If-None-Match → 304 tanpa body.
+    let st;
+    try {
+      st = statSync(target);
+    } catch {
+      return this.#sendError(res, { url: '/static/' }, 404, NOT_FOUND, 'file static tidak ditemukan');
+    }
+    const etag = `W/"${st.mtimeMs.toString(36)}-${st.size.toString(36)}"`;
+    const inm = req?.headers?.['if-none-match'];
+    if (typeof inm === 'string' && inm.split(',').some((t) => t.trim() === etag || t.trim() === '*')) {
+      res.writeHead(304, { ETag: etag });
+      res.end();
+      return;
+    }
     let data;
     try {
       data = await readFile(target);
@@ -1199,7 +1385,7 @@ export class PanelServer {
       return this.#sendError(res, { url: '/static/' }, 404, NOT_FOUND, 'file static tidak ditemukan');
     }
     if (res.headersSent) return;
-    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
+    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache', ETag: etag });
     res.end(data);
   }
 
@@ -1436,6 +1622,321 @@ export class PanelServer {
     return this.#redirect(res, '/projects');
   }
 
+  /** POST /projects/sync-all-cloud: Daftarkan semua project (termasuk lokal) ke manifest + commit */
+  async #handleSyncAllCloudPost(session, res) {
+    const detail = await this.#fetchProjectDetails();
+    const manifestPath = join(this.#rootDir, 'projects.auto.json');
+    let list = [];
+    try {
+      list = JSON.parse(readFileSync(manifestPath, 'utf8'));
+      if (!Array.isArray(list)) list = [];
+    } catch {
+      list = [];
+    }
+
+    for (const p of detail) {
+      const name = String(p.name ?? '').trim();
+      if (!name) continue;
+      const port = Number(p.port);
+      const cleanUrl = cleanRepoUrl(p.repoUrl || p.repo_url || '') || '';
+      const entry = {
+        name,
+        type: String(p.type ?? 'static'),
+        port: Number.isInteger(port) && port > 0 ? port : null,
+        repo_url: cleanUrl,
+        git_branch: typeof p.branch === 'string' && p.branch.trim() !== '' ? p.branch.trim() : 'main',
+        enabled: true,
+      };
+      const idx = list.findIndex((e) => e.name === name);
+      if (idx >= 0) list[idx] = entry;
+      else list.push(entry);
+    }
+
+    try {
+      writeFileSync(manifestPath, `${JSON.stringify(list, null, 2)}\n`, 'utf8');
+      const git = process.platform === 'win32' ? 'git.exe' : 'git';
+      const opts = { cwd: this.#rootDir, timeout: GIT_TIMEOUT_MS, windowsHide: true };
+      await execFileP(git, ['add', 'projects.auto.json'], opts);
+      try {
+        await execFileP(git, ['commit', '-m', GIT_COMMIT_MSG], opts);
+      } catch {}
+      try {
+        await execFileP(git, ['push', 'origin', GIT_PUSH_REF], opts);
+      } catch {}
+    } catch {}
+
+    return this.#redirect(res, '/projects');
+  }
+
+  /** POST /projects/:id/sync-cloud: Daftarkan project individual ke Cloud 24/7 */
+  async #handleSyncProjectCloudPost(id, session, res) {
+    let project = null;
+    try {
+      project = await this.#getManager().request('GET', `/projects/${encodeURIComponent(id)}`);
+    } catch {
+      return this.#redirect(res, '/projects');
+    }
+    if (!project) return this.#redirect(res, '/projects');
+
+    const manifestPath = join(this.#rootDir, 'projects.auto.json');
+    let list = [];
+    try {
+      list = JSON.parse(readFileSync(manifestPath, 'utf8'));
+      if (!Array.isArray(list)) list = [];
+    } catch {
+      list = [];
+    }
+
+    const port = Number(project.port);
+    const cleanUrl = cleanRepoUrl(project.repoUrl || project.repo_url || '') || '';
+    const entry = {
+      name: String(project.name ?? '').trim(),
+      type: String(project.type ?? 'static'),
+      port: Number.isInteger(port) && port > 0 ? port : null,
+      repo_url: cleanUrl,
+      git_branch: typeof project.branch === 'string' && project.branch.trim() !== '' ? project.branch.trim() : 'main',
+      enabled: true,
+    };
+
+    const idx = list.findIndex((e) => e.name === entry.name);
+    if (idx >= 0) list[idx] = entry;
+    else list.push(entry);
+
+    try {
+      writeFileSync(manifestPath, `${JSON.stringify(list, null, 2)}\n`, 'utf8');
+      const git = process.platform === 'win32' ? 'git.exe' : 'git';
+      const opts = { cwd: this.#rootDir, timeout: GIT_TIMEOUT_MS, windowsHide: true };
+      await execFileP(git, ['add', 'projects.auto.json'], opts);
+      try {
+        await execFileP(git, ['commit', '-m', GIT_COMMIT_MSG], opts);
+      } catch {}
+      try {
+        await execFileP(git, ['push', 'origin', GIT_PUSH_REF], opts);
+      } catch {}
+    } catch {}
+
+    return this.#redirect(res, '/projects');
+  }
+
+  /** Log error jalur desktop API — e.message HANYA ke log, tidak ke response. */
+  #logDesktopError(scope, err) {
+    try {
+      console.error(`[panel] ${scope}: ${err instanceof Error ? err.message : String(err)}`);
+    } catch {
+      // logging tidak boleh memutus alur request
+    }
+  }
+
+  /**
+   * POST /api/desktop/inspect-folder (A2#4) — deep inspection read-only untuk
+   * co-pilot generative deploy: framework + detectedEnvs + gitInfo.
+   */
+  async #handleDesktopInspectFolder(req, res, session) {
+    this.#requirePermission(session, 'project.create');
+    let body;
+    try {
+      const raw = await this.#readBody(req);
+      body = JSON.parse(raw);
+    } catch {
+      return this.#sendJson(res, 400, { ok: false, error: 'Request body must be valid JSON' });
+    }
+    const folderPath = typeof body?.folderPath === 'string' ? body.folderPath.trim() : '';
+    if (!folderPath) {
+      return this.#sendJson(res, 400, { ok: false, error: 'Path folder wajib diisi' });
+    }
+    try {
+      const inspection = deepInspectProjectFolder(folderPath);
+      return this.#sendJson(res, 200, { ok: true, inspection });
+    } catch (e) {
+      this.#logDesktopError('inspect-folder', e);
+      return this.#sendJson(res, 400, {
+        ok: false,
+        error: 'Gagal menginspeksi folder — pastikan path benar dan dapat dibaca.',
+      });
+    }
+  }
+
+  /** POST /api/desktop/deploy-folder */
+  async #handleDesktopDeployFolder(req, res, session) {
+    // A2#2: permission gate di awal, sebelum body/inspect apa pun.
+    this.#requirePermission(session, 'project.create');
+    let body;
+    try {
+      const raw = await this.#readBody(req);
+      body = JSON.parse(raw);
+    } catch {
+      return this.#sendJson(res, 400, { ok: false, error: 'Request body must be valid JSON' });
+    }
+
+    const folderPath = typeof body?.folderPath === 'string' ? body.folderPath.trim() : '';
+    if (!folderPath) {
+      return this.#sendJson(res, 400, { ok: false, error: 'Path folder wajib diisi' });
+    }
+
+    try {
+      // A2#4: deep inspection — framework/detectedEnvs/gitInfo ikut terpakai.
+      const inspection = deepInspectProjectFolder(folderPath);
+
+      // Port allocation (A2#24: port eksplisit wajib rentang legal + bukan reserved).
+      let port = null;
+      if (body.port != null && body.port !== '') {
+        const p = Number(body.port);
+        if (
+          !Number.isInteger(p) ||
+          p < DEPLOY_PORT_MIN ||
+          p > DEPLOY_PORT_MAX ||
+          RESERVED_PORTS.includes(p)
+        ) {
+          return this.#sendJson(res, 400, {
+            ok: false,
+            error: `Port harus angka bulat ${DEPLOY_PORT_MIN}-${DEPLOY_PORT_MAX} dan bukan port sistem yang dicadangkan (${RESERVED_PORTS.join(', ')}).`,
+          });
+        }
+        port = p;
+      } else {
+        let usedPorts = [];
+        try {
+          const svcs = await this.#getManager().request('GET', '/services');
+          if (Array.isArray(svcs?.rows)) {
+            usedPorts = svcs.rows.map((s) => s.port).filter(Boolean);
+          } else if (Array.isArray(svcs)) {
+            usedPorts = svcs.map((s) => s.port).filter(Boolean);
+          }
+        } catch {}
+        port = await allocateSafePort({ usedPorts });
+      }
+
+      // A2#24: sebelum deploy — bind test nyata + registry port manager (GET /ports).
+      if (!(await portBindTest(port))) {
+        return this.#sendJson(res, 400, {
+          ok: false,
+          error: `Port ${port} tidak dapat di-bind di host ini — pilih port lain.`,
+        });
+      }
+      try {
+        const portsReg = await this.#getManager().request('GET', '/ports');
+        const regRows = Array.isArray(portsReg?.rows)
+          ? portsReg.rows
+          : Array.isArray(portsReg)
+            ? portsReg
+            : [];
+        if (regRows.some((r) => Number(r?.port) === port)) {
+          return this.#sendJson(res, 400, {
+            ok: false,
+            error: `Port ${port} sudah terdaftar dipakai service lain.`,
+          });
+        }
+      } catch {
+        // registry tidak terjangkau — bind test lokal tetap gerbang utama
+      }
+
+      // Unique project name
+      let baseName = sanitizeProjectName(body.name || inspection.suggestedName);
+      let name = baseName;
+      let existingProjects = [];
+      try {
+        const prjRes = await this.#getManager().request('GET', '/projects');
+        if (Array.isArray(prjRes)) existingProjects = prjRes;
+        else if (Array.isArray(prjRes?.rows)) existingProjects = prjRes.rows;
+      } catch {}
+      let counter = 1;
+      while (existingProjects.some((p) => p.name === name)) {
+        name = `${baseName}-${counter++}`;
+      }
+
+      // Clean repoUrl to prevent token leakage (A2#4: gitInfo dari deep inspect)
+      const repoUrlClean =
+        cleanRepoUrl(body.repoUrl || inspection.gitInfo?.repoUrl || inspection.details?.gitInfo?.repoUrl || '') || undefined;
+
+      // REM1: bot / worker long-polling tidak pernah listen port → default
+      // adapter (tcp) kini membuat deploy FAILED. Tandai {type:'process'} agar
+      // health lane memakai keliveness proses (pola sama desktop/main.js A2).
+      const healthCheck = isBotLikeInspection(inspection) ? { type: 'process' } : undefined;
+
+      // Create project via Manager
+      const created = await this.#getManager().request('POST', '/projects', {
+        body: {
+          name,
+          type: inspection.type,
+          port,
+          start_cmd: inspection.entryFile || undefined,
+          repo_url: repoUrlClean,
+          git_branch: body.gitBranch || inspection.gitInfo?.branch || undefined,
+          ...(healthCheck ? { healthCheck } : {}),
+        },
+      });
+
+      // Copy files to workspace (A2#23: ignoreEnv=true — file rahasia lokal
+      // TIDAK pernah ikut tersalin ke workspace terkelola)
+      if (created?.workspacePath) {
+        copyWorkspaceFiles(folderPath, created.workspacePath, { ignoreEnv: true });
+        if (body.env && typeof body.env === 'object') {
+          upsertEnvFile(join(created.workspacePath, '.env'), body.env);
+        }
+      }
+
+      // Deploy project
+      try {
+        await this.#getManager().request('POST', `/projects/${encodeURIComponent(created.id)}/deploy`, {
+          body: { source: { type: 'workspace' } },
+          timeoutMs: 900_000,
+        });
+      } catch (e) {
+        // best effort deploy
+      }
+
+      // Auto 24/7 Cloud sync
+      let cloud247 = null;
+      if (body.auto247) {
+        const manifestPath = join(this.#rootDir, 'projects.auto.json');
+        let list = [];
+        try {
+          list = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          if (!Array.isArray(list)) list = [];
+        } catch {
+          list = [];
+        }
+        const entry = {
+          name: created.name,
+          type: created.type,
+          port: created.port,
+          repo_url: repoUrlClean || '',
+          git_branch: body.gitBranch || 'main',
+          enabled: true,
+        };
+        const idx = list.findIndex((p) => p.name === created.name);
+        if (idx >= 0) list[idx] = entry;
+        else list.push(entry);
+        writeFileSync(manifestPath, `${JSON.stringify(list, null, 2)}\n`, 'utf8');
+        cloud247 = {
+          enabled: true,
+          synced: true,
+          message: 'Project terdaftar di Cloud 24/7 manifest',
+        };
+      }
+
+      return this.#sendJson(res, 200, {
+        ok: true,
+        project: {
+          id: created.id,
+          name: created.name,
+          type: created.type,
+          port: created.port,
+        },
+        // A2#4: hasil deep inspection ikut dikembalikan ke shell desktop.
+        framework: inspection.framework ?? null,
+        cloud247,
+      });
+    } catch (e) {
+      // A2#2: detail internal HANYA ke log; response generik.
+      this.#logDesktopError('deploy-folder', e);
+      return this.#sendJson(res, 400, {
+        ok: false,
+        error: 'Deploy folder gagal diproses. Periksa log panel untuk detail.',
+      });
+    }
+  }
+
   async #pageDashboard(session, pathname) {
     this.#requirePermission(session, PAGE_ACTIONS['/']);
     const [status, projects, services, specs, github] = await Promise.all([
@@ -1554,16 +2055,112 @@ export class PanelServer {
             alerts.slice(0, 10),
           );
 
+    // Oriont Dark Luxe Dashboard Variables
+    const totalProjectsCount = String(rows.length);
+    let runningCount = 0;
+    let stoppedCount = 0;
+    const svcByProject = new Map();
+    for (const s of svcRows) {
+      if (s.status === 'running') runningCount++;
+      else stoppedCount++;
+      if (s.projectId && !svcByProject.has(s.projectId)) {
+        svcByProject.set(s.projectId, s);
+      }
+    }
+    const runningProjectsCount = String(runningCount);
+    const endedProjectsCount = String(stoppedCount);
+
+    const osCpus = os.cpus();
+    const cpuCoresStr = String(sp?.cpu?.cores ?? osCpus.length ?? 1);
+    const cpuModelStr = String(sp?.cpu?.model ?? osCpus[0]?.model ?? 'Standard CPU');
+    const cpuLoadPct = sp?.cpu?.usagePct != null ? clampPct(sp.cpu.usagePct) : loadPct;
+    const memUsedPct = sp?.memory?.usedPct != null ? clampPct(sp.memory.usedPct) : memPct;
+    const memUsedStr = sp?.memory?.usedMb != null ? fmtMb(sp.memory.usedMb) : fmtMb(Math.round((os.totalmem() - os.freemem()) / (1024 * 1024)));
+    const memTotalStr = sp?.memory?.totalMb != null ? fmtMb(sp.memory.totalMb) : fmtMb(Math.round(os.totalmem() / (1024 * 1024)));
+    const hostUptimeStr = sp?.host?.uptimeSec != null ? fmtDuration(sp.host.uptimeSec) : (st?.uptimeSec != null ? fmtDuration(st.uptimeSec) : fmtDuration(Math.round(os.uptime())));
+
+    const ghChainStatus = ghUp
+      ? (ghActive ? (ghActive.status || 'running') : (ghLast ? (ghLast.conclusion || 'idle') : 'idle'))
+      : '24/7 self-hosted';
+    const ghLastRun = ghLast
+      ? `${ghLast.conclusion ?? 'unknown'} (${fmtTime(ghLast.createdAt)})`
+      : (ghActive ? 'In progress' : 'Standby');
+    const ghRunLink = String(ghRunUrl || 'https://github.com');
+
+    let realProjectsHtml = '';
+    if (rows.length === 0) {
+      realProjectsHtml = `<div class="empty-state-mini"><div class="empty-title">Belum ada project</div><div class="empty-hint">Tarik folder ke dropzone untuk deploy instan.</div></div>`;
+    } else {
+      realProjectsHtml = rows.slice(0, 5).map((p) => {
+        const type = String(p.type || '').toLowerCase();
+        const typeIcon = type.includes('node') ? '⬢' : type.includes('python') ? '🐍' : '🌐';
+        const svc = svcByProject.get(p.id);
+        const prjStatus = p.status || svc?.status || 'stopped';
+        const prjPort = p.port || svc?.port || '—';
+        return `<div class="oriont-list-row">` +
+          `<div class="oriont-list-icon mono">${typeIcon}</div>` +
+          `<div class="oriont-list-info">` +
+            `<div class="oriont-list-title"><a href="/projects/${encodeURIComponent(p.id)}">${escapeHtml(p.name || p.id)}</a></div>` +
+            `<div class="oriont-list-meta"><span class="badge-type">${escapeHtml(p.type || 'app')}</span><span class="mono" style="margin-left: 6px;">:${escapeHtml(String(prjPort))}</span></div>` +
+          `</div>` +
+          `<div class="oriont-list-status">${statusCell(prjStatus)}</div>` +
+        `</div>`;
+      }).join('');
+    }
+
+    let realServicesHtml = '';
+    if (svcRows.length === 0) {
+      realServicesHtml = `<div class="empty-state-mini"><div class="empty-title">Tidak ada service aktif</div><div class="empty-hint">Deploy project atau start service dari menu Services.</div></div>`;
+    } else {
+      realServicesHtml = svcRows.slice(0, 5).map((s) => {
+        const svcPort = s.port ? `:${escapeHtml(String(s.port))}` : '';
+        const pidStr = s.pid ? `PID ${escapeHtml(String(s.pid))}` : 'no PID';
+        return `<div class="oriont-list-row">` +
+          `<div class="oriont-list-icon mono">⚙</div>` +
+          `<div class="oriont-list-info">` +
+            `<div class="oriont-list-title"><a href="/services">${escapeHtml(s.name || s.id)}</a></div>` +
+            `<div class="oriont-list-meta mono">${pidStr} · port ${svcPort || '—'}</div>` +
+          `</div>` +
+          `<div class="oriont-list-status">${statusCell(s.status || 'unknown')}</div>` +
+        `</div>`;
+      }).join('');
+    }
+
     return {
       template: 'dashboard',
       vars: this.#pageVars(session, pathname, banner, {
         title: 'Dashboard',
         managerStatus: status.ok ? String(status.data?.status ?? 'unknown') : 'unknown',
+        // A4-H5: teks kartu System Status dulu hardcoded 'Supervisor healthy'.
+        // Proporsikan dari hasil probe status nyata: ok + sehat → healthy;
+        // ok + nilai lain → tampilkan apa adanya; down → 'tidak terjangkau'.
+        supervisorStatusText: status.ok
+          ? (() => {
+              const s = String(st?.status ?? 'unknown').toLowerCase();
+              if (s === 'healthy' || s === 'running' || s === 'ok') return 'Supervisor healthy';
+              return `Supervisor: ${s}`;
+            })()
+          : 'Supervisor tidak terjangkau',
         projectCount: String(rows.length),
         rows,
         rowsJson: JSON.stringify(rows),
         systemCards,
         alertsTable,
+        totalProjectsCount,
+        runningProjectsCount,
+        endedProjectsCount,
+        cpuCoresStr,
+        cpuModelStr,
+        cpuLoadPct,
+        memUsedPct,
+        memUsedStr,
+        memTotalStr,
+        hostUptimeStr,
+        ghChainStatus,
+        ghLastRun,
+        ghRunLink,
+        realProjectsHtml,
+        realServicesHtml,
       }),
     };
   }
@@ -1700,7 +2297,10 @@ export class PanelServer {
   }
 
   async #pageProjectDetail(session, id, pathname, opts = {}) {
-    this.#requirePermission(session, PAGE_ACTIONS['/projects']);
+    // A2#12: "view detail" adalah aksi PER-project → teruskan id sebagai
+    // projectId agar operator ber-scope hanya bisa membuka detail project-nya.
+    // HALAMAN LIST (#pageProjects) tetap global (lihat catatan #requirePermission).
+    this.#requirePermission(session, PAGE_ACTIONS['/projects'], id);
     const [projects, services, deployments] = await Promise.all([
       this.#managerGet('/projects'),
       this.#managerGet('/services'),
@@ -1933,7 +2533,7 @@ export class PanelServer {
         { label: 'Actions', cell: (r) => serviceActions(r, csrf) },
       ],
       rows,
-      { empty: { title: 'No services.', hint: 'Services appear once a project has been deployed.' } },
+      { empty: services.ok ? { title: 'No services.', hint: 'Services appear once a project has been deployed.' } : MANAGER_DOWN_EMPTY },
     );
     return {
       template: 'services',
@@ -1967,7 +2567,7 @@ export class PanelServer {
         { label: 'Finished UTC', cls: 'mono', cell: (r) => escapeHtml(fmtTime(r.finished_at)) },
       ],
       rows,
-      { empty: { title: 'No deployments.', hint: 'Deployments appear after the first deploy of a project.' } },
+      { empty: deployments.ok ? { title: 'No deployments.', hint: 'Deployments appear after the first deploy of a project.' } : MANAGER_DOWN_EMPTY },
     );
     return {
       template: 'deployments',
@@ -2032,7 +2632,9 @@ export class PanelServer {
       (r) => r?.supervisor?.crashLoop === true || String(r?.supervisor?.state ?? '') === 'crash_loop',
     );
     const recoverySections =
-      crashers.length === 0
+      !recovery.ok
+        ? emptyState(MANAGER_DOWN_EMPTY)
+        : crashers.length === 0
         ? emptyState({ title: 'No services in crash-loop.', hint: 'The supervisor is operating within restart limits.' })
         : crashers
             .map((r) => {
@@ -2091,7 +2693,7 @@ export class PanelServer {
         { label: 'Created UTC', cls: 'mono', cell: (r) => escapeHtml(fmtTime(r.at)) },
       ],
       rows,
-      { empty: { title: 'No backups.', hint: 'Create one manually or wait for the scheduled backup.' } },
+      { empty: backups.ok ? { title: 'No backups.', hint: 'Create one manually or wait for the scheduled backup.' } : MANAGER_DOWN_EMPTY },
     );
     return {
       template: 'backups',
@@ -2117,12 +2719,18 @@ export class PanelServer {
     if (resultQ) rows = rows.filter((r) => String(r?.result ?? '') === resultQ);
     const total = audit.ok ? String(audit.data?.total ?? rows.length) : '0';
     const banner = audit.ok ? '' : alertFrag('warn', MANAGER_DOWN_BANNER);
+    // A2#22: manager GET /audit TIDAK mendukung filter `result` (lihat
+    // manager/api.js listAudit) — filter dijalankan atas 50 baris yang sudah
+    // diambil; JANGAN loop-fetch. Kejujuran ini dikomunikasikan lewat label.
+    const resultNote = resultQ
+      ? `<p class="field__hint">Filter “result” hanya menyaring dari 50 audit event terakhir (manager belum mendukung filter result).</p>`
+      : '';
     const filterForm =
       `<section class="card"><header class="card__header"><h2 class="card__title">Filters</h2></header><div class="card__body"><form class="filters" method="get" action="/audit">` +
       `<div class="field"><label class="field__label" for="f-actor">Actor</label><input class="field__input" type="text" id="f-actor" name="actor" value="${escapeHtml(actorQ)}"></div>` +
       `<div class="field"><label class="field__label" for="f-operation">Operation</label><input class="field__input mono" type="text" id="f-operation" name="operation" value="${escapeHtml(opQ)}"></div>` +
       `<div class="field"><label class="field__label" for="f-result">Result</label><select class="field__input" id="f-result" name="result"><option value="">all</option><option value="ok"${resultQ === 'ok' ? ' selected' : ''}>ok</option><option value="fail"${resultQ === 'fail' ? ' selected' : ''}>fail</option></select></div>` +
-      `<button class="btn" type="submit">Apply</button></form></div></section>`;
+      `<button class="btn" type="submit">Apply</button></form>${resultNote}</div></section>`;
     const auditTable = buildTable(
       [
         { label: 'Time UTC', cls: 'mono', cell: (r) => escapeHtml(fmtTime(r.at)) },
@@ -2322,11 +2930,77 @@ export class PanelServer {
       return await this.#handleSyncToGithubPost(session, res);
     }
 
-    let     m = pathname.match(/^\/projects\/([^/]+)\/deploy$/);
+    if (pathname === '/projects/sync-all-cloud') {
+      await readAndCsrf();
+      this.#requirePermission(session, 'project.create');
+      if (session.user.role !== 'owner') {
+        throw new VmPanelError(PERMISSION_DENIED, 'Sync ke GitHub khusus owner.');
+      }
+      return await this.#handleSyncAllCloudPost(session, res);
+    }
+
+    let m = pathname.match(/^\/projects\/([^/]+)\/sync-cloud$/);
     if (m) {
       await readAndCsrf();
-      this.#requirePermission(session, 'project.deploy');
+      this.#requirePermission(session, 'project.create');
+      if (session.user.role !== 'owner') {
+        throw new VmPanelError(PERMISSION_DENIED, 'Sync ke GitHub khusus owner.');
+      }
       const id = decodeURIComponent(m[1]);
+      return await this.#handleSyncProjectCloudPost(id, session, res);
+    }
+
+    m = pathname.match(/^\/projects\/([^/]+)\/delete$/);
+    if (m) {
+      const body = await readAndCsrf();
+      const id = decodeURIComponent(m[1]);
+      // A2#13: gate memakai verb delete (matriks §11.2 punya 'project.delete'),
+      // bukan 'project.create' seperti sebelumnya. A2#12: teruskan projectId.
+      this.#requirePermission(session, 'project.delete', id);
+      const key = `project-delete:${id}`;
+      const tokenField = String(body.confirmToken ?? '');
+      if (tokenField !== '' && !this.#consumeConfirmToken(tokenField, key, session.user.userId)) {
+        throw new VmPanelError(
+          PERMISSION_DENIED,
+          'Token konfirmasi tidak valid atau kedaluwarsa — jalankan ulang aksi hapus.',
+        );
+      }
+      if (tokenField === '') {
+        // FASE 1 — issue token + halaman konfirmasi; TIDAK ada penghapusan di sini.
+        const token = this.#issueConfirmToken(key, session.user.userId);
+        const html = this.#confirmDestructiveHtml({
+          actionUrl: `/projects/${m[1]}/delete`,
+          token,
+          csrf: session.csrfToken,
+          title: 'Konfirmasi hapus project',
+          message: 'Hapus project ini? Service yang berjalan dihentikan dan data proyek diarsipkan. Aksi tidak dapat dibatalkan.',
+          detail: `project: ${id}`,
+          cancelHref: `/projects/${encodeURIComponent(id)}`,
+        });
+        return this.#sendHtml(res, 200, html);
+      }
+      // FASE 2 — token cocok: eksekusi via manager (rantai dua-fase internal manager).
+      try {
+        await this.#getManager().request('DELETE', `/projects/${encodeURIComponent(id)}`);
+      } catch (e) {
+        try {
+          const reqRes = await this.#getManager().request('POST', `/projects/${encodeURIComponent(id)}/remove-request`);
+          if (reqRes?.confirmToken) {
+            await this.#getManager().request('POST', `/projects/${encodeURIComponent(id)}/remove`, {
+              body: { confirmToken: reqRes.confirmToken },
+            });
+          }
+        } catch {}
+      }
+      return this.#redirect(res, '/projects');
+    }
+
+    m = pathname.match(/^\/projects\/([^/]+)\/deploy$/);
+    if (m) {
+      await readAndCsrf();
+      const id = decodeURIComponent(m[1]);
+      // A2#12: deploy adalah aksi PER-project → teruskan projectId.
+      this.#requirePermission(session, 'project.deploy', id);
       try {
         // Project punya repo_url → deploy pakai git source; tanpa → workspace.
         // NB: GET /projects (route inti) tidak membawa repoUrl → pakai detail
@@ -2348,7 +3022,7 @@ export class PanelServer {
         if (e instanceof VmPanelError) {
           // Error → alert di halaman detail (pola graceful; tanpa crash).
           const page = await this.#pageProjectDetail(session, id, '/projects', {
-            banner: alertFrag('error', e.message),
+            banner: alertFrag('error', this.#userSafeErrorText(e)),
           });
           return this.#renderManaged(res, { ...page, status: STATUS_BY_CODE[e.code] ?? 500 });
         }
@@ -2360,9 +3034,27 @@ export class PanelServer {
     m = pathname.match(/^\/services\/([^/]+)\/(start|stop|restart|retry)$/);
     if (m) {
       await readAndCsrf();
-      this.#requirePermission(session, 'service.start');
       const id = decodeURIComponent(m[1]);
       const act = m[2];
+      // A2#12: aksi service adalah PER-project (project_scopes §11.3 keyed by
+      // projectId) → resolve serviceId → projectId best-effort lewat GET
+      // /services. Gagal resolve (manager down / service tak ada) → projectId
+      // undefined: user global (tanpa scope rows) lanjut (manager tetap
+      // memvalidasi request-nya sendiri); user ber-scope ditolak checkPermission
+      // (fail-closed — aksi ber-scope tanpa projectId tak pernah lolos).
+      let svcProjectId;
+      try {
+        const svcs = await this.#managerGet('/services');
+        const list = svcs.ok && Array.isArray(svcs.data?.rows) ? svcs.data.rows : [];
+        const hit = list.find((s) => String(s?.id ?? '') === id);
+        if (hit?.projectId) svcProjectId = String(hit.projectId);
+      } catch {
+        svcProjectId = undefined;
+      }
+      // Matriks §11.2 punya verb terpisah; retry (recovery) = lifecycle restart.
+      const action =
+        act === 'stop' ? 'service.stop' : act === 'restart' || act === 'retry' ? 'service.restart' : 'service.start';
+      this.#requirePermission(session, action, svcProjectId);
       if (act === 'retry') {
         await this.#getManager().request('POST', '/recovery/retry', { body: { serviceId: id } });
         return this.#redirect(res, '/recovery');
@@ -2451,12 +3143,12 @@ export class PanelServer {
       return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
     }
 
-    // POST /projects/:id/config/:filename/remove → two-phase di panel:
-    // manager remove-request → remove (confirmToken TIDAK pernah ke UI;
-    // konfirmasi user lewat dialog data-confirm-phrase = filename).
+    // POST /projects/:id/config/:filename/remove → dua-fase sisi panel (A2#13)
+    // lalu rantai manager remove-request → remove (confirmToken manager tidak
+    // pernah ke browser).
     m = pathname.match(/^\/projects\/([^/]+)\/config\/([^/]+)\/remove$/);
     if (m) {
-      await readAndCsrf();
+      const body = await readAndCsrf();
       this.#requirePermission(session, VAULT_ACTION);
       const id = decodeURIComponent(m[1]);
       const filename = safeDecode(m[2]);
@@ -2464,6 +3156,30 @@ export class PanelServer {
         return this.#renderProjectError(
           session, id, res,
           new VmPanelError(VALIDATION, 'Nama file tidak valid.'),
+        );
+      }
+      const key = `config-remove:${id}:${filename}`;
+      const tokenField = String(body.confirmToken ?? '');
+      if (tokenField !== '' && !this.#consumeConfirmToken(tokenField, key, session.user.userId)) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(PERMISSION_DENIED, 'Token konfirmasi tidak valid atau kedaluwarsa — jalankan ulang aksi hapus.'),
+        );
+      }
+      if (tokenField === '') {
+        const token = this.#issueConfirmToken(key, session.user.userId);
+        return this.#sendHtml(
+          res,
+          200,
+          this.#confirmDestructiveHtml({
+            actionUrl: `/projects/${m[1]}/config/${m[2]}/remove`,
+            token,
+            csrf: session.csrfToken,
+            title: 'Konfirmasi hapus config',
+            message: 'Hapus file config ini dari workspace proyek? File hilang permanen dari salinan terkelola.',
+            detail: `file: ${filename}`,
+            cancelHref: `/projects/${encodeURIComponent(id)}`,
+          }),
         );
       }
       try {
@@ -2509,10 +3225,10 @@ export class PanelServer {
       return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
     }
 
-    // POST /projects/:id/env/:envName/remove → two-phase (sama seperti config)
+    // POST /projects/:id/env/:envName/remove → dua-fase sisi panel (A2#13)
     m = pathname.match(/^\/projects\/([^/]+)\/env\/([^/]+)\/remove$/);
     if (m) {
-      await readAndCsrf();
+      const body = await readAndCsrf();
       this.#requirePermission(session, VAULT_ACTION);
       const id = decodeURIComponent(m[1]);
       const envName = safeDecode(m[2]);
@@ -2520,6 +3236,30 @@ export class PanelServer {
         return this.#renderProjectError(
           session, id, res,
           new VmPanelError(VALIDATION, 'Nama variabel tidak valid.'),
+        );
+      }
+      const key = `env-remove:${id}:${envName}`;
+      const tokenField = String(body.confirmToken ?? '');
+      if (tokenField !== '' && !this.#consumeConfirmToken(tokenField, key, session.user.userId)) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(PERMISSION_DENIED, 'Token konfirmasi tidak valid atau kedaluwarsa — jalankan ulang aksi hapus.'),
+        );
+      }
+      if (tokenField === '') {
+        const token = this.#issueConfirmToken(key, session.user.userId);
+        return this.#sendHtml(
+          res,
+          200,
+          this.#confirmDestructiveHtml({
+            actionUrl: `/projects/${m[1]}/env/${m[2]}/remove`,
+            token,
+            csrf: session.csrfToken,
+            title: 'Konfirmasi unlink env',
+            message: `Lepas binding variabel ${envName} dari rahasia yang menunjuknya?`,
+            detail: `env: ${envName}`,
+            cancelHref: `/projects/${encodeURIComponent(id)}`,
+          }),
         );
       }
       try {
@@ -2609,12 +3349,36 @@ export class PanelServer {
       return this.#redirect(res, `/projects/${encodeURIComponent(id)}`);
     }
 
-    // POST /projects/:id/hook/remove → two-phase (sama seperti config)
+    // POST /projects/:id/hook/remove → dua-fase sisi panel (A2#13)
     m = pathname.match(/^\/projects\/([^/]+)\/hook\/remove$/);
     if (m) {
-      await readAndCsrf();
+      const body = await readAndCsrf();
       this.#requirePermission(session, VAULT_ACTION);
       const id = decodeURIComponent(m[1]);
+      const key = `hook-remove:${id}`;
+      const tokenField = String(body.confirmToken ?? '');
+      if (tokenField !== '' && !this.#consumeConfirmToken(tokenField, key, session.user.userId)) {
+        return this.#renderProjectError(
+          session, id, res,
+          new VmPanelError(PERMISSION_DENIED, 'Token konfirmasi tidak valid atau kedaluwarsa — jalankan ulang aksi hapus.'),
+        );
+      }
+      if (tokenField === '') {
+        const token = this.#issueConfirmToken(key, session.user.userId);
+        return this.#sendHtml(
+          res,
+          200,
+          this.#confirmDestructiveHtml({
+            actionUrl: `/projects/${m[1]}/hook/remove`,
+            token,
+            csrf: session.csrfToken,
+            title: 'Konfirmasi hapus hook',
+            message: 'Hapus konfigurasi deploy hook proyek ini?',
+            detail: `project: ${id}`,
+            cancelHref: `/projects/${encodeURIComponent(id)}`,
+          }),
+        );
+      }
       try {
         await this.#vaultRemoveChain('POST', `/projects/${encodeURIComponent(id)}/hook`);
       } catch (e) {
@@ -2633,15 +3397,61 @@ export class PanelServer {
    */
   async #renderProjectError(session, id, res, err) {
     const page = await this.#pageProjectDetail(session, id, '/projects', {
-      banner: alertFrag('error', err.message),
+      banner: alertFrag('error', this.#userSafeErrorText(err)),
     });
     return this.#renderManaged(res, { ...page, status: STATUS_BY_CODE[err.code] ?? 500 });
   }
 
   /**
+   * A2#13 — konfirmasi destruktif dua-fase SISI SERVER (aturan AGENTS §1.4):
+   * fase 1 POST aksi tanpa token → issue token in-memory (sekali pakai,
+   * TTL 10 menit, terikat aksi+user) dan render halaman konfirmasi; fase 2
+   * POST dengan confirmToken yang cocok → baru mengeksekusi. TIDAK ADA
+   * auto-chain dalam satu request.
+   */
+  #issueConfirmToken(key, userId) {
+    const now = Date.now();
+    for (const [t, rec] of this.#pendingConfirms) {
+      if (rec.expiresAt <= now) this.#pendingConfirms.delete(t);
+    }
+    const token = randomBytes(32).toString('hex');
+    this.#pendingConfirms.set(token, { key, userId, expiresAt: now + CONFIRM_TOKEN_TTL_MS });
+    return token;
+  }
+
+  /** Konsumsi token sekali-pakai; harus cocok aksi (key) + pemilik sesi. */
+  #consumeConfirmToken(token, key, userId) {
+    if (typeof token !== 'string' || token === '') return false;
+    const rec = this.#pendingConfirms.get(token);
+    if (rec) this.#pendingConfirms.delete(token); // sekali pakai — hangus walau gagal cocok
+    return Boolean(
+      rec && rec.expiresAt > Date.now() && rec.key === key && rec.userId === userId,
+    );
+  }
+
+  /** Halaman konfirmasi fase-1: form POST ulang ke aksi yang sama + token + CSRF. */
+  #confirmDestructiveHtml({ actionUrl, token, csrf, title, message, detail, cancelHref }) {
+    return this.#pageShell(
+      title,
+      `<section class="auth__card">` +
+        `<div class="auth__brand"><span class="brand__mark">VPANEL</span><span class="auth__brand-sub">${escapeHtml(title)}</span></div>` +
+        alertFrag('warn', message) +
+        (detail ? `<p class="field__hint mono">${escapeHtml(detail)}</p>` : '') +
+        `<form class="auth__form" method="post" action="${escapeHtml(actionUrl)}">` +
+        `<input type="hidden" name="confirmToken" value="${escapeHtml(token)}">` +
+        csrfInput(csrf) +
+        `<button class="btn btn--danger btn--block" type="submit">Konfirmasi hapus</button>` +
+        `</form>` +
+        `<a class="btn btn--block" href="${escapeHtml(cancelHref)}">Batal</a>` +
+        `<p class="auth__note">Token konfirmasi sekali pakai dan kedaluwarsa dalam 10 menit.</p>` +
+        `</section>`,
+    );
+  }
+
+  /**
    * Two-phase remove di sisi panel: POST "<base>/remove-request" → ambil
    * confirmToken → POST "<base>/remove" {confirmToken}. Token TIDAK pernah
-   * dikirim ke browser — konfirmasi user memakai dialog data-confirm-phrase.
+   * dikirim ke browser — konfirmasi user lewat dialog data-confirm-phrase.
    */
   async #vaultRemoveChain(method, basePath) {
     const client = this.#getManager();
@@ -2676,7 +3486,7 @@ export class PanelServer {
         // Form ulang + alert error (nilai form dipertahankan); validasi
         // kanonik ada di manager (parseRepoUrlInput/parseGitBranchInput).
         const page = await this.#pageProjects(session, '/projects', {
-          banner: alertFrag('error', e.message),
+          banner: alertFrag('error', this.#userSafeErrorText(e)),
           form: { name, type, port: portRaw, repo_url: repoUrl, git_branch: branch || 'main' },
         });
         return this.#renderManaged(res, { ...page, status: STATUS_BY_CODE[e.code] ?? 500 });

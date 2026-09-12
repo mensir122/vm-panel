@@ -9,8 +9,28 @@ import { Vault } from '../../lib/vault.js';
 import { aesEncrypt, aesDecrypt, randomToken } from '../../lib/crypto.js';
 import { VmPanelError, NOT_FOUND, VALIDATION, PERMISSION_DENIED } from '../../lib/errors.js';
 import { atomicWriteFile, ensureDir } from '../../lib/fsutil.js';
+import { isValidId } from '../../lib/ids.js';
 
 const TOKEN_TTL_MS = 10 * 60 * 1000; // 10 menit
+
+/**
+ * F4: nama file koper harus aman untuk `path.join(dir, name + '.json')` —
+ * tanpa separator, tanpa '..', tanpa kontrol, tanpa titik di depan
+ * (menolak '.env' dsb.), boleh dot internal ('app.conf').
+ */
+function assertSafeConfigFilename(filename) {
+  if (
+    typeof filename !== 'string' ||
+    filename.length === 0 ||
+    filename.length > 128 ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(filename) ||
+    filename.includes('..') ||
+    filename.endsWith('.')
+  ) {
+    throw new VmPanelError(VALIDATION, 'Nama file config tidak valid', { filename: null });
+  }
+  return filename;
+}
 
 export class SecretManager {
   /**
@@ -102,7 +122,10 @@ export class SecretManager {
 
   setSecret({ name, value, projectScope, expiresAt }) {
     const vault = this._requireVault();
-    vault.set({ name, value, projectScope, expiresAt });
+    // F4: signature kanonik Vault.set(name, value, {projectScope, expiresAt})
+    // (lib/vault.js:183). Dulu dilempar satu object arg → Vault mengira itu
+    // `name` dan nilanya hilang.
+    vault.set(name, value, { projectScope, expiresAt });
     this._updateRefs();
     return { name, projectScope: projectScope || '', updatedAt: new Date().toISOString() };
   }
@@ -164,7 +187,22 @@ export class SecretManager {
 
   // --- File Koper Konfigurasi (Project Configs) -------------------------------
 
+  /**
+   * F4: projectId WAJIB format kanonik `prj_` + 10 char Crockford base32
+   * SEBELUM dipakai path.join — menutup traversal ('../..') dan tabrakan
+   * direktori. Dipakai juga oleh jalur env/hook (defense in depth).
+   */
+  _assertProjectId(projectId) {
+    if (!isValidId(projectId, 'prj_')) {
+      throw new VmPanelError(VALIDATION, 'projectId tidak valid (format prj_ + 10 char)', {
+        projectId: typeof projectId === 'string' && projectId.length <= 64 ? projectId : null,
+      });
+    }
+    return projectId;
+  }
+
   _projectConfigDir(projectId) {
+    this._assertProjectId(projectId);
     const p = path.join(this.configsDir, projectId);
     ensureDir(p);
     return p;
@@ -193,11 +231,22 @@ export class SecretManager {
   }
 
   _getKey32() {
-    const key = this.masterKey || process.env.VPANEL_MASTER_KEY || 'default-secret-key-min-32-chars-long';
+    // F4: TANPA fallback konstanta — kunci enkripsi koper HANYA boleh berasal
+    // dari masterKey instance atau env VPANEL_MASTER_KEY. Tidak ada keduanya →
+    // VAULT_CONFIG (dulu memakai 'default-secret-key-min-32-chars-long' yang
+    // terkompilasi di source = efektif tidak ada enkripsi).
+    const key = this.masterKey || process.env.VPANEL_MASTER_KEY;
+    if (typeof key !== 'string' || key.length === 0) {
+      throw new VmPanelError(
+        'VAULT_CONFIG',
+        'master key tidak tersedia — set env VPANEL_MASTER_KEY atau inisialisasi brankas lebih dulu',
+      );
+    }
     return crypto.createHash('sha256').update(String(key)).digest();
   }
 
   getConfig(projectId, filename) {
+    assertSafeConfigFilename(filename);
     const p = path.join(this._projectConfigDir(projectId), `${filename}.json`);
     if (!fs.existsSync(p)) {
       throw new VmPanelError(NOT_FOUND, `Config "${filename}" tidak ditemukan`);
@@ -216,9 +265,7 @@ export class SecretManager {
   }
 
   saveConfig(projectId, { filename, contentBase64 }) {
-    if (!filename || typeof filename !== 'string' || /[\\/\0]/.test(filename)) {
-      throw new VmPanelError(VALIDATION, 'Nama file config tidak valid');
-    }
+    assertSafeConfigFilename(filename);
     if (typeof contentBase64 !== 'string' || contentBase64.length === 0) {
       throw new VmPanelError(VALIDATION, 'Isi file config kosong');
     }
@@ -244,6 +291,7 @@ export class SecretManager {
   }
 
   removeConfig(projectId, filename) {
+    assertSafeConfigFilename(filename);
     const dest = path.join(this._projectConfigDir(projectId), `${filename}.json`);
     if (fs.existsSync(dest)) {
       try {
@@ -265,6 +313,7 @@ export class SecretManager {
   }
 
   listProjectEnv(projectId) {
+    this._assertProjectId(projectId);
     const db = this._getDb();
     const rows = db.prepare(
       'SELECT env_name, secret_ref FROM project_env_refs WHERE project_id = ? ORDER BY env_name ASC',
@@ -273,6 +322,7 @@ export class SecretManager {
   }
 
   setProjectEnv(projectId, { envName, secretName }) {
+    this._assertProjectId(projectId);
     if (!envName || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) {
       throw new VmPanelError(VALIDATION, 'Nama variabel env tidak valid');
     }
@@ -287,6 +337,7 @@ export class SecretManager {
   }
 
   removeProjectEnv(projectId, envName) {
+    this._assertProjectId(projectId);
     const db = this._getDb();
     db.prepare('DELETE FROM project_env_refs WHERE project_id = ? AND env_name = ?').run(projectId, envName);
     return { removed: true };
@@ -295,6 +346,7 @@ export class SecretManager {
   // --- Project Hooks (Suntikan Otomatis Startup) -----------------------------
 
   getProjectHook(projectId) {
+    this._assertProjectId(projectId);
     const db = this._getDb();
     const row = db.prepare(
       'SELECT config_json, updated_at FROM project_hooks WHERE project_id = ?',
@@ -309,6 +361,7 @@ export class SecretManager {
   }
 
   setProjectHook(projectId, { url, bodyFile, secretFields }) {
+    this._assertProjectId(projectId);
     let parsed = null;
     try {
       parsed = new URL(url);
@@ -332,6 +385,7 @@ export class SecretManager {
   }
 
   removeProjectHook(projectId) {
+    this._assertProjectId(projectId);
     const db = this._getDb();
     db.prepare('DELETE FROM project_hooks WHERE project_id = ?').run(projectId);
     return { removed: true };

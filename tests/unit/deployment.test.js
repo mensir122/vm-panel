@@ -19,7 +19,7 @@ import { ProcessManager } from '../../manager/process_manager/index.js';
 import { ProjectManager } from '../../manager/project_manager/index.js';
 import { ServiceManager } from '../../manager/service_manager/index.js';
 import { HealthManager } from '../../manager/health_manager/index.js';
-import { DeploymentManager } from '../../manager/deployment_manager/index.js';
+import { DeploymentManager, hashWorkspace } from '../../manager/deployment_manager/index.js';
 import { RollbackManager } from '../../manager/rollback_manager/index.js';
 import { VmPanelError, VALIDATION, NOT_FOUND, DEPLOY_IN_PROGRESS } from '../../lib/errors.js';
 
@@ -311,3 +311,315 @@ test('sweepDisconnected: deployment running tua → failed disconnected + rollba
   const freshSweep = await deployMgr.sweepDisconnected({ olderThanMs: 600_000 });
   assert.equal(freshSweep.length, 0);
 });
+
+test('#36 sweepDisconnected: started_at rusak tidak membuat sweep throw (skip + log)', async () => {
+  const project = projectMgr.listProjects().find((p) => p.name === 'dep-site');
+  const logs = [];
+  const prevLogger = deployMgr.logger;
+  deployMgr.logger = {
+    debug: () => {},
+    info: () => {},
+    warn: (msg, extra) => logs.push({ msg, extra }),
+    error: (msg, extra) => logs.push({ msg, extra }),
+  };
+  try {
+    deployMgr.store.db
+      .prepare(
+        `INSERT INTO deployments (id, project_id, revision, actor, status, stage, error, started_at, finished_at, rollback_of)
+         VALUES (?, ?, NULL, 'ghost', 'running', 'installing', NULL, ?, NULL, NULL)`,
+      )
+      .run('dep_BROENTIME1', project.id, 'bukan-tanggal-sama-sekali');
+
+    let swept;
+    await assert.doesNotReject(
+      async () => {
+        swept = await deployMgr.sweepDisconnected({ olderThanMs: 600_000 });
+      },
+      'started_at rusak tidak boleh membuat sweep melempar',
+    );
+    assert.equal(
+      swept.some((r) => r.deploymentId === 'dep_BROENTIME1'),
+      false,
+      'baris bertimestamp rusak harus DI-LEWATI (tidak di-rollback)',
+    );
+    assert.equal(deployMgr.getDeployment('dep_BROENTIME1').status, 'running');
+    assert.ok(
+      logs.some((l) => l.msg === 'deployment.sweep.skipped_unparsable_started_at'),
+      'skip harus dicatat di log',
+    );
+  } finally {
+    deployMgr.logger = prevLogger;
+    // Bereskan baris rusak agar test sweep berikutnya tidak terpengaruh.
+    deployMgr.store.db
+      .prepare(
+        `UPDATE deployments SET status = 'failed', finished_at = ? WHERE id = ?`,
+      )
+      .run(new Date().toISOString(), 'dep_BROENTIME1');
+  }
+});
+
+test('#36 parseTimeMs: ISO Z, offset non-UTC, epoch numerik, dan nilai rusak', async () => {
+  const { parseTimeMs } = await import('../../manager/deployment_manager/index.js');
+  assert.equal(parseTimeMs('2026-09-13T10:00:00.000Z'), Date.parse('2026-09-13T10:00:00.000Z'));
+  assert.equal(parseTimeMs('2026-09-13T17:00:00+07:00'), Date.parse('2026-09-13T17:00:00+07:00'));
+  assert.equal(parseTimeMs('1700000000000'), 1700000000000);
+  assert.equal(parseTimeMs(1700000000000), 1700000000000);
+  assert.equal(parseTimeMs('bukan-tanggal'), null);
+  assert.equal(parseTimeMs(''), null);
+  assert.equal(parseTimeMs(null), null);
+  assert.equal(parseTimeMs(undefined), null);
+
+  // Regresi inti #36: cutoff dibandingkan sebagai epoch, BUKAN string.
+  // '…T12:00:00+07:00' (= 05:00:00Z) lebih tua dari cutoff 06:00:00Z walau
+  // secara lexicografis string-nya "lebih besar".
+  const nowMs = Date.parse('2026-09-13T06:30:00.000Z');
+  const cutoffMs = nowMs - 1800_000; // 06:00:00Z
+  assert.ok(parseTimeMs('2026-09-13T12:00:00+07:00') < cutoffMs, 'harus terbaca lebih tua');
+  assert.ok('2026-09-13T12:00:00+07:00' > '2026-09-13T06:00:00.000Z', 'string compare justru salah');
+});
+
+test('python subfolder entrypoint: _deriveServiceConfigExtra mengenali subfolder dan startCmd', () => {
+  const ws = path.join(workspacesRoot, 'py-sub-ws');
+  fs.mkdirSync(path.join(ws, 'hermes-agent'), { recursive: true });
+  fs.writeFileSync(path.join(ws, 'hermes-agent', 'run_agent.py'), 'print("agent")\n');
+
+  // Case 1: auto-detect di subfolder
+  const extra1 = deployMgr._deriveServiceConfigExtra({ type: 'python', port: 10001 }, ws);
+  assert.equal(extra1.main, 'hermes-agent/run_agent.py');
+
+  // Case 2: eksplisit startCmd
+  const extra2 = deployMgr._deriveServiceConfigExtra({
+    type: 'python',
+    port: 10001,
+    startCmd: 'python hermes-agent/run_agent.py',
+  }, ws);
+  assert.equal(extra2.main, 'hermes-agent/run_agent.py');
+});
+
+// ── F5 regression: hashWorkspace ─────────────────────────────────────────────
+
+test('F5 hashWorkspace: node_modules/.venv/.git di-skip (tidak mengubah revision)', () => {
+  const ws = path.join(workspacesRoot, 'hash-ws');
+  fs.mkdirSync(ws, { recursive: true });
+  fs.writeFileSync(path.join(ws, 'index.js'), 'console.log(1)\n');
+  fs.mkdirSync(path.join(ws, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(ws, 'src', 'a.js'), 'export const a=1\n');
+  const base = hashWorkspace(ws);
+
+  // dependency/venv/git metadata ditambah → hash TIDAK berubah
+  fs.mkdirSync(path.join(ws, 'node_modules', 'dep', 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(ws, 'node_modules', 'dep', 'index.js'), 'module.exports={}\n');
+  fs.writeFileSync(path.join(ws, 'node_modules', 'dep', 'lib', 'x.js'), 'x\n');
+  fs.mkdirSync(path.join(ws, '.venv', 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(ws, '.venv', 'bin', 'python'), 'binary-ish\n');
+  fs.mkdirSync(path.join(ws, '.git'), { recursive: true });
+  fs.writeFileSync(path.join(ws, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+  assert.equal(hashWorkspace(ws), base, 'isi dependency tidak menentukan revision');
+
+  // file sumber berubah → hash berubah
+  fs.writeFileSync(path.join(ws, 'src', 'a.js'), 'export const a=2\n');
+  assert.notEqual(hashWorkspace(ws), base, 'perubahan source tetap terdeteksi');
+});
+
+test('F5 hashWorkspace: file > cap hanya di-hash metadata (nama+ukuran), konten tidak dibaca', () => {
+  const ws = path.join(workspacesRoot, 'hash-big-ws');
+  fs.mkdirSync(ws, { recursive: true });
+  fs.writeFileSync(path.join(ws, 'index.js'), 'console.log(1)\n');
+  const big = Buffer.alloc(33 * 1024 * 1024, 0x41); // 33MB > cap 32MB
+  fs.writeFileSync(path.join(ws, 'big.bin'), big);
+  const h1 = hashWorkspace(ws);
+
+  // ukuran sama, konten beda → hash SAMA (metadata-only untuk file di atas cap)
+  big.fill(0x42);
+  fs.writeFileSync(path.join(ws, 'big.bin'), big);
+  assert.equal(hashWorkspace(ws), h1, 'konten file besar tidak ikut di-hash');
+
+  // ukuran beda → hash beda
+  fs.writeFileSync(path.join(ws, 'big.bin'), Buffer.alloc(33 * 1024 * 1024 + 1, 0x41));
+  assert.notEqual(hashWorkspace(ws), h1, 'ukuran file besar tetap jadi penentu');
+});
+
+// ── F5 regression: GC git-sources ────────────────────────────────────────────
+
+test('F5 _gcGitSources: keep-2 terbaru per project, project lain tidak tersentuh', () => {
+  const project = projectMgr.createProject({
+    name: 'dep-gc',
+    type: 'static',
+    port: 20999,
+  });
+  const srcRoot = path.join(dataDir, 'git-sources');
+  const now = Date.now() / 1000;
+  const dirs = [];
+  for (let i = 1; i <= 5; i++) {
+    const d = path.join(srcRoot, `git-${project.id}-batch${i}-${i}`);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'f.txt'), `v${i}`);
+    fs.utimesSync(d, now - (5 - i), now - (5 - i)); // batch1 = tertua, batch5 = terbaru
+    dirs.push(d);
+  }
+  // project lain tidak boleh tersentuh
+  const other = path.join(srcRoot, 'git-prj_OTHER00001-batch1-1');
+  fs.mkdirSync(other, { recursive: true });
+
+  const removed = deployMgr._gcGitSources(project.id);
+  assert.equal(removed.length, 3, `3 clone tertua dihapus (got ${removed.length})`);
+  assert.equal(fs.existsSync(dirs[0]), false);
+  assert.equal(fs.existsSync(dirs[1]), false);
+  assert.equal(fs.existsSync(dirs[2]), false);
+  assert.ok(fs.existsSync(dirs[3]), 'keep #2 terbaru');
+  assert.ok(fs.existsSync(dirs[4]), 'keep #1 terbaru');
+  assert.ok(fs.existsSync(other), 'project lain tidak tersapu');
+});
+
+test('F5 _gcGitSources: rootDir service aktif selalu dilindungi walau tertua', () => {
+  const project = projectMgr.createProject({ name: 'dep-gc2', type: 'static', port: 20998 });
+  const srcRoot = path.join(dataDir, 'git-sources');
+  const now = Date.now() / 1000;
+  const dirs = [];
+  for (let i = 1; i <= 4; i++) {
+    const d = path.join(srcRoot, `git-${project.id}-keep-${i}`);
+    fs.mkdirSync(d, { recursive: true });
+    fs.utimesSync(d, now - (4 - i), now - (4 - i)); // keep-1 tertua … keep-4 terbaru
+    dirs.push(d);
+  }
+  const svc = svcMgr.createService({
+    projectId: project.id,
+    name: 'svc-dep-gc2',
+    type: 'static',
+    port: 20998,
+    config: { rootDir: dirs[0] }, // rootDir aktif = yang tertua
+  });
+  assert.equal(svcMgr.getService(svc.id).config.rootDir, dirs[0]);
+
+  const removed = deployMgr._gcGitSources(project.id);
+  assert.equal(removed.length, 1, 'hanya keep-2 yang dihapus (keep-1 dilindungi)');
+  assert.equal(path.resolve(removed[0]), path.resolve(dirs[1]));
+  assert.ok(fs.existsSync(dirs[0]), 'rootDir service aktif tidak pernah dihapus');
+  assert.ok(fs.existsSync(dirs[2]) && fs.existsSync(dirs[3]), '2 terbaru keep');
+});
+
+// ── F5 regression: lock deploy untuk rollback + sweep (re-entrancy) ──────────
+
+test('F5 rollback(): memegang lock deploy-<projectId> → DEPLOY_IN_PROGRESS bila deploy hidup', async () => {
+  const { acquire, release } = await import('../../lib/lock.js');
+  const project = projectMgr.listProjects().find((p) => p.name === 'dep-site');
+  const token = await acquire(`deploy-${project.id}`, {
+    dir: path.join(dataDir, 'locks'),
+    ttlMs: 60_000,
+  });
+  try {
+    await assert.rejects(
+      () => rollbackMgr.rollback({ projectId: project.id, actor: 'tester' }),
+      codeIs(DEPLOY_IN_PROGRESS),
+    );
+    // kontrak re-entrancy: pemanggil yang sudah memegang lock kirim lock:false
+    const out = await rollbackMgr.rollback({
+      projectId: project.id,
+      actor: 'tester',
+      lock: false,
+    });
+    assert.ok(out.deploymentId.startsWith('dep_'));
+  } finally {
+    release(`deploy-${project.id}`, token, { dir: path.join(dataDir, 'locks') });
+  }
+});
+
+test('F5 sweepDisconnected: baris dengan lock dipegang deploy hidup DI-LEWATI (tidak ditandai gagal)', async () => {
+  const { acquire, release } = await import('../../lib/lock.js');
+  const project = projectMgr.listProjects().find((p) => p.name === 'dep-gc');
+  const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
+  deployMgr.store.db
+    .prepare(
+      `INSERT INTO deployments (id, project_id, revision, actor, status, stage, error, started_at, finished_at, rollback_of)
+       VALUES (?, ?, 'ws-busy', 'ghost', 'running', 'installing', NULL, ?, NULL, NULL)`,
+    )
+    .run('dep_BUSY000001', project.id, hourAgo);
+
+  const token = await acquire(`deploy-${project.id}`, {
+    dir: path.join(dataDir, 'locks'),
+    ttlMs: 60_000,
+  });
+  try {
+    const swept = await deployMgr.sweepDisconnected({ olderThanMs: 600_000 });
+    const hit = swept.find((r) => r.deploymentId === 'dep_BUSY000001');
+    assert.ok(hit, 'baris dilaporkan');
+    assert.equal(hit.skipped, true, 'baris diskip karena lock-held');
+    const dep = deployMgr.getDeployment('dep_BUSY000001');
+    assert.equal(dep.status, 'running', 'deployment hidup TIDAK boleh ditandai failed');
+  } finally {
+    release(`deploy-${project.id}`, token, { dir: path.join(dataDir, 'locks') });
+  }
+  // setelah lock lepas → sweep normal memproses baris yang sama
+  const swept2 = await deployMgr.sweepDisconnected({ olderThanMs: 600_000 });
+  const hit2 = swept2.find((r) => r.deploymentId === 'dep_BUSY000001');
+  assert.ok(hit2 && !hit2.skipped, 'sweep kedua memproses baris yatim');
+  assert.equal(deployMgr.getDeployment('dep_BUSY000001').status, 'failed');
+  // cleanup agar test berikutnya tidak terseret
+  deployMgr.store.db.prepare('DELETE FROM deployments WHERE id = ?').run('dep_BUSY000001');
+});
+
+// ── F5 regression: liveness fallback hanya utk check tipe process ────────────
+
+test('F5 verifying: check tcp yang gagal TIDAK ditolong fallback liveness', async () => {
+  const fake = {
+    _sleep: async () => {},
+    healthManager: null,
+    _healthCheckType: () => 'tcp',
+    serviceManager: {
+      healthService: async () => ({ ok: false, error: 'ECONNREFUSED' }),
+      getService: () => ({ id: 'svc_fake', status: 'running', pid: process.pid }),
+    },
+  };
+  await assert.rejects(
+    () => DeploymentManager.prototype._stageVerifying.call(fake, { id: 'svc_fake' }),
+    /ECONNREFUSED/,
+    'service tcp mati harus FAILED, bukan lolos karena proses hidup',
+  );
+});
+
+test('F5 verifying: check tipe process + proses hidup → lolos (fallback sah)', async () => {
+  const fake = {
+    _sleep: async () => {},
+    healthManager: null,
+    _healthCheckType: () => 'process',
+    serviceManager: {
+      healthService: async () => ({ ok: false, error: 'no listener' }),
+      getService: () => ({ id: 'svc_fake', status: 'running', pid: process.pid }),
+    },
+  };
+  const note = await DeploymentManager.prototype._stageVerifying.call(fake, { id: 'svc_fake' });
+  assert.match(note, /process-type check/);
+});
+
+test('F5 _healthCheckType: default adapter static → http; config {type:process} → process', () => {
+  const ws = path.join(workspacesRoot, 'hc-ws');
+  fs.mkdirSync(ws, { recursive: true });
+  fs.writeFileSync(path.join(ws, 'index.html'), '<p>x</p>');
+  assert.equal(
+    deployMgr._healthCheckType({ id: 'svc_hc', type: 'static', rootDir: ws, port: 20998, config: { type: 'static', rootDir: ws, port: 20998 } }),
+    'http',
+    'static adapter = http check → TIDAK boleh lolos via fallback liveness',
+  );
+  assert.equal(
+    deployMgr._healthCheckType({
+      id: 'svc_hc2',
+      type: 'custom',
+      rootDir: ws,
+      port: 20998,
+      config: { type: 'custom', rootDir: ws, port: 20998, healthCheck: { type: 'process' } },
+    }),
+    'process',
+  );
+  assert.equal(
+    deployMgr._healthCheckType({
+      id: 'svc_hc3',
+      type: 'node',
+      rootDir: ws,
+      port: 20997,
+      config: { type: 'node', rootDir: ws, port: 20997, main: 'index.js' },
+    }),
+    'tcp',
+    'node adapter tanpa healthCheck eksplisit = tcp',
+  );
+});
+

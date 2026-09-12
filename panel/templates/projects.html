@@ -67,28 +67,124 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Projects — VPANEL</title>
+  <title>Projects — ORIONT</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/panel.css">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230A0D0C'/%3E%3Ccircle cx='16' cy='16' r='9' stroke='%23FFFFFF' stroke-width='2' fill='none'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%23FFFFFF'/%3E%3C/svg%3E">
 </head>
-<body>
+<body class="oriont-theme">
+  <!-- Desktop Titlebar (Electron App only) -->
+  <div id="desktop-titlebar" class="desktop-titlebar" style="display: none;">
+    <div class="desktop-titlebar__brand">
+      <img src="/static/oriont-logo.png" alt="ORIONT" width="16" height="16" style="object-fit: contain;">
+      <span class="desktop-titlebar__pulse"></span>
+      <span>ORIONT · VPANEL</span>
+      <span class="desktop-titlebar__tag">24/7 ACTIVE</span>
+    </div>
+    <div class="desktop-titlebar__center">
+      <span class="desktop-titlebar__center-title">PROJECTS</span>
+    </div>
+    <div class="desktop-titlebar__controls">
+      <button type="button" class="desktop-titlebar__btn" id="titlebar-min" title="Minimize">
+        <svg width="10" height="2" viewBox="0 0 10 2" fill="currentColor"><rect width="10" height="2" rx="1"/></svg>
+      </button>
+      <button type="button" class="desktop-titlebar__btn" id="titlebar-max" title="Maximize / Restore">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="8" height="8" rx="1.5"/></svg>
+      </button>
+      <button type="button" class="desktop-titlebar__btn desktop-titlebar__btn--close" id="titlebar-close" title="Close to Tray">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg>
+      </button>
+    </div>
+  </div>
+
   <a class="skip-link" href="#main">Skip to content</a>
+
   <div class="app">
+    <!-- Sleek Dark Sidebar -->
     <aside class="app__sidebar">
+      <!-- Brand Logo -->
       <div class="brand">
-        <a class="brand__mark" href="/dashboard">VPANEL</a>
-        <span class="brand__sub">VM-Panel</span>
+        <a class="brand__mark" href="/dashboard">
+          <div class="brand__logo-box">
+            <img src="/static/oriont-logo.png" alt="ORIONT" class="brand__logo-img" width="24" height="24">
+          </div>
+          <div class="brand__text-group">
+            <span class="brand__name">ORIONT</span>
+            <span class="brand__sub">VPANEL</span>
+          </div>
+        </a>
       </div>
-      {{nav|raw}}
-      <div class="app__sidebar-foot">VM-Panel · operations console</div>
+
+      <!-- Server Rendered Menu (MENU & GENERAL) -->
+      <div class="sidebar-nav-wrap">
+        {{nav|raw}}
+      </div>
+
+      <!-- Real Host Status Widget -->
+      <div class="sidebar-host-widget">
+        <div class="sidebar-host-head">
+          <span class="pulse-dot pulse-dot--white"></span>
+          <span class="sidebar-host-label">DAEMON 24/7</span>
+        </div>
+        <div class="sidebar-host-val mono">{{managerStatus}}</div>
+        <div class="sidebar-host-meta">{{nodeVersionStr}} · {{osPlatformStr}}</div>
+      </div>
+
+      <div class="app__sidebar-foot">ORIONT · operations console</div>
     </aside>
 
+    <!-- Main Workspace Container -->
     <div class="app__main">
+      <!-- Dark Luxe Topbar with Search & User Profile -->
       <header class="topbar">
-        <span class="topbar__user">{{user}}</span>
-        <form method="post" action="/logout">
-          <button class="btn btn--ghost" type="submit">Log out</button>
-        </form>
+        <div class="topbar__search">
+          <svg class="topbar__search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"/>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input type="text" id="topbar-search-input" class="topbar__search-input" placeholder="Search projects, services or commands..." autocomplete="off">
+          <kbd class="kbd-pill" id="search-kbd-pill" title="Press Ctrl+F or ⌘+F to search">⌘ F</kbd>
+        </div>
+
+        <div class="topbar__actions">
+          <button type="button" class="topbar__icon-btn" id="btn-topbar-hermes" title="Open Hermes AI Assistant" aria-label="Hermes AI Assistant">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            </svg>
+          </button>
+          <button type="button" class="topbar__icon-btn" title="System Alerts" aria-label="System Alerts" onclick="window.location.href='/audit'">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+              <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
+          </button>
+
+          <div class="user-pill">
+            <div class="user-pill__avatar" title="{{user}}">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+              </svg>
+            </div>
+            <div class="user-pill__info">
+              <div class="user-pill__name">{{user}}</div>
+              <div class="user-pill__email">{{user}}@oriont.internal</div>
+            </div>
+          </div>
+
+          <form method="post" action="/logout" class="topbar__logout-form">
+            <input type="hidden" name="_csrf" value="{{csrfToken}}">
+            <button class="topbar__icon-btn topbar__icon-btn--logout" type="submit" title="Log out" aria-label="Log out">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                <polyline points="16 17 21 12 16 7"/>
+                <line x1="21" y1="12" x2="9" y2="12"/>
+              </svg>
+            </button>
+          </form>
+        </div>
       </header>
 
       <div class="notices">
@@ -108,6 +204,43 @@
         </div>
 
         <div class="page__stack">
+          <!-- Quick Drag & Drop dropzone -->
+          <div class="dropzone-glow" id="project-dropzone" tabindex="0" role="region" aria-label="Project Drag and Drop Deployment">
+            <div class="dropzone-inner" id="dropzone-default">
+              <div class="dropzone-icon">
+                <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#00ff88" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="17 8 12 3 7 8"></polyline>
+                  <line x1="12" y1="3" x2="12" y2="15"></line>
+                </svg>
+              </div>
+              <div class="dropzone-title">Tarik & Lepas Folder Project ke Sini</div>
+              <div class="dropzone-subtitle">
+                Tarik folder langsung dari Explorer untuk deploy instan tanpa isi form manual.
+              </div>
+              <div class="dropzone-badges">
+                <span class="tag--emerald">Auto-Detect</span>
+                <span class="tag--emerald">Port Dinamis</span>
+                <span class="tag--emerald">Live 24/7</span>
+              </div>
+              <div style="margin-top: 10px; display: flex; gap: 8px; justify-content: center; align-items: center; flex-wrap: wrap;">
+                <button type="button" class="btn btn--secondary btn--sm" id="btn-browse-folder">
+                  Pilih Folder dari Explorer
+                </button>
+              </div>
+              <div class="dropzone-manual-path" style="margin-top: 10px; display: flex; gap: 6px; justify-content: center; max-width: 440px; width: 100%;">
+                <input type="text" id="input-manual-folder" class="input input--sm" placeholder="Atau ketik/paste path folder lokal..." style="font-family: monospace; font-size: 11px; flex: 1; min-width: 220px; background: rgba(5,8,6,0.6); border-color: rgba(0,255,136,0.2);">
+                <button type="button" class="btn btn--primary btn--sm" id="btn-manual-inspect" style="padding: 4px 12px; font-size: 11px; white-space: nowrap;">
+                  Inspeksi
+                </button>
+              </div>
+            </div>
+            <div class="dropzone-progress" id="dropzone-progress">
+              <div class="dropzone-spinner"></div>
+              <div class="dropzone-status-text" id="dropzone-status">Menginspeksi direktori project...</div>
+            </div>
+          </div>
+
           {{githubSync|raw}}
           {{projectsTable|raw}}
         </div>
@@ -117,6 +250,251 @@
         <span class="mono">VPANEL</span>
         <span>Status reflects the last health sample.</span>
       </footer>
+    </div>
+  </div>
+
+  <!-- AI-Native Generative Deployment Flow Modal (Inspired by Architecture Blueprint) -->
+  <div id="generative-deploy-modal" class="deploy-modal" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="deploy-modal-title">
+    <div class="deploy-modal__backdrop"></div>
+    <div class="deploy-modal__window">
+      <!-- Modal Topbar / Header -->
+      <div class="deploy-modal__header">
+        <div class="deploy-modal__brand">
+          <div class="deploy-modal__badge">
+            <span class="pulse-dot"></span>
+            <span>AI-NATIVE AUTONOMOUS PIPELINE</span>
+          </div>
+          <h2 class="deploy-modal__title" id="deploy-modal-title">GENERATIVE DEPLOYMENT ORCHESTRATOR</h2>
+        </div>
+        <button type="button" class="deploy-modal__close" id="btn-close-deploy-modal" aria-label="Tutup">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+
+      <!-- Modal Split Layout -->
+      <div class="deploy-modal__body">
+        <!-- Left Column: Conversational UI & Pipeline Orchestrator Nodes -->
+        <div class="deploy-modal__col deploy-modal__col--left">
+          <!-- Section 1: Conversational UI (Hermes Co-Pilot) -->
+          <div class="flow-card flow-card--copilot">
+            <div class="flow-card__header">
+              <div class="flow-card__label">CONVERSATIONAL CO-PILOT</div>
+              <span class="flow-card__status-tag flow-card__status-tag--active" id="copilot-status-tag">HERMES ACTIVE</span>
+            </div>
+
+            <div class="copilot-chat-box" id="copilot-chat-box">
+              <div class="copilot-msg copilot-msg--assistant">
+                <div class="copilot-msg__avatar">🤖</div>
+                <div class="copilot-msg__content" id="copilot-initial-msg">
+                  Folder project terdeteksi. Saya siap membantu memeriksa dependensi, menyesuaikan port, atau menyetel environment variable/token.
+                </div>
+              </div>
+            </div>
+
+            <!-- Quick Command Suggestion Chips -->
+            <div class="copilot-chips" id="copilot-chips">
+              <button type="button" class="copilot-chip" data-cmd="analisis kelengkapan arsitektur">🔍 Analisis Kode</button>
+              <button type="button" class="copilot-chip" data-cmd="ganti port 3005">🔌 Ganti Port</button>
+              <button type="button" class="copilot-chip" data-cmd="apa saja token yang kurang?">🔑 Cek Token</button>
+              <button type="button" class="copilot-chip" data-cmd="deploy sekarang">🚀 Deploy Sekarang</button>
+            </div>
+
+            <!-- Input Box -->
+            <form class="copilot-input-form" id="copilot-input-form">
+              <input type="text" class="copilot-input" id="copilot-input" placeholder="Perintahkan Hermes... misal: set BOT_TOKEN=xxx atau port 3005" autocomplete="off">
+              <button type="submit" class="copilot-submit" id="copilot-submit" title="Kirim Instruksi">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+              </button>
+            </form>
+          </div>
+
+          <!-- Section 2: Pipeline Orchestrator Flow Nodes -->
+          <div class="pipeline-flow" id="pipeline-flow">
+            <!-- Flow Node 1 -->
+            <div class="pipeline-node pipeline-node--done" id="node-inspection">
+              <div class="pipeline-node__indicator">
+                <span class="pipeline-node__num">1</span>
+              </div>
+              <div class="pipeline-node__content">
+                <div class="pipeline-node__title">Codebase & Runtime Analysis</div>
+                <div class="pipeline-node__desc" id="node-inspection-desc">Memeriksa struktur proyek...</div>
+              </div>
+              <span class="pipeline-node__badge badge--green" id="node-inspection-badge">INSPECTED</span>
+            </div>
+
+            <!-- Glowing connector 1 -->
+            <div class="pipeline-connector pipeline-connector--active" id="conn-1">
+              <div class="pipeline-connector__pulse"></div>
+            </div>
+
+            <!-- Flow Node 2 -->
+            <div class="pipeline-node pipeline-node--active" id="node-secrets">
+              <div class="pipeline-node__indicator">
+                <span class="pipeline-node__num">2</span>
+              </div>
+              <div class="pipeline-node__content">
+                <div class="pipeline-node__title">Environment & Secret Vault Synthesis</div>
+                <div class="pipeline-node__desc" id="node-secrets-desc">Memverifikasi variabel lingkungan & token...</div>
+              </div>
+              <span class="pipeline-node__badge badge--emerald" id="node-secrets-badge">READY</span>
+            </div>
+
+            <!-- Glowing connector 2 -->
+            <div class="pipeline-connector" id="conn-2">
+              <div class="pipeline-connector__pulse"></div>
+            </div>
+
+            <!-- Flow Node 3 -->
+            <div class="pipeline-node pipeline-node--pending" id="node-provision">
+              <div class="pipeline-node__indicator">
+                <span class="pipeline-node__num">3</span>
+              </div>
+              <div class="pipeline-node__content">
+                <div class="pipeline-node__title">Workspace & Socket Provisioning</div>
+                <div class="pipeline-node__desc" id="node-provision-desc">Alokasi port aman & isolasi workspace...</div>
+              </div>
+              <span class="pipeline-node__badge" id="node-provision-badge">STANDBY</span>
+            </div>
+
+            <!-- Glowing connector 3 -->
+            <div class="pipeline-connector" id="conn-3">
+              <div class="pipeline-connector__pulse"></div>
+            </div>
+
+            <!-- Flow Node 4 -->
+            <div class="pipeline-node pipeline-node--pending" id="node-build">
+              <div class="pipeline-node__indicator">
+                <span class="pipeline-node__num">4</span>
+              </div>
+              <div class="pipeline-node__content">
+                <div class="pipeline-node__title">Build & Dependency Resolution</div>
+                <div class="pipeline-node__desc" id="node-build-desc">Resolusi modul dependensi aplikasi...</div>
+              </div>
+              <span class="pipeline-node__badge" id="node-build-badge">STANDBY</span>
+            </div>
+
+            <!-- Glowing connector 4 -->
+            <div class="pipeline-connector" id="conn-4">
+              <div class="pipeline-connector__pulse"></div>
+            </div>
+
+            <!-- Flow Node 5 -->
+            <div class="pipeline-node pipeline-node--pending" id="node-verify">
+              <div class="pipeline-node__indicator">
+                <span class="pipeline-node__num">5</span>
+              </div>
+              <div class="pipeline-node__content">
+                <div class="pipeline-node__title">Process Activation & Health Probe</div>
+                <div class="pipeline-node__desc" id="node-verify-desc">Verifikasi socket port & health status 24/7...</div>
+              </div>
+              <span class="pipeline-node__badge" id="node-verify-badge">STANDBY</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Column: Generated Adaptive Widgets -->
+        <div class="deploy-modal__col deploy-modal__col--right">
+          <!-- Widget 1: Progress & Real-time Telemetry -->
+          <div class="flow-card flow-card--widget">
+            <div class="flow-card__header">
+              <div class="flow-card__label">PIPELINE TELEMETRY & STAGE PROGRESS</div>
+              <span class="flow-card__status-tag" id="deploy-stage-tag">CONFIGURING</span>
+            </div>
+
+            <!-- Progress bar -->
+            <div class="deploy-meter">
+              <div class="deploy-meter__track">
+                <div class="deploy-meter__bar" id="deploy-progress-bar" style="width: 20%;"></div>
+              </div>
+              <div class="deploy-meter__labels">
+                <span class="deploy-meter__stage" id="deploy-stage-text">Tahap 1: Inspeksi Codebase Selesai</span>
+                <span class="deploy-meter__pct" id="deploy-pct-text">20%</span>
+              </div>
+            </div>
+
+            <!-- Telemetry Stats Grid -->
+            <div class="telemetry-grid">
+              <div class="telemetry-item">
+                <div class="telemetry-label">PROJECT NAME</div>
+                <div class="telemetry-val mono" id="stat-project-name">-</div>
+              </div>
+              <div class="telemetry-item">
+                <div class="telemetry-label">TARGET PORT</div>
+                <div class="telemetry-val mono" id="stat-port">-</div>
+              </div>
+              <div class="telemetry-item">
+                <div class="telemetry-label">FRAMEWORK</div>
+                <div class="telemetry-val" id="stat-framework">-</div>
+              </div>
+              <div class="telemetry-item">
+                <div class="telemetry-label">ENTRYPOINT</div>
+                <div class="telemetry-val mono" id="stat-entry">-</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Widget 2: Environment & Vault Variable Configuration -->
+          <div class="flow-card flow-card--widget">
+            <div class="flow-card__header">
+              <div class="flow-card__label">ENVIRONMENT & VAULT SYNTHESIS</div>
+              <span class="flow-card__tag-sm" id="env-count-tag">0 Terdeteksi</span>
+            </div>
+            <p class="flow-card__hint">Variabel lingkungan & secret yang terdeteksi dari source code project Anda:</p>
+            <div class="env-fields-list" id="env-fields-list">
+              <!-- Dynamic env input items -->
+            </div>
+          </div>
+
+          <!-- Widget 2.5: Auto 24/7 Cloud Hosting Configuration -->
+          <div class="flow-card flow-card--widget flow-card--cloud247">
+            <div class="flow-card__header">
+              <div class="flow-card__label"><span style="margin-right:6px;">☁️</span>24/7 CLOUD HOSTING (GITHUB RUNNER)</div>
+              <span class="flow-card__status-tag badge--white" id="cloud-status-badge">AUTO 24/7 AKTIF</span>
+            </div>
+            <div class="cloud-toggle-row">
+              <label class="cloud-switch" for="toggle-auto-247">
+                <input type="checkbox" id="toggle-auto-247" checked>
+                <span class="cloud-switch__slider"></span>
+              </label>
+              <div class="cloud-toggle-text">
+                <div class="cloud-toggle-title">Jaga Tetap Hidup 24/7 di Cloud Runner</div>
+                <div class="cloud-toggle-desc">Proyek akan tetap online dan aktif terus menerus, bahkan saat laptop Anda dimatikan atau ditutup.</div>
+              </div>
+            </div>
+            <div class="cloud-repo-group" id="cloud-repo-group">
+              <label class="cloud-field-label" for="deploy-repo-url">GitHub Repository URL (Opsional / Terdeteksi):</label>
+              <input type="text" class="cloud-field-input mono" id="deploy-repo-url" placeholder="https://github.com/username/repo (opsional)">
+              <div class="cloud-field-help" id="cloud-field-help">Jika kosong, kode proyek akan disinkronkan otomatis ke cloud runner internal VM-Panel.</div>
+            </div>
+          </div>
+
+          <!-- Widget 3: Live Event Log Stream -->
+          <div class="flow-card flow-card--widget">
+            <div class="flow-card__header">
+              <div class="flow-card__label">REAL-TIME PIPELINE EVENT STREAM</div>
+              <span class="live-pulse-badge">LIVE STREAM</span>
+            </div>
+            <div class="terminal-logs" id="deploy-terminal-logs">
+              <div class="terminal-line"><span class="terminal-tag info">[SYSTEM]</span> Menunggu inisiasi deployment...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Pinned Footer: Controls & Status Always Visible -->
+      <div class="deploy-modal__footer">
+        <div class="deploy-modal__footer-status">
+          <span class="pulse-dot"></span>
+          <span id="deploy-footer-status-text">Siap untuk deployment</span>
+        </div>
+        <div class="deploy-modal__actions">
+          <button type="button" class="btn btn--secondary" id="btn-cancel-deploy">Tutup / Batal</button>
+          <button type="button" class="btn btn--primary btn--luminous" id="btn-start-deploy">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+            Jalankan Deployment Sekarang
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 

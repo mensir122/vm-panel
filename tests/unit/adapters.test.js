@@ -50,6 +50,18 @@ function assertVmPanelErrorAsync(fn, code, msgIncludes) {
   );
 }
 
+/**
+ * Normalisasi panggilan npm hasil execFile-injected menjadi bentuk POSIX
+ * {file:'npm', args:[...]} — di win32 jalur NO-SHELL memakai
+ * [node.exe, npm-cli.js, ...args] sehingga executable + argv[0] dipangkas.
+ */
+function normalizeNpmCall(call) {
+  if (process.platform === 'win32') {
+    return { file: 'npm', args: call.args.slice(1) };
+  }
+  return { file: call.file, args: call.args };
+}
+
 // ---------------------------------------------------------------- registry
 describe('registry', () => {
   test('ADAPTERS memuat static/node/python', () => {
@@ -297,13 +309,35 @@ describe('node adapter', () => {
     const res = await new NodeAdapter({ workspacePath: ws }).install({}, { execFile: fakeExecFile });
     assert.equal(res.ok, true);
     assert.equal(calls.length, 1);
-    const expectedExe = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-    assert.equal(calls[0].file, expectedExe);
+    const norm = normalizeNpmCall(calls[0]);
+    // F6a: NO-SHELL di semua platform (win32 = node + npm-cli.js).
+    assert.equal(calls[0].opts.shell, false, 'shell wajib false (DEP0190)');
+    assert.equal(norm.file, 'npm');
     // Fallback baru: TANPA package-lock.json → npm install (bukan npm ci).
-    assert.deepEqual(calls[0].args, ['install', '--no-audit', '--no-fund']);
+    assert.deepEqual(norm.args, ['install', '--no-audit', '--no-fund']);
     assert.equal(calls[0].opts.cwd, ws);
     assert.ok(calls[0].opts.timeout <= 120_000);
     assert.ok(res.output.length <= 4096, `output: ${res.output.length}`);
+  });
+
+  test('F6a: install win32 pakai node + npm-cli.js (bukan npm.cmd + shell)', async () => {
+    const ws = makeNodeFixture();
+    const calls = [];
+    const fakeExecFile = (file, args, opts, cb) => {
+      calls.push({ file, args, opts });
+      cb(null, 'ok', '');
+    };
+    await new NodeAdapter({ workspacePath: ws }).install({}, { execFile: fakeExecFile });
+    assert.equal(calls.length, 1);
+    if (process.platform === 'win32') {
+      assert.equal(calls[0].file, process.execPath, 'file = node.exe');
+      assert.match(calls[0].args[0] ?? '', /npm-cli\.js$/, 'argv[0] = npm-cli.js');
+      assert.ok(fs.existsSync(calls[0].args[0]), 'npm-cli.js benar-benar ada');
+    } else {
+      assert.equal(calls[0].file, 'npm');
+      assert.equal(/npm-cli\.js/.test(calls[0].args[0] ?? ''), false);
+    }
+    assert.notEqual(calls[0].opts.shell, true);
   });
 
   test('install: dengan package-lock.json → npm ci --ignore-scripts', async () => {
@@ -316,7 +350,7 @@ describe('node adapter', () => {
     };
     const res = await new NodeAdapter({ workspacePath: ws }).install({}, { execFile: fakeExecFile });
     assert.equal(res.ok, true);
-    assert.deepEqual(calls[0].args, ['ci', '--ignore-scripts']);
+    assert.deepEqual(normalizeNpmCall(calls[0]).args, ['ci', '--ignore-scripts']);
   });
 
   test('install: scripts.build ada → npm run build dipanggil setelah install', async () => {
@@ -334,8 +368,9 @@ describe('node adapter', () => {
     const res = await new NodeAdapter({ workspacePath: ws }).install({}, { execFile: fakeExecFile });
     assert.equal(res.ok, true);
     assert.equal(calls.length, 2, 'install + build');
-    assert.deepEqual(calls[0].args, ['install', '--no-audit', '--no-fund']);
-    assert.deepEqual(calls[1].args, ['run', 'build']);
+    assert.deepEqual(normalizeNpmCall(calls[0]).args, ['install', '--no-audit', '--no-fund']);
+    assert.deepEqual(normalizeNpmCall(calls[1]).args, ['run', 'build']);
+    assert.equal(calls[1].opts.shell, false, 'build juga NO-SHELL');
   });
 
   test('install: build gagal → ok:false dengan pesan build gagal', async () => {
@@ -362,6 +397,32 @@ describe('node adapter', () => {
     const res = await new NodeAdapter({ workspacePath: ws }).install({}, { execFile: failing });
     assert.equal(res.ok, false);
     assert.ok(res.output.includes('npm boom'));
+  });
+
+  test('F6a: semua jalur execFile install bebas shell (DEP0190)', async () => {
+    const ws = makeNodeFixture({ main: 'server.js' });
+    const pkgPath = path.join(ws, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    pkg.scripts = { ...(pkg.scripts ?? {}), build: 'node build.js' };
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg));
+    fs.writeFileSync(path.join(ws, 'package-lock.json'), '{"lockfileVersion":3}');
+    const calls = [];
+    const fakeExecFile = (file, args, opts, cb) => {
+      calls.push({ file, args, opts });
+      cb(null, 'ok', '');
+    };
+    const res = await new NodeAdapter({ workspacePath: ws }).install({}, { execFile: fakeExecFile });
+    assert.equal(res.ok, true);
+    assert.equal(calls.length, 2, 'install + build');
+    for (const c of calls) {
+      assert.equal(c.opts.shell, false, `shell:true ditemukan pada ${JSON.stringify(c.args)}`);
+      assert.ok(Array.isArray(c.args), 'args wajib array (bukan string shell)');
+      assert.ok(c.args.every((a) => typeof a === 'string'));
+      if (process.platform === 'win32') {
+        assert.doesNotMatch(c.file, /\.cmd$/i, 'win32 tidak boleh spawn .cmd');
+        assert.equal(c.file, process.execPath);
+      }
+    }
   });
 });
 
@@ -392,6 +453,17 @@ describe('python adapter', () => {
       () => new PythonAdapter({ workspacePath: ws }).validate({}),
       VALIDATION, 'main',
     );
+  });
+
+  test('F6b: validate workspace hilang → NOT_FOUND (bukan ReferenceError)', () => {
+    const ws = makePythonFixture();
+    try {
+      new PythonAdapter({ workspacePath: ws }).validate({ workspacePath: path.join(dir, 'no-such-ws') });
+      assert.fail('expected NOT_FOUND');
+    } catch (e) {
+      assert.ok(e instanceof VmPanelError, `tipe salah: ${e?.name}: ${e?.message}`);
+      assert.equal(e.code, NOT_FOUND);
+    }
   });
 
   test('validate ok dengan config.main; pythonBin sesuai platform', () => {

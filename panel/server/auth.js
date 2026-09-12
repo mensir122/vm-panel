@@ -28,16 +28,29 @@ import { VmPanelError, VALIDATION, NOT_FOUND, PERMISSION_DENIED } from '../../li
 import { PermissionManager } from '../../manager/permission_manager/index.js';
 
 const MAX_FAILED_ATTEMPTS = 5;
+/** IP localhost — 2FA di-bypass karena user sudah di mesin fisik. */
+const LOCALHOST_IPS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 const LOCK_WINDOW_MS = 15 * 60 * 1000;
 const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 jam (= 28800 s)
 const RECOVERY_CODE_COUNT = 10;
 const RECOVERY_CODE_BYTES = 4; // randomToken(4) → 8 char hex
 const TOTP_SECRET_BYTES = 20;
+const SESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 jam (A2#20)
 
 export const SESSION_COOKIE = 'vpanel_session';
 export const CSRF_COOKIE = 'vpanel_csrf';
 
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+/** Hash dummy (parameter scrypt setara) untuk menyamakan timing user tak dikenal. */
+let DUMMY_STORED = null;
+function dummyStored() {
+  if (!DUMMY_STORED) {
+    const { salt, hash, params } = scryptHash('oriont-timing-equalizer-not-a-real-password');
+    DUMMY_STORED = { salt, hash, params };
+  }
+  return DUMMY_STORED;
+}
 
 /** Encode Buffer → base32 RFC 4648 (untuk secret TOTP 20 byte → 32 char). */
 function base32Encode(buf) {
@@ -71,10 +84,12 @@ function safeEqualStr(a, b) {
 export class PanelAuth {
   /**
    * @param {{dataDir: string, auditManager?: object,
-   *          now?: () => number, sessionTtlMs?: number}} opts
+   *          now?: () => number, sessionTtlMs?: number,
+   *          localhostBypass2fa?: boolean}} opts
    * `now` injectable untuk test (default Date.now); sessionTtlMs override TTL.
+   * `localhostBypass2fa` (default true): bypass 2FA untuk koneksi localhost.
    */
-  constructor({ dataDir, auditManager, now, sessionTtlMs } = {}) {
+  constructor({ dataDir, auditManager, now, sessionTtlMs, localhostBypass2fa = true } = {}) {
     if (!dataDir || typeof dataDir !== 'string') {
       throw new VmPanelError(VALIDATION, 'PanelAuth: dataDir wajib');
     }
@@ -85,6 +100,7 @@ export class PanelAuth {
     this.#now = typeof now === 'function' ? now : () => Date.now();
     const ttl = Number(sessionTtlMs);
     this.#sessionTtlMs = Number.isFinite(ttl) && ttl > 0 ? ttl : DEFAULT_SESSION_TTL_MS;
+    this.#localhostBypass2fa = localhostBypass2fa;
     this.#stmts = {
       getUserByUsernameFull: this.#h.db.prepare('SELECT * FROM users WHERE username = ?'),
       getUserByIdFull: this.#h.db.prepare('SELECT * FROM users WHERE id = ?'),
@@ -113,6 +129,21 @@ export class PanelAuth {
         'SELECT id, username, role, status, created_at, last_login_at FROM users ORDER BY created_at, username',
       ),
     };
+    // A2#20: bersihkan sesi kedaluwarsa saat start + berkala (1 jam, unref agar
+    // tidak menahan proses/test exit). Kegagalan periodik diamkan (non-fatal).
+    try {
+      this.cleanupExpired();
+    } catch {
+      // DB mungkin belum siap di skenario eksotis — abaikan
+    }
+    this.#cleanupTimer = setInterval(() => {
+      try {
+        this.cleanupExpired();
+      } catch {
+        // non-fatal
+      }
+    }, SESSION_CLEANUP_INTERVAL_MS);
+    this.#cleanupTimer.unref?.();
   }
 
   #h;
@@ -120,8 +151,10 @@ export class PanelAuth {
   #auditManager;
   #now;
   #sessionTtlMs;
+  #localhostBypass2fa;
   #stmts;
   #kEnc = null;
+  #cleanupTimer = null;
 
   // --- helpers -------------------------------------------------------------
 
@@ -290,6 +323,13 @@ export class PanelAuth {
 
     const row = this.#stmts.getUserByUsernameFull.get(u);
     if (!row || !row.password_hash) {
+      // A2#29: samakan biaya timing dengan jalur user dikenal — verifikasi
+      // scrypt terhadap hash dummy berparameter setara (hasil diabaikan).
+      try {
+        scryptVerify(password, dummyStored());
+      } catch {
+        // hash dummy harusnya selalu valid; kegagalan tidak boleh mengubah alur
+      }
       this.#audit('LOGIN_FAIL', { actor: u, ip, result: 'fail' });
       return finish('invalid');
     }
@@ -314,21 +354,33 @@ export class PanelAuth {
       return finish('invalid');
     }
 
+    // A2#1: hanya user berstatus 'active' yang boleh punya sesi. Ditolak dengan
+    // 'invalid' yang sama (pesan generik "Username atau password salah" di
+    // controller) — tanpa membocorkan keberadaan status akun.
+    if (row.status !== 'active') {
+      this.#audit('LOGIN_FAIL', { actor: u, userId: row.id, ip, result: 'fail', reason: 'inactive' });
+      return finish('invalid');
+    }
+
     // Faktor kedua wajib: TOTP (window ±1) ATAU recovery code sekali pakai
-    let secondFactor = false;
+    // BYPASS: localhost (127.0.0.1 / ::1) — user sudah di mesin fisik
+    const isLocal = this.#localhostBypass2fa && LOCALHOST_IPS.has(ip);
+    let secondFactor = isLocal;
     let secretBase32 = null;
-    try {
-      secretBase32 = this.#decryptTotpSecret(row.totp_secret);
-    } catch {
-      // Kunci enkripsi tidak cocok (mis. master key berubah) — perlakukan
-      // sebagai 2FA gagal, JANGAN biarkan melempar 500 INTERNAL.
-      secretBase32 = null;
-    }
-    if (secretBase32 && typeof totpCode === 'string' && totpCode.trim() !== '') {
-      secondFactor = totpVerify(secretBase32, totpCode.trim(), { window: 1 });
-    }
-    if (!secondFactor && typeof recoveryCode === 'string' && recoveryCode.trim() !== '') {
-      secondFactor = this.#consumeRecoveryCode(row.id, recoveryCode);
+    if (!secondFactor) {
+      try {
+        secretBase32 = this.#decryptTotpSecret(row.totp_secret);
+      } catch {
+        // Kunci enkripsi tidak cocok (mis. master key berubah) — perlakukan
+        // sebagai 2FA gagal, JANGAN biarkan melempar 500 INTERNAL.
+        secretBase32 = null;
+      }
+      if (secretBase32 && typeof totpCode === 'string' && totpCode.trim() !== '') {
+        secondFactor = totpVerify(secretBase32, totpCode.trim(), { window: 1 });
+      }
+      if (!secondFactor && typeof recoveryCode === 'string' && recoveryCode.trim() !== '') {
+        secondFactor = this.#consumeRecoveryCode(row.id, recoveryCode);
+      }
     }
     if (!secondFactor) {
       this.#audit('LOGIN_FAIL_2FA', { actor: u, userId: row.id, ip, result: 'fail' });
@@ -343,7 +395,13 @@ export class PanelAuth {
       this.#stmts.insSession.run(sessionId, row.id, nowIso, expiresAt, csrfToken);
       this.#stmts.loginOk.run(nowIso, row.id);
     });
-    this.#audit('LOGIN_SUCCESS', { actor: u, userId: row.id, role: row.role, ip, result: 'ok' });
+    // A2#20: kesempatan pembersihan sesi kedaluwarsa (non-fatal).
+    try {
+      this.cleanupExpired();
+    } catch {
+      // pembersihan tidak boleh memutus alur login
+    }
+    this.#audit('LOGIN_SUCCESS', { actor: u, userId: row.id, role: row.role, ip, result: 'ok', ...(isLocal ? { '2fa': 'localhost_bypass' } : {}) });
 
     const maxAge = Math.round(this.#sessionTtlMs / 1000);
     const sessionCookie = `${SESSION_COOKIE}=${sessionId}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
@@ -368,7 +426,8 @@ export class PanelAuth {
     if (!row || row.revoked) return null;
     if (Date.parse(row.expires_at) <= this.#now()) return null;
     const userRow = this.#stmts.getUserByIdFull.get(row.user_id);
-    if (!userRow) return null;
+    // A2#1: user non-active (pending/disabled) → sesi lama ikut mati.
+    if (!userRow || userRow.status !== 'active') return null;
     return {
       user: this.#userFromRow(userRow),
       csrfToken: row.csrf_token,
@@ -426,6 +485,10 @@ export class PanelAuth {
 
   /** Tutup koneksi DB (panel + permission manager). */
   close() {
+    if (this.#cleanupTimer) {
+      clearInterval(this.#cleanupTimer);
+      this.#cleanupTimer = null;
+    }
     try {
       this.#perm.close();
     } finally {

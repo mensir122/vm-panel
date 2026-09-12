@@ -70,28 +70,124 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Users — VPANEL</title>
+  <title>Users — ORIONT</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/panel.css">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230A0D0C'/%3E%3Ccircle cx='16' cy='16' r='9' stroke='%23FFFFFF' stroke-width='2' fill='none'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%23FFFFFF'/%3E%3C/svg%3E">
 </head>
-<body>
+<body class="oriont-theme">
+  <!-- Desktop Titlebar (Electron App only) -->
+  <div id="desktop-titlebar" class="desktop-titlebar" style="display: none;">
+    <div class="desktop-titlebar__brand">
+      <img src="/static/oriont-logo.png" alt="ORIONT" width="16" height="16" style="object-fit: contain;">
+      <span class="desktop-titlebar__pulse"></span>
+      <span>ORIONT · VPANEL</span>
+      <span class="desktop-titlebar__tag">24/7 ACTIVE</span>
+    </div>
+    <div class="desktop-titlebar__center">
+      <span class="desktop-titlebar__center-title">USERS & RBAC</span>
+    </div>
+    <div class="desktop-titlebar__controls">
+      <button type="button" class="desktop-titlebar__btn" id="titlebar-min" title="Minimize">
+        <svg width="10" height="2" viewBox="0 0 10 2" fill="currentColor"><rect width="10" height="2" rx="1"/></svg>
+      </button>
+      <button type="button" class="desktop-titlebar__btn" id="titlebar-max" title="Maximize / Restore">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="8" height="8" rx="1.5"/></svg>
+      </button>
+      <button type="button" class="desktop-titlebar__btn desktop-titlebar__btn--close" id="titlebar-close" title="Close to Tray">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg>
+      </button>
+    </div>
+  </div>
+
   <a class="skip-link" href="#main">Skip to content</a>
+
   <div class="app">
+    <!-- Sleek Dark Sidebar -->
     <aside class="app__sidebar">
+      <!-- Brand Logo -->
       <div class="brand">
-        <a class="brand__mark" href="/dashboard">VPANEL</a>
-        <span class="brand__sub">VM-Panel</span>
+        <a class="brand__mark" href="/dashboard">
+          <div class="brand__logo-box">
+            <img src="/static/oriont-logo.png" alt="ORIONT" class="brand__logo-img" width="24" height="24">
+          </div>
+          <div class="brand__text-group">
+            <span class="brand__name">ORIONT</span>
+            <span class="brand__sub">VPANEL</span>
+          </div>
+        </a>
       </div>
-      {{nav|raw}}
-      <div class="app__sidebar-foot">VM-Panel · operations console</div>
+
+      <!-- Server Rendered Menu (MENU & GENERAL) -->
+      <div class="sidebar-nav-wrap">
+        {{nav|raw}}
+      </div>
+
+      <!-- Real Host Status Widget -->
+      <div class="sidebar-host-widget">
+        <div class="sidebar-host-head">
+          <span class="pulse-dot pulse-dot--white"></span>
+          <span class="sidebar-host-label">DAEMON 24/7</span>
+        </div>
+        <div class="sidebar-host-val mono">{{managerStatus}}</div>
+        <div class="sidebar-host-meta">{{nodeVersionStr}} · {{osPlatformStr}}</div>
+      </div>
+
+      <div class="app__sidebar-foot">ORIONT · operations console</div>
     </aside>
 
+    <!-- Main Workspace Container -->
     <div class="app__main">
+      <!-- Dark Luxe Topbar with Search & User Profile -->
       <header class="topbar">
-        <span class="topbar__user">{{user}}</span>
-        <form method="post" action="/logout">
-          <button class="btn btn--ghost" type="submit">Log out</button>
-        </form>
+        <div class="topbar__search">
+          <svg class="topbar__search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"/>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input type="text" id="topbar-search-input" class="topbar__search-input" placeholder="Search users..." autocomplete="off">
+          <kbd class="kbd-pill" id="search-kbd-pill" title="Press Ctrl+F or ⌘+F to search">⌘ F</kbd>
+        </div>
+
+        <div class="topbar__actions">
+          <button type="button" class="topbar__icon-btn" id="btn-topbar-hermes" title="Open Hermes AI Assistant" aria-label="Hermes AI Assistant">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            </svg>
+          </button>
+          <button type="button" class="topbar__icon-btn" title="System Alerts" aria-label="System Alerts" onclick="window.location.href='/audit'">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+              <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
+          </button>
+
+          <div class="user-pill">
+            <div class="user-pill__avatar" title="{{user}}">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+              </svg>
+            </div>
+            <div class="user-pill__info">
+              <div class="user-pill__name">{{user}}</div>
+              <div class="user-pill__email">{{user}}@oriont.internal</div>
+            </div>
+          </div>
+
+          <form method="post" action="/logout" class="topbar__logout-form">
+            <input type="hidden" name="_csrf" value="{{csrfToken}}">
+            <button class="topbar__icon-btn topbar__icon-btn--logout" type="submit" title="Log out" aria-label="Log out">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                <polyline points="16 17 21 12 16 7"/>
+                <line x1="21" y1="12" x2="9" y2="12"/>
+              </svg>
+            </button>
+          </form>
+        </div>
       </header>
 
       <div class="notices">
@@ -114,7 +210,7 @@
       </main>
 
       <footer class="footer">
-        <span class="mono">VPANEL</span>
+        <span class="mono">ORIONT</span>
         <span>Only owners can create, approve or reassign users.</span>
       </footer>
     </div>

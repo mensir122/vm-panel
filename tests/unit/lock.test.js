@@ -4,10 +4,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { acquire, release, withLock, acquireAll, releaseAll } from '../../lib/lock.js';
+import { acquire, release, refresh, withLock, acquireAll, releaseAll } from '../../lib/lock.js';
 import { VmPanelError, LOCK_HELD } from '../../lib/errors.js';
 
 let locksDir;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 beforeEach(() => {
   locksDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vmp-locks-'));
@@ -112,6 +114,69 @@ test('release: pemilik salah (token beda) TIDAK bisa menghapus lock', async () =
 
 test('release: idempotent — lock yang sudah tidak ada -> false, tidak throw', () => {
   assert.equal(release('tidak-ada', 'x', opts()), false);
+});
+
+test('F8: lock 0-byte (holder sedang menulis payload) BUKAN stale — tidak direbut', async () => {
+  const file = path.join(locksDir, 'prj_Z1.lock');
+  fs.writeFileSync(file, ''); // 0-byte, baru dibuat → dalam grace window
+  await assert.rejects(
+    () => acquire('prj_Z1', opts({ maxWaitMs: 200, retryMs: 50 })),
+    (e) => e.code === LOCK_HELD,
+  );
+  assert.ok(fs.existsSync(file), 'lock 0-byte tidak boleh dihapus dalam grace');
+  assert.equal(fs.existsSync(path.join(locksDir, 'stale-takeover.log')), false);
+});
+
+test('F8: payload korup + grace habis (staleGraceMs=0) → takeover normal + event tercatat', async () => {
+  const file = path.join(locksDir, 'prj_Z2.lock');
+  fs.writeFileSync(file, ''); // 0-byte tapi grace 0ms → dianggap yatim
+  const token = await acquire('prj_Z2', opts({ maxWaitMs: 1000, retryMs: 20, staleGraceMs: 0 }));
+  const info = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(info.token, token);
+  assert.ok(fs.readFileSync(path.join(locksDir, 'stale-takeover.log'), 'utf8').includes('prj_Z2'));
+  release('prj_Z2', token, opts());
+});
+
+test('F8: create+payload atomik — file hasil acquire selalu JSON lengkap', async () => {
+  const token = await acquire('prj_Z3', opts());
+  const file = path.join(locksDir, 'prj_Z3.lock');
+  const raw = fs.readFileSync(file, 'utf8');
+  assert.ok(raw.length > 0, 'payload terisi segera setelah acquire resolve');
+  const info = JSON.parse(raw);
+  assert.equal(info.token, token);
+  assert.equal(info.pid, process.pid);
+  release('prj_Z3', token, opts());
+});
+
+test('F5/refresh: TTL lock diperpanjang hanya oleh pemilik token', async () => {
+  const token = await acquire('prj_R', opts({ ttlMs: 1000 }));
+  const file = path.join(locksDir, 'prj_R.lock');
+  const before = Date.parse(JSON.parse(fs.readFileSync(file, 'utf8')).expiresAt);
+  await sleep(50);
+  assert.equal(refresh('prj_R', 'token-salah', opts({ ttlMs: 60_000 })), false, 'bukan pemilik → false');
+  assert.equal(refresh('prj_R', token, opts({ ttlMs: 60_000 })), true);
+  const after = Date.parse(JSON.parse(fs.readFileSync(file, 'utf8')).expiresAt);
+  assert.ok(after - before > 50_000, `expiresAt maju (${after - before}ms)`);
+  // refresh lock yang tidak ada → false, tidak membuat file baru
+  assert.equal(refresh('prj_TIDAK_ADA', token, opts()), false);
+  assert.equal(fs.existsSync(path.join(locksDir, 'prj_TIDAK_ADA.lock')), false);
+  release('prj_R', token, opts());
+});
+
+test('F5/withLock heartbeat: operasi lebih lama dari TTL tidak kehilangan lock', async () => {
+  const file = path.join(locksDir, 'prj_HB.lock');
+  const out = await withLock(
+    'prj_HB',
+    opts({ ttlMs: 150, heartbeatMs: 50, maxWaitMs: 200 }),
+    async () => {
+      await sleep(400); // 2.6x TTL — tanpa heartbeat lock sudah expired
+      const info = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.ok(Date.parse(info.expiresAt) > Date.now(), 'TTL diperpanjang heartbeat');
+      return 'done';
+    },
+  );
+  assert.equal(out, 'done');
+  assert.equal(fs.existsSync(file), false, 'lock dilepas setelah fn selesai');
 });
 
 test('withLock: fn jalan dengan token, lock otomatis dilepas (sukses & gagal)', async () => {

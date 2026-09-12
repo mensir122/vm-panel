@@ -27,9 +27,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
-      - name: Syntax check (node --check semua JS)
+      - name: Syntax check (node --check semua JS + MJS)
         run: |
-          find . -name '*.js' \
+          find . \( -name '*.js' -o -name '*.mjs' \) \
             -not -path './node_modules/*' \
             -not -path './.git/*' \
             -print0 | xargs -0 -n 1 node --check

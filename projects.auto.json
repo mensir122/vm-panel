@@ -1,10 +1,18 @@
 [
   {
-    "name": "9router",
+    "name": "9router-vm",
     "type": "node",
     "port": 20127,
     "repo_url": "https://github.com/decolua/9router",
     "git_branch": "master",
+    "enabled": true
+  },
+  {
+    "name": "hermes-agent",
+    "type": "python",
+    "port": 10001,
+    "repo_url": "https://github.com/decolua/hermes-agent",
+    "git_branch": "main",
     "enabled": true
   }
 ]

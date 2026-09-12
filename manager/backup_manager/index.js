@@ -176,9 +176,11 @@ export class BackupManager {
     try {
       const bk = this._backupsDb();
 
-      // §9.5 rate-limit: backup otomatis (non-manual) ditolak bila backup valid
-      // terakhir < 30 menit; trigger 'manual' selalu boleh.
-      if (trigger !== 'manual') {
+      // §9.5 rate-limit (F11): HANYA backup terjadwal (trigger 'scheduled')
+      // ditolak bila backup valid terakhir < 30 menit. 'manual' (aksi user)
+      // dan 'pre-shutdown' (snapshot pengaman sebelum mati) selalu bypass —
+      // menolak pre-shutdown justru menghilangkan safety net saat restart.
+      if (trigger === 'scheduled') {
         const last = bk.db
           .prepare(
             `SELECT at FROM backups WHERE verification_status = 'valid'

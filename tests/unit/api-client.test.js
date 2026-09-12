@@ -201,3 +201,55 @@ describe('ManagerClient: error path', () => {
     await assert.rejects(() => c.health(), (e) => isVmPanelError(e) && e.code === UNREACHABLE);
   });
 });
+
+describe('ManagerClient: retry hanya method idempoten (A2#14)', () => {
+  test('GET: koneksi putus di percobaan-1 → di-retry sekali lalu sukses', async () => {
+    let n = 0;
+    const m = await startMockManager((req, res) => {
+      n++;
+      if (n === 1) {
+        req.socket.destroy();
+        return;
+      }
+      json(res, 200, { ok: true });
+    });
+    try {
+      const c = new ManagerClient({ port: m.port, token: 't', timeoutMs: 3000 });
+      const r = await c.request('GET', '/x');
+      assert.deepEqual(r, { ok: true });
+      assert.ok(n >= 2, `GET layak di-retry (hits=${n})`);
+    } finally { await m.close(); }
+  });
+
+  test('POST: koneksi putus → TIDAK di-retry; tepat satu request dikirim', async () => {
+    let n = 0;
+    const m = await startMockManager((req, res) => {
+      n++;
+      req.socket.destroy();
+    });
+    try {
+      const c = new ManagerClient({ port: m.port, token: 't', timeoutMs: 3000 });
+      await assert.rejects(
+        () => c.request('POST', '/x', { body: { deploy: true } }),
+        (e) => isVmPanelError(e) && e.code === UNREACHABLE,
+      );
+      assert.equal(n, 1, 'POST harus satu percobaan — retry bisa menggandakan efek (deploy/create)');
+    } finally { await m.close(); }
+  });
+
+  test('DELETE: koneksi putus → TIDAK di-retry', async () => {
+    let n = 0;
+    const m = await startMockManager((req, res) => {
+      n++;
+      req.socket.destroy();
+    });
+    try {
+      const c = new ManagerClient({ port: m.port, token: 't', timeoutMs: 3000 });
+      await assert.rejects(
+        () => c.request('DELETE', '/x'),
+        (e) => isVmPanelError(e) && e.code === UNREACHABLE,
+      );
+      assert.equal(n, 1);
+    } finally { await m.close(); }
+  });
+});

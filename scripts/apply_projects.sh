@@ -41,16 +41,16 @@ import fs from 'node:fs';
 const list = JSON.parse(fs.readFileSync('${MANIFEST}', 'utf8'));
 for (const e of list) {
   if (e.enabled === false) continue;
-  console.log([e.name ?? '', e.type ?? 'node', e.port ?? '', e.repo_url ?? '', e.git_branch ?? 'main'].join('\t'));
+  console.log([e.name ?? '', e.type ?? 'node', e.port ?? '', e.repo_url ?? '', e.git_branch ?? 'main', e.source_path ?? ''].join('\t'));
 }
 ")
 
-while IFS=$'\t' read -r NAME TYPE PORT REPO_URL BRANCH; do
+while IFS=$'\t' read -r NAME TYPE PORT REPO_URL BRANCH SOURCE_PATH; do
   [ -z "$NAME" ] && continue
-  echo "[apply_projects] entry: name=${NAME} type=${TYPE} port=${PORT} branch=${BRANCH}"
+  echo "[apply_projects] entry: name=${NAME} type=${TYPE} port=${PORT} branch=${BRANCH} source_path=${SOURCE_PATH}"
 
   # (1) Project sudah terdaftar? (match by name)
-  export NM="$NAME" TP="$TYPE" PT="$PORT" RU="$REPO_URL" BR="$BRANCH"
+  export NM="$NAME" TP="$TYPE" PT="$PORT" RU="$REPO_URL" BR="$BRANCH" SP="$SOURCE_PATH"
   EXISTING_ID=$(curl -sf --max-time 5 "${AUTH[@]}" "http://127.0.0.1:${MP}/projects" \
     | node --input-type=module -e "
 let s=''; process.stdin.on('data', d => s += d).on('end', () => {
@@ -78,10 +78,15 @@ let s=''; process.stdin.on('data', d => s += d).on('end', () => { try { console.
   fi
 
   # (2) Service sudah running? (deploy idempoten - skip bila sudah sehat)
+  export PID="$EXISTING_ID"
   SVC_STATUS=$(curl -sf --max-time 5 "${AUTH[@]}" "http://127.0.0.1:${MP}/services?projectId=${EXISTING_ID}" \
     | node --input-type=module -e "
 let s=''; process.stdin.on('data', d => s += d).on('end', () => {
-  try { const r = JSON.parse(s).rows ?? []; const hit = r[0]; console.log(hit ? hit.status : 'none'); } catch { console.log('none'); }
+  try {
+    const r = JSON.parse(s).rows ?? [];
+    const hit = r.find(svc => svc.projectId === process.env.PID) || r[0];
+    console.log(hit ? hit.status : 'none');
+  } catch { console.log('none'); }
 });
 " 2>/dev/null) || SVC_STATUS='none'
 
@@ -93,8 +98,19 @@ let s=''; process.stdin.on('data', d => s += d).on('end', () => {
 
   # (3) Deploy (sinkron; build Next.js bisa 3-8 menit -> curl timeout 600s).
   echo "[apply_projects] deploy ${NAME} (service status: ${SVC_STATUS})..."
+  if [ -n "$REPO_URL" ]; then
+    DEPLOY_PAYLOAD='{"source":{"type":"git"}}'
+  elif [ -n "$SOURCE_PATH" ] && [ -d "$SOURCE_PATH" ]; then
+    echo "[apply_projects] copy local source dari ${SOURCE_PATH} ke workspace ${EXISTING_ID}..."
+    mkdir -p "workspaces/${EXISTING_ID}"
+    cp -r "${SOURCE_PATH}/." "workspaces/${EXISTING_ID}/"
+    DEPLOY_PAYLOAD='{"source":{"type":"workspace"}}'
+  else
+    DEPLOY_PAYLOAD='{"source":{"type":"workspace"}}'
+  fi
+
   DEPLOY_RES=$(curl -sf --max-time 600 -X POST -H "Content-Type: application/json" "${AUTH[@]}" \
-    -d '{"source":{"type":"git"}}' "http://127.0.0.1:${MP}/projects/${EXISTING_ID}/deploy" 2>&1) \
+    -d "$DEPLOY_PAYLOAD" "http://127.0.0.1:${MP}/projects/${EXISTING_ID}/deploy" 2>&1) \
     && ok=$((ok+1)) && echo "[apply_projects] deploy ${NAME}: OK" \
     || { echo "[apply_projects] deploy ${NAME}: GAGAL - ${DEPLOY_RES}"; fail=$((fail+1)); }
 

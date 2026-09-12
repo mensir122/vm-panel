@@ -50,11 +50,13 @@ export class InternalSupervisor {
   /**
    * @param {{
    *   serviceManager?: object, healthManager?: object, processManager?: object,
+   *   deploymentManager?: object|null, // opsional: enable auto-rollback §7.3
    *   logger?: {debug,info,warn,error},
    *   pollIntervalMs?: number,      // default 5000 (§8.1); test override kecil
    *   maxRestarts?: number,         // default 5
    *   backoffSeq?: number[],        // detik, default [5,15,30,60,120] (§8.3)
    *   stableWindowMs?: number,      // default 600000 (§8.3 window reset)
+   *   deploySweepIntervalMs?: number, // default 300000 (low-frequency §7.3)
    *   notificationWebhook?: string|null,
    *   lockDir?: string, lockWaitMs?: number, lockTtlMs?: number,
    *   nowFn?: () => number,         // injectable clock (epoch ms)
@@ -65,6 +67,13 @@ export class InternalSupervisor {
     this.serviceManager = opts.serviceManager ?? null;
     this.healthManager = opts.healthManager ?? null;
     this.processManager = opts.processManager ?? null;
+    /**
+     * DeploymentManager (opsional). Bila diinjeksi, supervisor ikut menjalankan
+     * `sweepDisconnected()` (§7.3 auto-rollback deployment yatim) pada tick
+     * ber-interval panjang — bukan tiap tick. Tanpa injeksi: no-op (call site
+     * manager/index.js yang perlu menambahkan property ini).
+     */
+    this.deploymentManager = opts.deploymentManager ?? null;
     this.logger = opts.logger ?? defaultLogger();
     this.pollIntervalMs = opts.pollIntervalMs ?? 5000;
     this.maxRestarts = opts.maxRestarts ?? 5;
@@ -73,23 +82,31 @@ export class InternalSupervisor {
         ? [...opts.backoffSeq]
         : [5, 15, 30, 60, 120];
     this.stableWindowMs = opts.stableWindowMs ?? 600_000;
+    this.deploySweepIntervalMs =
+      Number.isFinite(opts.deploySweepIntervalMs) && opts.deploySweepIntervalMs > 0
+        ? opts.deploySweepIntervalMs
+        : 300_000;
     this.notificationWebhook = opts.notificationWebhook ?? null;
     this.lockDir = opts.lockDir ?? null;
     this.lockWaitMs = opts.lockWaitMs ?? 2000;
     this.lockTtlMs = opts.lockTtlMs ?? 30_000;
     this._now = typeof opts.nowFn === 'function' ? opts.nowFn : (() => Date.now());
     this._staticServices = Array.isArray(opts.services) ? opts.services : null;
+    this._lastDeploySweepAt = 0;
 
     this.#timer = null;
     this.#ticking = false;
     this.#stopped = false;
     this.#smPromise = null;
+    this.#sweeping = null;
   }
 
   #timer;
   #ticking;
   #stopped;
   #smPromise;
+  /** Promise sweep aktif (guard agar hanya satu sweep jalan bersamaan). */
+  #sweeping;
 
   /* ---------------- lifecycle ---------------- */
 
@@ -98,10 +115,16 @@ export class InternalSupervisor {
     if (this.#timer) return;
     await this.#sm(); // gagal → throw sebelum interval jalan
     this.#stopped = false;
+    this._lastDeploySweepAt = 0; // tick pertama langsung sempat sweep §7.3
     this.#timer = setInterval(() => {
       void this.tick();
     }, this.pollIntervalMs);
-    this.logger.info('supervisor.started', { pollIntervalMs: this.pollIntervalMs });
+    this.logger.info('supervisor.started', {
+      pollIntervalMs: this.pollIntervalMs,
+      deploySweep: this.deploymentManager ? this.deploySweepIntervalMs : 'disabled',
+    });
+    // Sweep pertama tidak menunggu penuh satu interval.
+    void this.sweepDeployments();
   }
 
   /** Hentikan loop (clearInterval; tick yang sedang jalan dibiarkan selesai). */
@@ -172,6 +195,42 @@ export class InternalSupervisor {
       });
   }
 
+  /**
+   * F5/§7.3: auto-rollback deployment yang terputus (manager crash di tengah
+   * deploy). Method PUBLIK — dipanggil dari start() dan dari tick dengan
+   * throttle `deploySweepIntervalMs` (frekuensi rendah, bukan tiap tick).
+   * Tanpa `deploymentManager` ter-injeksi → no-op (return []).
+   * Semua error ditelan: supervisor tidak boleh mati karena sweep.
+   * @returns {Promise<Array>} hasil sweepDisconnected (baris ter-rollback)
+   */
+  async sweepDeployments(opts = {}) {
+    const dm = this.deploymentManager;
+    if (!dm || typeof dm.sweepDisconnected !== 'function') return [];
+    if (this.#sweeping) return this.#sweeping; // hanya satu sweep bersamaan
+    this._lastDeploySweepAt = this._now();
+    this.#sweeping = (async () => {
+      try {
+        const rows = await dm.sweepDisconnected(opts);
+        const list = Array.isArray(rows) ? rows : [];
+        if (list.length > 0) {
+          this.logger.warn('supervisor.deploy_sweep.applied', {
+            count: list.length,
+            deployments: list.map((r) => r?.deploymentId ?? null),
+          });
+        } else {
+          this.logger.debug('supervisor.deploy_sweep.clean', {});
+        }
+        return list;
+      } catch (e) {
+        this.logger.error('supervisor.deploy_sweep.error', { error: errMsg(e) });
+        return [];
+      } finally {
+        this.#sweeping = null;
+      }
+    })();
+    return this.#sweeping;
+  }
+
   /* ---------------- internal ---------------- */
 
   /** Resolusi ServiceManager: injeksi > lazy dynamic import. */
@@ -211,15 +270,21 @@ export class InternalSupervisor {
         await this._handleService(sm, row);
       } catch (e) {
         this.logger.error('supervisor.tick.service_error', {
-          serviceId: row?.service_id ?? null,
+          serviceId: row?.service_id ?? row?.id ?? null,
           error: errMsg(e),
         });
       }
     }
+    // §7.3低频: auto-rollback deployment yatim — hanya tiap
+    // deploySweepIntervalMs (bukan tiap tick) dan hanya bila ada
+    // deploymentManager ter-injeksi.
+    if (this.deploymentManager && this._now() - this._lastDeploySweepAt >= this.deploySweepIntervalMs) {
+      await this.sweepDeployments();
+    }
   }
 
   async _handleService(sm, row) {
-    const serviceId = row?.service_id;
+    const serviceId = row?.service_id ?? row?.id;
     if (!serviceId) return;
     const enabled = row.enabled === 1 || row.enabled === true || row.enabled === '1';
     if (!enabled) return;
@@ -232,7 +297,15 @@ export class InternalSupervisor {
     }
 
     const pid = toNum(row.pid);
-    const hint = stateField(st, 'startTimeHint', 'start_time_hint') ?? null;
+    // #30 — creation-time anak yang tercatat di baris services (epoch ms) adalah
+    // hint PID-reuse yang sesungguhnya; supervisor_state tidak pernah
+    // menyimpannya, jadi urutan bacanya: row → (fallback) state.
+    // (bukan toNum(): Number(null)===0 akan jadi hint palsu).
+    const rawHint = row.start_time_hint ?? row.startTimeHint ?? null;
+    const hint =
+      rawHint != null && Number.isFinite(Number(rawHint))
+        ? Number(rawHint)
+        : stateField(st, 'startTimeHint', 'start_time_hint') ?? null;
     const pm = this.processManager;
     const alive =
       pid != null && pm && typeof pm.isAlive === 'function'
@@ -249,7 +322,7 @@ export class InternalSupervisor {
   /* -------- BRANCH ALIVE: health threshold (§8.1-8.2) -------- */
 
   async _handleAlive(sm, row, st) {
-    const serviceId = row.service_id;
+    const serviceId = row?.service_id ?? row?.id;
     const res = (await sm.healthService?.(serviceId, this.healthManager)) ?? null;
     const ok = res?.ok === true;
     const failures = this.#consecutiveFailures(res, serviceId);
@@ -271,7 +344,7 @@ export class InternalSupervisor {
         }
         this.logger.info('supervisor.service.recovered', {
           serviceId,
-          projectId: row.project_id ?? null,
+          projectId: row?.project_id ?? row?.projectId ?? null,
         });
         return;
       }
@@ -302,7 +375,7 @@ export class InternalSupervisor {
         consecutiveFailures: failures,
       });
       await this.#raiseAlert({
-        projectId: row.project_id ?? null,
+        projectId: row?.project_id ?? row?.projectId ?? null,
         level: 'warning',
         code: 'SERVICE_UNHEALTHY',
         message: `service ${serviceId} unhealthy ${failures}x berturut-turut`,
@@ -313,22 +386,28 @@ export class InternalSupervisor {
   /* -------- BRANCH DEAD: policy + backoff + restart (§8.1-8.3) -------- */
 
   async _handleDead(sm, row, st) {
-    const serviceId = row.service_id;
+    const serviceId = row?.service_id ?? row?.id;
     // (1) event log kematian + exitCode dari process manager (best-effort).
     let exitCode = null;
+    let exitReason = null;
     try {
-      exitCode =
-        (typeof this.processManager?.getExitRecord === 'function'
+      const rec =
+        typeof this.processManager?.getExitRecord === 'function'
           ? this.processManager.getExitRecord(serviceId)
-          : null)?.exitCode ?? null;
+          : null;
+      exitCode = rec?.exitCode ?? null;
+      // #32 — reason khusus dari exit-classification (mis. port_taken_at_spawn).
+      exitReason = typeof rec?.reason === 'string' ? rec.reason : null;
     } catch {
       exitCode = null;
+      exitReason = null;
     }
     this.logger.warn('supervisor.service.died', {
       serviceId,
-      projectId: row.project_id ?? null,
-      pid: row.pid ?? null,
+      projectId: row?.project_id ?? row?.projectId ?? null,
+      pid: row?.pid ?? null,
       exitCode,
+      reason: exitReason,
     });
 
     // (2) lock per-service; gagal (dipegang pihak lain) → skip tick ini.
@@ -338,7 +417,7 @@ export class InternalSupervisor {
         `svc-${serviceId}`,
         { dir: this.lockDir ?? undefined, ttlMs: this.lockTtlMs, maxWaitMs: this.lockWaitMs },
         async () => {
-          await this._deadUnderLock(sm, row, st);
+          await this._deadUnderLock(sm, row, st, exitReason);
         },
       );
     } catch (e) {
@@ -353,8 +432,8 @@ export class InternalSupervisor {
   }
 
   /** Langkah restart-policy/backoff, dieksekusi DI DALAM lock per-service. */
-  async _deadUnderLock(sm, row, stPrev) {
-    const serviceId = row.service_id;
+  async _deadUnderLock(sm, row, stPrev, exitReason = null) {
+    const serviceId = row?.service_id ?? row?.id;
     // Re-read di dalam lock: state bisa berubah pihak lain sejak tick mulai.
     const row2 = (await sm.getService?.(serviceId)) ?? row;
     const enabled = row2.enabled === 1 || row2.enabled === true || row2.enabled === '1';
@@ -363,7 +442,7 @@ export class InternalSupervisor {
     if (toNum(stateField(st2, 'crashLoop', 'crash_loop')) === 1) return;
 
     const restartCount = toNum(stateField(st2, 'restartCount', 'restart_count')) ?? 0;
-    const policy = row2.restart_policy;
+    const policy = row2.restart_policy ?? row2.restartPolicy ?? row2.config?.restartPolicy;
     const mode =
       typeof policy === 'string' ? policy : (policy?.mode ?? 'never');
 
@@ -378,14 +457,15 @@ export class InternalSupervisor {
       if (prevState !== 'failed') {
         this.logger.error('supervisor.service.failed', {
           serviceId,
-          projectId: row2.project_id ?? null,
+          projectId: row2?.project_id ?? row2?.projectId ?? null,
           mode,
+          reason: exitReason,
         });
         await this.#raiseAlert({
-          projectId: row2.project_id ?? null,
+          projectId: row2?.project_id ?? row2?.projectId ?? null,
           level: 'error',
           code: 'SERVICE_FAILED',
-          message: `service ${serviceId} mati; restart_policy=never (manual start diperlukan)`,
+          message: this.#deathMessage(serviceId, exitReason, 'restart_policy=never (manual start diperlukan)'),
         });
       }
       return;
@@ -396,7 +476,7 @@ export class InternalSupervisor {
 
     // (5) restart_count mencapai maxRestarts → crash loop + notifikasi.
     if (restartCount >= this.maxRestarts) {
-      await this.#enterCrashLoop(sm, serviceId, row2, restartCount);
+      await this.#enterCrashLoop(sm, serviceId, row2, restartCount, exitReason);
       return;
     }
 
@@ -407,7 +487,7 @@ export class InternalSupervisor {
 
     if (backoffUntil != null && now >= backoffUntil) {
       // backoff selesai → eksekusi restart sekarang.
-      await this.#executeRestart(sm, serviceId, row2, restartCount);
+      await this.#executeRestart(sm, serviceId, row2, restartCount, exitReason);
       return;
     }
 
@@ -415,7 +495,7 @@ export class InternalSupervisor {
     // restart langsung; selain itu jadwalkan backoff pertama (§8.2).
     const curState = stateField(st2, 'state', 'state');
     if (curState === 'recovering') {
-      await this.#executeRestart(sm, serviceId, row2, restartCount);
+      await this.#executeRestart(sm, serviceId, row2, restartCount, exitReason);
       return;
     }
     const delayMs = this.backoffSeq[Math.min(restartCount, this.backoffSeq.length - 1)] * 1000;
@@ -426,7 +506,7 @@ export class InternalSupervisor {
     });
     this.logger.warn('supervisor.backoff.scheduled', {
       serviceId,
-      projectId: row2.project_id ?? null,
+      projectId: row2?.project_id ?? row2?.projectId ?? null,
       delayMs,
       restartCount,
       backoffUntil: now + delayMs,
@@ -434,7 +514,7 @@ export class InternalSupervisor {
   }
 
   /** restart → health sekali → sukses (running) / gagal (backoff berikutnya). */
-  async #executeRestart(sm, serviceId, row, restartCount) {
+  async #executeRestart(sm, serviceId, row, restartCount, exitReason = null) {
     this.logger.info('supervisor.restart.attempt', { serviceId, restartCount });
     let restartOk = false;
     let restartError = null;
@@ -467,7 +547,7 @@ export class InternalSupervisor {
       });
       this.logger.info('supervisor.restart.succeeded', {
         serviceId,
-        projectId: row.project_id ?? null,
+        projectId: row?.project_id ?? row?.projectId ?? null,
         restartCount,
       });
       return;
@@ -480,7 +560,7 @@ export class InternalSupervisor {
         restartCount: newCount,
         backoffUntil: null,
       });
-      await this.#enterCrashLoop(sm, serviceId, row, newCount);
+      await this.#enterCrashLoop(sm, serviceId, row, newCount, exitReason);
       return;
     }
     const now = this._now();
@@ -492,16 +572,17 @@ export class InternalSupervisor {
     });
     this.logger.warn('supervisor.restart.failed', {
       serviceId,
-      projectId: row.project_id ?? null,
+      projectId: row?.project_id ?? row?.projectId ?? null,
       restartCount: newCount,
       delayMs,
       backoffUntil: now + delayMs,
+      reason: exitReason,
       error: restartError,
     });
   }
 
   /** crash_loop: stop auto-retry + alert critical + webhook (§8.2, §8.5). */
-  async #enterCrashLoop(sm, serviceId, row, restartCount) {
+  async #enterCrashLoop(sm, serviceId, row, restartCount, exitReason = null) {
     await sm.setSupervisorState(serviceId, {
       state: 'crash_loop',
       crashLoop: 1,
@@ -511,20 +592,40 @@ export class InternalSupervisor {
     });
     this.logger.error('supervisor.crash_loop.detected', {
       serviceId,
-      projectId: row.project_id ?? null,
+      projectId: row?.project_id ?? row?.projectId ?? null,
       restartCount,
+      reason: exitReason,
     });
     await this.#raiseAlert({
-      projectId: row.project_id ?? null,
+      projectId: row?.project_id ?? row?.projectId ?? null,
       level: 'critical',
       code: 'CRASH_LOOP',
-      message: `service ${serviceId} crash loop (restart_count=${restartCount}); manual retry diperlukan`,
+      message: this.#deathMessage(
+        serviceId,
+        exitReason,
+        `crash loop (restart_count=${restartCount}); manual retry diperlukan`,
+      ),
     });
     this.notify({
       event: 'crash_loop',
       serviceId,
-      projectId: row.project_id ?? null,
+      projectId: row?.project_id ?? row?.projectId ?? null,
+      reason: exitReason ?? undefined,
     });
+  }
+
+  /**
+   * #32 — Pesan alert yang membedakan kematian biasa dari kegagalan segera
+   * karena port sudah dipegang proses lain (`reason` dari exit record).
+   */
+  #deathMessage(serviceId, reason, tail) {
+    if (reason === 'port_taken_at_spawn') {
+      return (
+        `service ${serviceId} exit <5s dan port-nya masih dipegang proses lain ` +
+        `(port_taken_at_spawn) — kemungkinan tabrakan port, bukan crash aplikasi; ${tail}`
+      );
+    }
+    return `service ${serviceId} mati; ${tail}`;
   }
 
   async #raiseAlert({ projectId, level, code, message }) {

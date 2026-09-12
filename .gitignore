@@ -11,10 +11,18 @@ logs/
 backups/
 secrets/vault.enc
 secrets/vault.enc.tmp
+workspaces/
 projects/workspaces/
+scratch/
+.venv/
+venv/
 *.tmp
 coverage/
 .nyc_output/
 
 # atomic-write temp files
 *.tmp-*
+dist/
+
+# deepwork orchestrator state (git-local)
+.slim/deepwork/

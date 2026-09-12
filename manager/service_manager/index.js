@@ -28,6 +28,17 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+/** Status legal untuk transisi eksplisit via setStatus (#31b). */
+const SERVICE_STATUSES = new Set(['stopped', 'running', 'failed', 'disabled']);
+
+/** Logger fallback — rekonsiliasi tidak boleh crash tanpa logger ter-injeksi. */
+const NOOP_LOGGER = {
+  debug: () => {},
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+};
+
 function safeJsonParse(text, fallback = null) {
   if (text == null) return fallback;
   try {
@@ -49,6 +60,7 @@ export class ServiceManager {
    *   adapters?: typeof ADAPTERS,
    *   auditManager?: object|null,
    *   projectsDbPath?: string|null,
+   *   logger?: {debug,info,warn,error}|null,
    * }} opts
    */
   constructor({
@@ -57,6 +69,7 @@ export class ServiceManager {
     adapters = ADAPTERS,
     auditManager = null,
     projectsDbPath = null,
+    logger = null,
   }) {
     if (!dataDir || typeof dataDir !== 'string') {
       throw new VmPanelError(VALIDATION, 'ServiceManager: dataDir wajib');
@@ -68,6 +81,7 @@ export class ServiceManager {
     this.processManager = processManager;
     this.adapters = adapters;
     this.auditManager = auditManager;
+    this.logger = logger ?? NOOP_LOGGER;
     fs.mkdirSync(this.dataDir, { recursive: true });
 
     const opened = openDatabase(path.join(this.dataDir, 'services.db'), {
@@ -76,10 +90,16 @@ export class ServiceManager {
     this.store = opened;
     opened.migrate();
 
-    // Ensure kolom `config` (aditif, idempotent — bukan penulisan ulang DDL).
+    // Ensure kolom aditif & idempotent (ALTER TABLE, bukan DDL baru):
+    //  - `config`          : JSON config service
+    //  - `start_time_hint` : #30 creation-time proses anak (epoch ms) — dipakai
+    //    isAlive() sebagai guard PID-reuse lintas restart manager.
     const cols = this.store.db.prepare('PRAGMA table_info(services)').all().map((c) => c.name);
     if (!cols.includes('config')) {
       this.store.db.exec('ALTER TABLE services ADD COLUMN config TEXT');
+    }
+    if (!cols.includes('start_time_hint')) {
+      this.store.db.exec('ALTER TABLE services ADD COLUMN start_time_hint INTEGER');
     }
 
     // Validasi project: koneksi read-only sendiri ke projects.db.
@@ -97,11 +117,54 @@ export class ServiceManager {
     // mengganggu lifecycle process (diamkan). Idempotent terhadap stopService
     // (DELETE ports row yang mungkin sudah hilang).
     if (typeof this.processManager.setExitHandler === 'function') {
-      this.processManager.setExitHandler((serviceId) => {
+      this.processManager.setExitHandler((serviceId, exitInfo) => {
         try {
           this.releasePort(serviceId);
         } catch {
           /* DB sudah close / service row sudah dihapus — abaikan */
+        }
+        try {
+          const rec = this.store.db.prepare('SELECT status FROM services WHERE id = ?').get(serviceId);
+          if (rec && rec.status === 'running') {
+            const now = nowIso();
+            const exitCode = exitInfo?.exitCode ?? null;
+            // #32 — reason dari exit-classification ProcessManager (mis.
+            // 'port_taken_at_spawn'); null = crash biasa.
+            const reason = typeof exitInfo?.reason === 'string' ? exitInfo.reason : null;
+            this.store.db
+              .prepare(
+                `UPDATE services
+                 SET status = 'failed', pid = NULL, start_time_hint = NULL,
+                     last_exit_code = ?, updated_at = ?
+                 WHERE id = ? AND status = 'running'`,
+              )
+              .run(exitCode, now, serviceId);
+            try {
+              this.setSupervisorState(serviceId, {
+                state: 'failed',
+                lastEvent: reason ?? 'crashed',
+              });
+            } catch {}
+            this._audit('processCrashed', {
+              actor: 'system',
+              serviceId,
+              result: 'ok',
+              input: {
+                exitCode,
+                signal: exitInfo?.signal ?? null,
+                reason,
+                lifetimeMs: exitInfo?.lifetimeMs ?? null,
+                port: exitInfo?.port ?? null,
+                // Pesan bedakan crash biasa vs port-tabrakan-lekas (§#32).
+                message:
+                  reason === 'port_taken_at_spawn'
+                    ? `service ${serviceId} exit ${exitCode} <5s; port ${exitInfo?.port} masih dipegang proses lain — kemungkinan besar tabrakan port, bukan bug aplikasi`
+                    : `service ${serviceId} crash (exit ${exitCode})`,
+              },
+            });
+          }
+        } catch {
+          /* best-effort exit sync */
         }
       });
     }
@@ -133,6 +196,8 @@ export class ServiceManager {
       type: config.type ?? null,
       status: row.status ?? null,
       pid: row.pid ?? null,
+      /** #30 creation-time proses anak (epoch ms) — guard PID-reuse isAlive(). */
+      startTimeHint: row.start_time_hint ?? null,
       port: row.port ?? null,
       enabled: row.enabled === 1,
       restartCount: row.restart_count ?? 0,
@@ -264,9 +329,27 @@ export class ServiceManager {
     }
     if (Object.keys(clean).length === 0) return rec;
     const merged = { ...(rec.config ?? {}), ...clean };
-    this.store.db
-      .prepare('UPDATE services SET config = ?, updated_at = ? WHERE id = ?')
-      .run(JSON.stringify(merged), nowIso(), serviceId);
+    const newPort = Number.isInteger(Number(clean.port)) && Number(clean.port) > 0 ? Number(clean.port) : null;
+    const now = nowIso();
+    this.store.tx(() => {
+      if (newPort && newPort !== rec.port) {
+        this.store.db
+          .prepare('UPDATE services SET port = ?, config = ?, updated_at = ? WHERE id = ?')
+          .run(newPort, JSON.stringify(merged), now, serviceId);
+        this.store.db.prepare('DELETE FROM ports WHERE service_id = ?').run(serviceId);
+        this.store.db
+          .prepare(
+            `INSERT INTO ports (port, service_id, bound_host, bound_at)
+             VALUES (?, ?, '127.0.0.1', ?)
+             ON CONFLICT(port) DO UPDATE SET service_id = excluded.service_id, bound_at = excluded.bound_at`,
+          )
+          .run(newPort, serviceId, now);
+      } else {
+        this.store.db
+          .prepare('UPDATE services SET config = ?, updated_at = ? WHERE id = ?')
+          .run(JSON.stringify(merged), now, serviceId);
+      }
+    });
     return this.getService(serviceId);
   }
 
@@ -319,7 +402,12 @@ export class ServiceManager {
     }
 
     const serviceLike = this._serviceLike(rec);
-    const canBind = await this.processManager.portBindTest(rec.port);
+    let canBind = await this.processManager.portBindTest(rec.port);
+    if (!canBind) {
+      // Tunggu sebentar (250ms) mengantisipasi socket TIME_WAIT di Windows setelah stop cepat
+      await new Promise((r) => setTimeout(r, 250));
+      canBind = await this.processManager.portBindTest(rec.port);
+    }
     if (!canBind) {
       throw new VmPanelError(PORT_IN_USE, `port sudah terpakai: ${rec.port}`, {
         serviceId,
@@ -330,12 +418,15 @@ export class ServiceManager {
     const adapter = this._resolveAdapter(rec, serviceLike);
     const spec = adapter.startSpec(serviceLike);
 
-    const { pid } = this.processManager.startProcess({
+    const { pid, startTimeHint } = this.processManager.startProcess({
       serviceId,
       argv: spec.argv,
       cwd: spec.cwd,
       env: spec.env ?? {},
       extraEnv: {},
+      // #32 — port ikut dilaporkan ke ProcessManager supaya exit-handler bisa
+      // mengenali pola "gagal segera karena port sudah dipegang pihak lain".
+      port: rec.port ?? null,
     });
 
     const now = nowIso();
@@ -349,10 +440,10 @@ export class ServiceManager {
       });
       this.store.db
         .prepare(
-          `UPDATE services SET status = 'running', pid = ?, started_at = ?, updated_at = ?
+          `UPDATE services SET status = 'running', pid = ?, start_time_hint = ?, started_at = ?, updated_at = ?
            WHERE id = ?`,
         )
-        .run(pid, now, now, serviceId);
+        .run(pid, startTimeHint ?? null, now, now, serviceId);
       this.store.db
         .prepare(
           `INSERT INTO ports (port, service_id, bound_host, bound_at)
@@ -372,12 +463,37 @@ export class ServiceManager {
    */
   async stopService(serviceId, { graceMs = 10000 } = {}) {
     const rec = this.getService(serviceId);
-    await this.processManager.stopProcess({ serviceId, graceMs });
+    // #30 — bawa creation-time yang tercatat supaya ProcessManager bisa menolak
+    // membunuh proses asing bila PID row ini sudah di-reuse.
+    const killRes = await this.processManager.stopProcess({
+      serviceId,
+      graceMs,
+      startTimeHint: rec.startTimeHint ?? null,
+    });
 
+    if (killRes && killRes.stopped === false) {
+      // PID bukan anak kita lagi — setStatus/releasePort punya tx sendiri.
+      this.setStatus(serviceId, 'failed', { pid: null, lastEvent: 'pid_reuse' });
+      try {
+        this.releasePort(serviceId);
+      } catch {
+        /* ports row mungkin sudah hilang */
+      }
+      this._audit('stopService.pid_reuse', {
+        actor: 'system',
+        serviceId,
+        projectId: rec.projectId ?? null,
+        input: { pid: killRes.pid ?? null, reason: killRes.reason ?? 'pid_reuse' },
+        result: 'ok',
+      });
+      return { serviceId, status: 'failed', pidReuse: true };
+    }
     const now = nowIso();
     this.store.tx(() => {
       this.store.db
-        .prepare(`UPDATE services SET status = 'stopped', pid = NULL, updated_at = ? WHERE id = ?`)
+        .prepare(
+          `UPDATE services SET status = 'stopped', pid = NULL, start_time_hint = NULL, updated_at = ? WHERE id = ?`,
+        )
         .run(now, serviceId);
       this.setSupervisorState(serviceId, {
         state: 'stopped_by_user',
@@ -433,6 +549,10 @@ export class ServiceManager {
       });
     }
 
+    if (check.type === 'process' && !check.pid) {
+      check = { ...check, pid: rec.pid || 0 };
+    }
+
     const outcome = await healthManager.runCheck({
       serviceId,
       projectId: rec.projectId,
@@ -460,16 +580,18 @@ export class ServiceManager {
       });
     }
     const existing = this.store.db
-      .prepare('SELECT restart_count FROM service_supervisor_state WHERE service_id = ?')
+      .prepare('SELECT * FROM service_supervisor_state WHERE service_id = ?')
       .get(serviceId);
     const now = nowIso();
     const row = {
       state: patch.state ?? existing?.state ?? 'unknown',
       restart_count: patch.restartCount ?? existing?.restart_count ?? 0,
-      backoff_until: patch.backoffUntil ?? null,
-      crash_loop: (patch.crashLoop ? 1 : 0),
-      consecutive_failures: patch.consecutiveFailures ?? 0,
-      last_event: patch.lastEvent ?? patch.state ?? 'unknown',
+      backoff_until: patch.backoffUntil !== undefined
+        ? (patch.backoffUntil != null ? String(patch.backoffUntil) : null)
+        : (existing?.backoff_until ?? null),
+      crash_loop: patch.crashLoop !== undefined ? (patch.crashLoop ? 1 : 0) : (existing?.crash_loop ?? 0),
+      consecutive_failures: patch.consecutiveFailures ?? existing?.consecutive_failures ?? 0,
+      last_event: patch.lastEvent ?? patch.state ?? existing?.last_event ?? 'unknown',
       updated_at: now,
     };
     this.store.db
@@ -520,6 +642,147 @@ export class ServiceManager {
       lastEvent: row.last_event,
       updatedAt: row.updated_at,
     };
+  }
+
+  /**
+   * Transisi status service eksplisit (#31b). HANYA mengubah baris `services`
+   * (+ sinkron state supervisor) — TIDAK pernah menyentuh proses OS, jadi
+   * aman dipakai rekonsiliasi baris yatim saat start.
+   * @param {string} serviceId
+   * @param {'stopped'|'running'|'failed'|'disabled'} status
+   * @param {{pid?: number|null, lastEvent?: string|null}} [patch]
+   *   `pid` tidak diberikan → kolom pid dibiarkan apa adanya; `null` → dikosongkan.
+   */
+  setStatus(serviceId, status, { pid = undefined, lastEvent = null } = {}) {
+    if (!SERVICE_STATUSES.has(status)) {
+      throw new VmPanelError(VALIDATION, `status service tidak dikenal: ${String(status)}`, {
+        serviceId,
+        status,
+        allowed: [...SERVICE_STATUSES],
+      });
+    }
+    const rec = this.getService(serviceId); // NOT_FOUND + format guard
+    const now = nowIso();
+    const cols = ['status = ?', 'updated_at = ?'];
+    const vals = [status, now];
+    if (pid !== undefined) {
+      cols.push('pid = ?');
+      vals.push(pid == null ? null : Number(pid));
+    }
+    if (status !== 'running') {
+      // #30 — hint creation-time hanya bermakna untuk baris yang benar-benar
+      // berjalan; baris mati/failed wajib bersih agar tidak pernah false-match
+      // ke proses lain yang kebetulan dapat PID yang sama.
+      cols.push('start_time_hint = NULL');
+    }
+    this.store.tx(() => {
+      this.store.db
+        .prepare(`UPDATE services SET ${cols.join(', ')} WHERE id = ?`)
+        .run(...vals, serviceId);
+      this.setSupervisorState(serviceId, {
+        state: status,
+        lastEvent: lastEvent ?? `status:${status}`,
+      });
+    });
+    return this.getService(serviceId) ?? rec;
+  }
+
+  /**
+   * #31b — Rekonsiliasi baris `running` yatim saat manager start (SEBELUM
+   * supervisor auto-start). Manager crash/restart meninggalkan baris status
+   * 'running' padahal prosesnya sudah mati → auto-start supervisor akan
+   * menganggapnya hidup sampai tick pertama.
+   *
+   * Aturan:
+   *  - PID mati / tidak ada → setStatus('failed', pid: null) + audit event
+   *    `service.reconciled_dead`. TIDAK ada kill proses, TIDAK ada hapus
+   *    ports row (masih bisa di-bind ulang / dipakai proses yatim).
+   *  - PID hidup tapi TIDAK dikenal registry ProcessManager proses ini
+   *    (proses yatim dari daemon lama) → DIBIARKAN + log warning.
+   *  - PID hidup dan dikenal → dibiarkan (supervisor lanjut mengawasi).
+   * @returns {Promise<{checked: number, reconciled: object[], orphans: object[]}>}
+   */
+  async reconcileStaleRunning() {
+    const rows = this.store.db
+      .prepare(`SELECT * FROM services WHERE status = 'running'`)
+      .all();
+    const knownPids = new Map();
+    try {
+      for (const p of this.processManager?.listProcesses?.() ?? []) {
+        if (Number.isInteger(p.pid)) knownPids.set(p.serviceId, p.pid);
+      }
+    } catch {
+      /* processManager tanpa listProcesses → dianggap tidak ada yang dikenal */
+    }
+    const reconciled = [];
+    const orphans = [];
+    for (const row of rows) {
+      const pid = Number.isInteger(row.pid) && row.pid > 0 ? row.pid : null;
+      const hint = Number.isInteger(row.start_time_hint) ? row.start_time_hint : null;
+      let alive = false;
+      if (pid != null) {
+        try {
+          alive = (await this.processManager.isAlive(pid, hint)) === true;
+        } catch (e) {
+          this.logger.warn('service.reconcile.isalive_error', {
+            serviceId: row.id,
+            pid,
+            reason: String(e?.message ?? e),
+          });
+          alive = false;
+        }
+      }
+      if (alive) {
+        if (knownPids.get(row.id) !== pid) {
+          orphans.push({ serviceId: row.id, pid });
+          this.logger.warn('service.reconcile.orphan_alive', {
+            serviceId: row.id,
+            pid,
+            hint,
+            note: 'PID hidup tapi tidak dikenal proses manager ini — dibiarkan, tidak di-kill',
+          });
+        }
+        continue;
+      }
+      // Mati (atau PID hilang) → tandai failed. Tidak pernah kill, tidak
+      // pernah hapus ports row.
+      try {
+        this.setStatus(row.id, 'failed', {
+          pid: null,
+          lastEvent: 'reconciled_dead',
+        });
+      } catch (e) {
+        this.logger.warn('service.reconcile.setStatus_failed', {
+          serviceId: row.id,
+          reason: String(e?.message ?? e),
+        });
+        continue;
+      }
+      reconciled.push({ serviceId: row.id, pid, port: row.port ?? null });
+      this._audit('service.reconciled_dead', {
+        actor: 'system',
+        serviceId: row.id,
+        projectId: row.project_id ?? null,
+        port: row.port ?? null,
+        statusBefore: 'running',
+        statusAfter: 'failed',
+        result: 'ok',
+        input: {
+          pid,
+          start_time_hint: hint,
+          reason: pid == null ? 'pid_missing' : 'pid_not_alive',
+        },
+      });
+      this.logger.warn('service.reconciled_dead', { serviceId: row.id, pid, port: row.port ?? null });
+    }
+    if (reconciled.length > 0 || orphans.length > 0) {
+      this.logger.info('service.reconcile.summary', {
+        checked: rows.length,
+        reconciled: reconciled.length,
+        orphanAlive: orphans.length,
+      });
+    }
+    return { checked: rows.length, reconciled, orphans };
   }
 
   /** enable: enabled=1, status kembali 'stopped'. */

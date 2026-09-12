@@ -1,10 +1,10 @@
 // tests/unit/db.test.js — open/migrate/integrity/vacuumInto/preflight/tx (node:test)
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync, copyFileSync, unlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync, copyFileSync, unlinkSync, utimesSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDatabase, preflightCheck } from '../../lib/db.js';
+import { openDatabase, preflightCheck, sweepOrphanTmpFiles } from '../../lib/db.js';
 import { SCHEMAS, SCHEMA_NAMES } from '../../lib/schema.js';
 
 const tmpRoot = join(tmpdir(), 'vmpanel-db-test');
@@ -157,7 +157,7 @@ describe('preflight — refuse-start & WAL yatim', () => {
     );
   });
 
-  test('WAL yatim: salin -wal + hapus -shm → buka ulang tetap sukses', () => {
+  test('WAL yatim: checkpoint probe SUKSES → recovered, TANPA salinan .tmp tersisa', () => {
     const p = join(dir, 'locks.db');
     // 1) buka, tulis data (masih di -wal, belum di-checkpoint);
     //    snapshot kondisi pre-close SAAT koneksi terbuka, lalu close
@@ -189,7 +189,13 @@ describe('preflight — refuse-start & WAL yatim', () => {
     const h2 = openDatabase(p, { schemaName: 'locks' });
     try {
       assert.equal(h2.preflight.walOrphanRecovered, true);
-      assert.ok(h2.preflight.backupsMade.length >= 1, 'salinan .tmp dibuat');
+      // F2: checkpoint sukses → TIDAK ada salinan .tmp (tidak bocor jadi yatim)
+      assert.equal(h2.preflight.backupsMade.length, 0, 'checkpoint sukses → tanpa salinan');
+      assert.equal(
+        readdirSync(dir).some((n) => /\.(db|db-wal|db-shm)\.tmp-\d+$/.test(n)),
+        false,
+        'tidak boleh ada artefak .tmp-* di direktori',
+      );
       h2.migrate();
       const row = h2.db
         .prepare("SELECT holder FROM lock_registry WHERE name='backup'")
@@ -200,6 +206,64 @@ describe('preflight — refuse-start & WAL yatim', () => {
     } finally {
       h2.close();
     }
+  });
+
+  test('F2: WAL dengan writer aktif (probe BUSY) → salinan .tmp DIBUAT sebagai recovery point', async () => {
+    const { default: Database } = await import('better-sqlite3');
+    const p = join(dir, 'busy.db');
+    // writer TERBUKA memegang transaksi → checkpoint TRUNCATE probe gagal BUSY.
+    const writer = new Database(p);
+    writer.pragma('journal_mode = WAL');
+    writer.exec('CREATE TABLE t (x)');
+    writer.exec('INSERT INTO t VALUES (1)');
+    assert.ok(existsSync(p + '-wal'), '-wal aktif ada');
+    writer.exec('BEGIN IMMEDIATE');
+    writer.exec('INSERT INTO t VALUES (2)');
+    const res = preflightCheck(p);
+    try {
+      writer.exec('ROLLBACK');
+    } catch {}
+    assert.equal(res.walOrphanRecovered, false, 'BUSY → tidak dianggap recovered');
+    assert.equal(res.walBusy, true, 'BUSY terdeteksi eksplisit');
+    assert.ok(res.backupsMade.length >= 1, 'BUSY → salinan .tmp dibuat');
+    assert.ok(
+      res.backupsMade.every((f) => existsSync(f)),
+      'salinan BUSY tetap ada di disk (recovery point)',
+    );
+    assert.ok(existsSync(p + '-wal'), 'JANGAN hapus -wal aktif');
+    writer.close();
+  });
+
+  test('F2: sweepOrphanTmpFiles → hanya pola .tmp-<digits> tua (age>1h) dihapus', () => {
+    const d = mkdtempSync(join(dir, 'sweep-'));
+    const old = Date.now() / 1000 - 7200; // 2 jam lalu
+    const fresh = Date.now() / 1000 - 60; // 1 menit lalu
+    const mk = (name, age) => {
+      const fp = join(d, name);
+      writeFileSync(fp, 'x');
+      utimesSync(fp, age, age);
+      return fp;
+    };
+    mk('a.db.tmp-1000', old); // tua → hapus
+    mk('b.db-wal.tmp-2000', old); // tua → hapus
+    mk('c.db-shm.tmp-3000', old); // tua → hapus
+    mk('d.db.tmp-4000', fresh); // baru → JANGAN hapus
+    mk('e.db.tmp-notanumber', old); // pola salah → JANGAN hapus
+    mk('f.db.bak', old); // pola lain → JANGAN hapus
+    writeFileSync(join(d, 'live.db-wal'), 'wal'); // -wal aktif → JANGAN hapus
+    writeFileSync(join(d, 'live.db'), 'db'); // db → JANGAN hapus
+    const removed = sweepOrphanTmpFiles(d);
+    const names = readdirSync(d).sort();
+    assert.equal(existsSync(join(d, 'a.db.tmp-1000')), false);
+    assert.equal(existsSync(join(d, 'b.db-wal.tmp-2000')), false);
+    assert.equal(existsSync(join(d, 'c.db-shm.tmp-3000')), false);
+    assert.ok(existsSync(join(d, 'd.db.tmp-4000')), 'salinan muda (<1h) utuh');
+    assert.ok(existsSync(join(d, 'e.db.tmp-notanumber')), 'non-digit suffix utuh');
+    assert.ok(existsSync(join(d, 'f.db.bak')), 'pola lain utuh');
+    assert.ok(existsSync(join(d, 'live.db-wal')), '-wal aktif utuh');
+    assert.ok(existsSync(join(d, 'live.db')), 'db utuh');
+    assert.equal(removed.length, 3);
+    assert.ok(names.includes('d.db.tmp-4000'));
   });
 
   test('DB baru (file tidak ada) → preflight ok, walOrphanRecovered false', () => {

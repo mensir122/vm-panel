@@ -1,38 +1,42 @@
 <!doctype html>
 <!--
-  VPANEL template: login.html
-  Pre-auth page. Centered card on near-black; no sidebar, no nav.
-
-  VARS (written as [key|raw] here to avoid template substitution
-  inside this comment; the real placeholders use double braces):
-
-    [banner|raw]  optional system banner. Fragment of one or more
-                  div.alert.alert--info|--warn|--error elements, or
-                  empty string.
-    [flash|raw]   one-shot session flash (e.g. "Signed out.").
-                  Same fragment shape as banner, or empty string.
-    [error|raw]   login failure box. Expected:
-                  <div class="alert alert--error" role="alert">...</div>
-                  or empty string.
-
-  Intentionally NOT used on this page: [nav|raw] and [user] — the
-  operator has no session yet. The server may pass empty strings.
-
-  Static form posts to /login. Adjust action/name attrs if the
-  server routes differ. Password/TOTP handling is server-side.
+  ORIONT · VPANEL template: login.html
+  Pre-auth page. Centered luxury card on obsidian canvas.
 -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Sign in — VPANEL</title>
+  <title>Sign in — ORIONT · VPANEL</title>
   <link rel="stylesheet" href="/static/panel.css">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%23ffffff' stroke-width='2.5'/%3E%3C/svg%3E">
 </head>
 <body class="auth">
+  <div id="desktop-titlebar" class="desktop-titlebar" style="display: none;">
+    <div class="desktop-titlebar__brand">
+      <img src="/static/oriont-logo.png" alt="ORIONT" width="16" height="16" style="object-fit: contain;">
+      <span class="desktop-titlebar__pulse"></span>
+      <span>ORIONT · VPANEL</span>
+      <span class="desktop-titlebar__tag">24/7 ACTIVE</span>
+    </div>
+    <div class="desktop-titlebar__center">
+      <span class="desktop-titlebar__center-title">OPERATOR LOGIN</span>
+    </div>
+    <div class="desktop-titlebar__controls">
+      <button type="button" class="desktop-titlebar__btn" id="titlebar-min" title="Minimize">
+        <svg width="10" height="2" viewBox="0 0 10 2" fill="currentColor"><rect width="10" height="2" rx="1"/></svg>
+      </button>
+      <button type="button" class="desktop-titlebar__btn" id="titlebar-max" title="Maximize / Restore">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="8" height="8" rx="1.5"/></svg>
+      </button>
+      <button type="button" class="desktop-titlebar__btn desktop-titlebar__btn--close" id="titlebar-close" title="Tutup ke Tray">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg>
+      </button>
+    </div>
+  </div>
   <main class="auth__wrap">
-    <h1 class="sr-only">Sign in to VPANEL</h1>
+    <h1 class="sr-only">Sign in to ORIONT · VPANEL</h1>
 
     <div class="notices auth__notices">
       {{banner|raw}}
@@ -41,8 +45,9 @@
 
     <section class="auth__card">
       <div class="auth__brand">
-        <span class="brand__mark">VPANEL</span>
-        <span class="auth__brand-sub">VM deployment manager — operator sign-in</span>
+        <img src="/static/oriont-logo.png" alt="ORIONT" class="auth__logo-img" width="48" height="48" style="margin: 0 auto 6px auto; object-fit: contain;">
+        <span class="brand__mark">ORIONT</span>
+        <span class="auth__brand-sub">Autonomous Host Telemetry & 24/7 Cloud Orchestrator</span>
       </div>
 
       {{error|raw}}
@@ -76,7 +81,7 @@
     </section>
 
     <footer class="auth__foot">
-      <span class="mono">VPANEL</span>
+      <span class="mono">ORIONT · VPANEL</span>
       <span>Unauthorized access is prohibited. All sign-in attempts are logged.</span>
     </footer>
   </main>

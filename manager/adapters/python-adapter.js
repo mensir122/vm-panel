@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
-import { VmPanelError, VALIDATION } from '../../lib/errors.js';
+import { VmPanelError, VALIDATION, NOT_FOUND } from '../../lib/errors.js';
 import { BaseAdapter } from './base.js';
 
 const OUTPUT_LIMIT = 4 * 1024; // output clamp 4KB
@@ -72,15 +72,22 @@ export class PythonAdapter extends BaseAdapter {
       /* lanjut cek entry */
     }
     const cfg = this.config ?? {};
-    const candidates = ['main.py', 'app.py'];
+    const candidates = ['main.py', 'bot.py', 'app.py', 'server.py', 'telegram_bot.py', 'run.py', 'start.py', 'gateway.py', 'hermes.py', 'agent.py', 'index.py'];
     if (typeof cfg.main === 'string' && cfg.main.trim() !== '') candidates.push(cfg.main);
-    return candidates.some((rel) => {
+    if (candidates.some((rel) => {
       try {
         return fs.statSync(path.join(ws, rel)).isFile();
       } catch {
         return false;
       }
-    });
+    })) {
+      return true;
+    }
+    try {
+      return fs.readdirSync(ws).some((f) => f.endsWith('.py'));
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -143,7 +150,22 @@ export class PythonAdapter extends BaseAdapter {
     }
 
     // Fase 2: pip install -r requirements.txt (skip bila tidak ada).
-    const reqPath = path.join(workspace, 'requirements.txt');
+    let reqPath = path.join(workspace, 'requirements.txt');
+    if (!fs.existsSync(reqPath)) {
+      try {
+        const ignored = new Set(['.git', '.venv', 'venv', 'node_modules', '__pycache__']);
+        const entries = fs.readdirSync(workspace, { withFileTypes: true });
+        for (const ent of entries) {
+          if (ent.isDirectory() && !ignored.has(ent.name)) {
+            const candidate = path.join(workspace, ent.name, 'requirements.txt');
+            if (fs.existsSync(candidate)) {
+              reqPath = candidate;
+              break;
+            }
+          }
+        }
+      } catch {}
+    }
     if (fs.existsSync(reqPath)) {
       const venvPip = this.venvPipPath(workspace);
       steps.push(`pip:${venvPip}`);
@@ -155,6 +177,46 @@ export class PythonAdapter extends BaseAdapter {
       } catch (e) {
         outputs.push(String(e?.stdout ?? ''), String(e?.stderr ?? ''), String(e?.message ?? ''));
         return { ok: false, steps, output: clampOutput(outputs.join('\n')) };
+      }
+    } else {
+      // Cek apakah ada pyproject.toml atau setup.py (di root atau subfolder)
+      let projectDir = null;
+      if (fs.existsSync(path.join(workspace, 'pyproject.toml')) || fs.existsSync(path.join(workspace, 'setup.py'))) {
+        projectDir = workspace;
+      } else {
+        try {
+          const ignored = new Set(['.git', '.venv', 'venv', 'node_modules', '__pycache__']);
+          const entries = fs.readdirSync(workspace, { withFileTypes: true });
+          for (const ent of entries) {
+            if (ent.isDirectory() && !ignored.has(ent.name)) {
+              const sub = path.join(workspace, ent.name);
+              if (fs.existsSync(path.join(sub, 'pyproject.toml')) || fs.existsSync(path.join(sub, 'setup.py'))) {
+                projectDir = sub;
+                break;
+              }
+            }
+          }
+        } catch {}
+      }
+      if (projectDir) {
+        const venvPip = this.venvPipPath(workspace);
+        steps.push(`pip:${venvPip}`);
+        const relTarget = path.relative(workspace, projectDir) || '.';
+        try {
+          const { stdout, stderr } = await runExecFile(
+            ef, venvPip, ['install', '-e', relTarget], opts,
+          );
+          outputs.push(String(stdout), String(stderr));
+        } catch (e) {
+          try {
+            const { stdout, stderr } = await runExecFile(
+              ef, venvPip, ['install', relTarget], opts,
+            );
+            outputs.push(String(stdout), String(stderr));
+          } catch (e2) {
+            outputs.push(String(e2?.stdout ?? ''), String(e2?.stderr ?? ''), String(e2?.message ?? ''));
+          }
+        }
       }
     }
 
@@ -173,10 +235,18 @@ export class PythonAdapter extends BaseAdapter {
       throw new VmPanelError(VALIDATION, 'python adapter requires config.main', { workspacePath: workspace });
     }
     const port = this.requirePort(service);
+    const mainPath = path.resolve(workspace, main);
+    const mainDir = path.dirname(mainPath);
+    const env = { PORT: String(port) };
+    if (mainDir !== path.resolve(workspace)) {
+      env.PYTHONPATH = `${mainDir}${path.delimiter}${workspace}`;
+    }
+    const venvPy = this.venvPythonPath(workspace);
+    const pythonExec = cfg.useSystemPython ? this.pythonBin(cfg) : venvPy;
     return {
-      argv: [this.venvPythonPath(workspace), path.resolve(workspace, main)],
+      argv: [pythonExec, mainPath],
       cwd: workspace,
-      env: { PORT: String(port) },
+      env,
       port,
     };
   }

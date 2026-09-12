@@ -1,0 +1,21 @@
+# VM-Panel Source Bridges Security Filter
+# Mencegah file kredensial / rahasia ter-commit ke GitHub saat bridging proyek lokal
+.env*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.pkcs12
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*credential*.json
+*secret*.json
+service-account*.json
+token.json
+node_modules/
+.venv/
+venv/
+__pycache__/

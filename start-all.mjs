@@ -12,6 +12,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+
+try {
+  const envPath = path.join(ROOT, '.env');
+  if (fs.existsSync(envPath) && typeof process.loadEnvFile === 'function') {
+    process.loadEnvFile(envPath);
+  }
+} catch {}
+
 const MPORT = Number(process.env.MANAGER_API_PORT || 8097);
 const PPORT = Number(process.env.PANEL_PORT || 8080);
 const TOKEN_FILE = path.join(ROOT, 'runtime', 'sockets', 'cli-token');

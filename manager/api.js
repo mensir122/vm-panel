@@ -9,7 +9,7 @@
 
 import http from 'node:http';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { VmPanelError, PERMISSION_DENIED, NOT_FOUND, VALIDATION } from '../lib/errors.js';
+import { VmPanelError, PERMISSION_DENIED, NOT_FOUND, VALIDATION, LOCK_HELD, DEPLOY_IN_PROGRESS, BACKUP_IN_PROGRESS } from '../lib/errors.js';
 
 const MAX_BODY_BYTES = 1024 * 1024; // 1MB
 const RATE_LIMIT_MAX = 60; // req per window
@@ -20,6 +20,10 @@ const STATUS_MAP = Object.freeze({
   [NOT_FOUND]: 404,
   [VALIDATION]: 400,
   NOT_READY: 503, // modul data belum aktif (F4 data routes)
+  // Gate-2 (warisan M-A2/M-B): lock sibuk / operasi berjalankan ≠ 500.
+  [LOCK_HELD]: 409,
+  [DEPLOY_IN_PROGRESS]: 409,
+  [BACKUP_IN_PROGRESS]: 409,
 });
 
 /**

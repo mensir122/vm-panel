@@ -164,7 +164,7 @@ test('verifyBackup tamper: modifikasi 1 byte file .gz → verification failed', 
   assert.equal(row.verification_status, 'failed');
 });
 
-test('rate-limit: scheduled kedua < 30 menit → BACKUP_IN_PROGRESS, manual tetap boleh', async (t) => {
+test('rate-limit F11: hanya scheduled yang dibatasi; manual & pre-shutdown bypass', async (t) => {
   const sandbox = makeSandbox(t);
   const { bm } = makeManagers(sandbox);
   t.after(() => bm.close());
@@ -176,10 +176,10 @@ test('rate-limit: scheduled kedua < 30 menit → BACKUP_IN_PROGRESS, manual teta
   );
   const res = await bm.createBackup({ trigger: 'manual', retentionClass: 'manual' });
   assert.ok(res.backupId.startsWith('bak_'), 'manual selalu boleh');
-  await assert.rejects(
-    () => bm.createBackup({ trigger: 'pre-shutdown', retentionClass: 'latest' }),
-    (e) => e instanceof VmPanelError && e.code === BACKUP_IN_PROGRESS,
-  );
+  // F11: pre-shutdown = snapshot pengaman sebelum mati — TIDAK boleh lagi
+  // diblok rate-limit (dulu ditolak; sekarang wajib lolos).
+  const resPs = await bm.createBackup({ trigger: 'pre-shutdown', retentionClass: 'latest' });
+  assert.ok(resPs.backupId.startsWith('bak_'), 'pre-shutdown bypass rate-limit');
 });
 
 test('retention: 5 backup latest → tinggal 3 terbaru, manual tidak tersentuh, retention_runs tercatat', async (t) => {

@@ -20,7 +20,14 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { VmPanelError, NOT_FOUND, VALIDATION } from '../lib/errors.js';
+import {
+  VmPanelError,
+  NOT_FOUND,
+  VALIDATION,
+  PERMISSION_DENIED,
+  LOCK_HELD,
+} from '../lib/errors.js';
+import { withLock } from '../lib/lock.js';
 
 /** Jumlah baris tail untuk GET /logs/:serviceId (desain: 200 baris). */
 const LOG_TAIL_LINES = 200;
@@ -319,17 +326,46 @@ export function registerDataRoutes({ manager } = {}) {
     throw new VmPanelError(VALIDATION, 'registerDataRoutes: manager wajib');
   }
 
-  /** Aksi service lifecycle + audit actor (dipanggil via POST /services/:id/<action>). */
+  /**
+   * Aksi service lifecycle + audit actor (dipanggil via POST /services/:id/<action>).
+   * - Permission PER-VERB sesuai matriks §11.2 (service.start/stop/restart
+   *   adalah tiga aksi berbeda — dulu ketiganya dicek 'service.start').
+   * - Lock LEVEL ROUTE `svc-<id>` (nama sama dengan supervisor _handleDead →
+   *   saling-eksklusi terhadap restart otomatis). maxWait 2 detik; masih
+   *   dipegang → LOCK_HELD pesan jelas. DILARANG lock di service_manager
+   *   (supervisor sudah pegang lock yang sama → deadlock re-entrant).
+   */
   const serviceAction = (action) => ({
     method: 'POST',
     pattern: `/services/:id/${action}`,
-    permission: 'service.start',
+    permission: `service.${action}`,
     handler: async ({ params, user }) => {
       const sm = requireMod(manager.serviceManager);
+      const id = assertSafeId(params.id, 'serviceId');
+      const lockDir = manager.rootDir
+        ? path.join(manager.rootDir, 'runtime', 'locks')
+        : undefined;
       let result;
-      if (action === 'start') result = await sm.startService(params.id);
-      else if (action === 'stop') result = await sm.stopService(params.id);
-      else result = await sm.restartService(params.id);
+      try {
+        result = await withLock(
+          `svc-${id}`,
+          { dir: lockDir, ttlMs: 30_000, maxWaitMs: 2_000 },
+          async () => {
+            if (action === 'start') return sm.startService(id);
+            if (action === 'stop') return sm.stopService(id);
+            return sm.restartService(id);
+          },
+        );
+      } catch (e) {
+        if (e && e.code === LOCK_HELD) {
+          throw new VmPanelError(
+            LOCK_HELD,
+            `aksi '${action}' untuk service '${id}' tidak bisa dimulai — service sedang diproses aksi/recovery lain, coba lagi dalam beberapa detik`,
+            { serviceId: id, action },
+          );
+        }
+        throw e;
+      }
       // Audit actor eksplisit (ServiceManager._audit tidak membawa actor).
       try {
         manager.auditManager?.append?.({
@@ -351,9 +387,11 @@ export function registerDataRoutes({ manager } = {}) {
       method: 'GET',
       pattern: '/services',
       permission: 'service.health.view',
-      handler: () => {
+      handler: ({ url }) => {
         const sm = requireMod(manager.serviceManager);
-        return { rows: sm.listServices() };
+        const projectId = url?.searchParams?.get('projectId') || null;
+        const status = url?.searchParams?.get('status') || null;
+        return { rows: sm.listServices({ projectId, status }) };
       },
     },
     {
@@ -509,12 +547,35 @@ export function registerDataRoutes({ manager } = {}) {
         if (body?.port !== undefined && body?.port !== null && body?.port !== '') {
           input.port = Number(body.port);
         }
+        if (body?.healthCheck !== undefined) {
+          input.healthCheck = body.healthCheck;
+        }
+        if (body?.startCmd !== undefined) input.startCmd = body.startCmd;
+        if (body?.start_cmd !== undefined) input.startCmd = body.start_cmd;
         // Kelola project via UI: repo_url + git_branch opsional (kolom
         // projects.repo_url/branch SUDAH ada di lib/schema.js — tidak perlu ALTER).
         const repoUrl = parseRepoUrlInput(body?.repo_url);
         if (repoUrl !== null) input.repoUrl = repoUrl;
         input.branch = parseGitBranchInput(body?.git_branch);
         return pm.createProject(input);
+      },
+    },
+    {
+      method: 'PATCH',
+      pattern: '/projects/:id',
+      permission: 'project.create',
+      handler: ({ params, body }) => {
+        const pm = requireMod(manager.projectManager);
+        const patch = {};
+        if (body?.port !== undefined && body?.port !== null && body?.port !== '') {
+          patch.port = Number(body.port);
+        }
+        if (body?.restartPolicy !== undefined) patch.restartPolicy = body.restartPolicy;
+        if (body?.healthCheck !== undefined) patch.healthCheck = body.healthCheck;
+        if (body?.branch !== undefined) patch.branch = body.branch;
+        if (body?.startCmd !== undefined) patch.startCmd = body.startCmd;
+        if (body?.start_cmd !== undefined) patch.startCmd = body.start_cmd;
+        return pm.updateProject(params.id, patch);
       },
     },
     {
@@ -538,6 +599,109 @@ export function registerDataRoutes({ manager } = {}) {
         }
         // Sinkron: tunggu pipeline selesai (sukses/gagal) → hasil dikirim.
         return dm.deploy({ projectId: params.id, source, actor: user ?? 'system' });
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/remove-request',
+      permission: 'project.create',
+      handler: ({ params }) => {
+        const pm = requireMod(manager.projectManager);
+        const project = pm.getProject(params.id);
+        // F1(c): brankas token dua-fase WAJIB aktif — tidak ada lagi fallback
+        // randomToken lokal (token tak terverifikasi = konfirmasi palsu).
+        if (
+          !manager.secretManager ||
+          typeof manager.secretManager.issueConfirmToken !== 'function'
+        ) {
+          throw new VmPanelError(
+            'NOT_READY',
+            'modul secret belum aktif — token konfirmasi dua-fase tidak bisa diterbitkan',
+          );
+        }
+        const res = manager.secretManager.issueConfirmToken('project', params.id);
+        return {
+          confirmToken: res.confirmToken,
+          expiresAt: res.expiresAt,
+          id: project.id,
+          name: project.name,
+        };
+      },
+    },
+    {
+      method: 'POST',
+      pattern: '/projects/:id/remove',
+      permission: 'project.create',
+      handler: async ({ params, body, user }) => {
+        if (!body?.confirmToken) {
+          throw new VmPanelError(PERMISSION_DENIED, 'confirmToken wajib diisi (fase 1 remove-request dulu)');
+        }
+        // F1(a): token dikonsumsi NYATA — gagal consume (tak dikenal/expired/
+        // salah target) = PERMISSION_DENIED (403), TIDAK boleh "or proceed".
+        if (
+          !manager.secretManager ||
+          typeof manager.secretManager.consumeConfirmToken !== 'function'
+        ) {
+          throw new VmPanelError(
+            'NOT_READY',
+            'modul secret belum aktif — konfirmasi dua-fase tidak bisa diverifikasi',
+          );
+        }
+        try {
+          manager.secretManager.consumeConfirmToken(body.confirmToken, 'project', params.id);
+        } catch (e) {
+          throw new VmPanelError(
+            PERMISSION_DENIED,
+            `konfirmasi dua-fase gagal: ${String(e?.message ?? 'token tidak valid')}`,
+            { projectId: params.id },
+          );
+        }
+        return await manager.purgeProject(params.id, {
+          confirmToken: body.confirmToken,
+          actor: user ?? 'user',
+        });
+      },
+    },
+    {
+      method: 'DELETE',
+      pattern: '/projects/:id',
+      permission: 'project.create',
+      handler: async ({ params, body, user }) => {
+        // F1(b): DELETE langsung (dipakai panel) TIDAK lagi bypass dua-fase —
+        // wajib body.confirmToken valid milik project ini; tanpa itu → 403.
+        if (!body?.confirmToken) {
+          throw new VmPanelError(
+            PERMISSION_DENIED,
+            'confirmToken wajib diisi (minta via POST /projects/:id/remove-request dulu)',
+          );
+        }
+        if (
+          !manager.secretManager ||
+          typeof manager.secretManager.consumeConfirmToken !== 'function'
+        ) {
+          throw new VmPanelError(
+            'NOT_READY',
+            'modul secret belum aktif — konfirmasi dua-fase tidak bisa diverifikasi',
+          );
+        }
+        try {
+          manager.secretManager.consumeConfirmToken(body.confirmToken, 'project', params.id);
+        } catch (e) {
+          throw new VmPanelError(
+            PERMISSION_DENIED,
+            `konfirmasi dua-fase gagal: ${String(e?.message ?? 'token tidak valid')}`,
+            { projectId: params.id },
+          );
+        }
+        if (typeof manager.purgeProject === 'function') {
+          return await manager.purgeProject(params.id, {
+            confirmToken: body.confirmToken,
+            actor: user ?? 'user',
+          });
+        }
+        const pm = requireMod(manager.projectManager);
+        const tok = 'PURGE_CONFIRMED';
+        return pm.removeProject(params.id, { confirmToken: tok, expectedToken: tok });
       },
     },
 

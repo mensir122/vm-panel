@@ -413,4 +413,77 @@ describe('projects-ui (kelola project via web)', () => {
       assert.ok(text.includes('alert--error'), 'alert error tampil');
     }
   });
+
+  test('(9) POST /projects/:id/delete → dua-fase server-side (A2#13) lalu bersih', async () => {
+    // 1. Buat project dummy baru
+    const prjName = `del-${Math.random().toString(36).slice(2, 8)}`;
+    const createRes = await req(ctx.port, 'POST', '/projects', {
+      jar: ctx.ownerJar,
+      headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
+      body: form({ name: prjName, type: 'static', port: '21099' }),
+    });
+    assert.equal(createRes.status, 302);
+    const targetPrj = ctx.manager.projectManager.listProjects().find((p) => p.name === prjName);
+    assert.ok(targetPrj, 'project berhasil dibuat');
+    assert.ok(targetPrj.workspacePath, 'workspace path ada');
+
+    const delUrl = `/projects/${targetPrj.id}/delete`;
+
+    // 2a. FASE 1 — POST tanpa confirmToken → halaman konfirmasi (200);
+    //     TIDAK boleh ada penghapusan pada request ini.
+    const confirmRes = await req(ctx.port, 'POST', delUrl, {
+      jar: ctx.ownerJar,
+      headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
+      body: form({}),
+    });
+    assert.equal(confirmRes.status, 200, 'fase 1 → halaman konfirmasi 200');
+    const confirmHtml = await confirmRes.text();
+    const tokMatch = confirmHtml.match(/name="confirmToken" value="([0-9a-f]+)"/);
+    assert.ok(tokMatch, 'token konfirmasi ada di halaman konfirmasi');
+    assert.ok(confirmHtml.includes('name="_csrf"'), 'form konfirmasi membawa CSRF');
+    assert.ok(
+      ctx.manager.projectManager.listProjects().some((p) => p.id === targetPrj.id),
+      'fase 1 tidak menghapus apa pun',
+    );
+
+    // 2b. Token salah → 403, project tetap utuh.
+    const badRes = await req(ctx.port, 'POST', delUrl, {
+      jar: ctx.ownerJar,
+      headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
+      body: form({ confirmToken: 'f'.repeat(64) }),
+    });
+    assert.equal(badRes.status, 403, 'token salah → 403');
+    await badRes.text();
+    assert.ok(
+      ctx.manager.projectManager.listProjects().some((p) => p.id === targetPrj.id),
+      'token salah tidak menghapus',
+    );
+
+    // 2c. FASE 2 — token cocok → eksekusi.
+    const delRes = await req(ctx.port, 'POST', delUrl, {
+      jar: ctx.ownerJar,
+      headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
+      body: form({ confirmToken: tokMatch[1] }),
+    });
+    assert.equal(delRes.status, 302);
+    assert.equal(delRes.headers.get('location'), '/projects');
+    await delRes.text();
+
+    // 3. Verifikasi project sudah hilang dari database
+    const found = ctx.manager.projectManager.listProjects().find((p) => p.id === targetPrj.id);
+    assert.equal(found, undefined, 'project harus hilang dari list');
+
+    // 4. Verifikasi workspace folder fisik sudah hilang dari filesystem
+    const { existsSync } = await import('node:fs');
+    assert.equal(existsSync(targetPrj.workspacePath), false, 'workspace folder fisik harus terhapus bersih');
+
+    // 5. Token sekali pakai → use ulang setelah sukses = 403 (bukan eksekusi ulang).
+    const reuseRes = await req(ctx.port, 'POST', delUrl, {
+      jar: ctx.ownerJar,
+      headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
+      body: form({ confirmToken: tokMatch[1] }),
+    });
+    assert.equal(reuseRes.status, 403, 'token sekali pakai — use ulang ditolak');
+    await reuseRes.text();
+  });
 });

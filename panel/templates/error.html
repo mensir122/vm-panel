@@ -31,6 +31,27 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
 </head>
 <body>
+  <div id="desktop-titlebar" class="desktop-titlebar" style="display: none;">
+    <div class="desktop-titlebar__brand">
+      <span class="desktop-titlebar__pulse"></span>
+      <span>VM-PANEL DESKTOP</span>
+      <span class="desktop-titlebar__tag">24/7 ACTIVE</span>
+    </div>
+    <div class="desktop-titlebar__center">
+      <span class="desktop-titlebar__center-title">SYSTEM ALERT</span>
+    </div>
+    <div class="desktop-titlebar__controls">
+      <button type="button" class="desktop-titlebar__btn" id="titlebar-min" title="Minimize">
+        <svg width="10" height="2" viewBox="0 0 10 2" fill="currentColor"><rect width="10" height="2" rx="1"/></svg>
+      </button>
+      <button type="button" class="desktop-titlebar__btn" id="titlebar-max" title="Maximize / Restore">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="8" height="8" rx="1.5"/></svg>
+      </button>
+      <button type="button" class="desktop-titlebar__btn desktop-titlebar__btn--close" id="titlebar-close" title="Tutup ke Tray">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg>
+      </button>
+    </div>
+  </div>
   <main class="auth__wrap">
     <h1 class="sr-only">Error</h1>
 

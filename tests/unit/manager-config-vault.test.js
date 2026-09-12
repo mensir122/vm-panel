@@ -8,8 +8,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Manager } from '../../manager/index.js';
 import { ManagerClient } from '../../lib/api-client.js';
+import { SecretManager } from '../../manager/secret_manager/index.js';
 
-const PID = 'prj_test_koper';
+// F4: projectId kini divalidasi isValidId('prj_') SEBELUM path.join —
+// fixture wajib format kanonik Crockford base32 (10 char, tanpa I/L/O/U).
+const PID = 'prj_TESTKP3R01';
 
 function randomHighPort() {
   return 20000 + Math.floor(Math.random() * 10000);
@@ -175,5 +178,82 @@ describe('Manager API — Config & Brankas Endpoints', () => {
 
     const check = await client.request('GET', `/projects/${PID}/hook`);
     assert.equal(check.hook, null);
+  });
+
+  // ── Regresi F4 (bug-hunt god-mode lane M-A) ─────────────────────────────
+
+  test('15. F4: setSecret memakai signature kanonik vault.set(name,value,opts)', async () => {
+    const sm = manager.secretManager;
+    const res = sm.setSecret({ name: 'tg_bot_token', value: 'super-secret-123' });
+    assert.equal(res.name, 'tg_bot_token');
+    const list = sm.listSecrets();
+    assert.ok(list.some((s) => s.name === 'tg_bot_token'), 'metadata tersimpan');
+    assert.equal(sm.getSecretValue('tg_bot_token'), 'super-secret-123');
+    // listSecrets TIDAK PERNAH memuat nilai
+    assert.ok(!JSON.stringify(list).includes('super-secret-123'));
+  });
+
+  test('16. F4: projectId non-kanonik/traversal ditolak VALIDATION sebelum path.join', () => {
+    const sm = manager.secretManager;
+    for (const bad of ['prj_test_koper', '../../etc', 'prj_BADIO00000', '']) {
+      assert.throws(
+        () => sm.listConfigs(bad),
+        (e) => e?.code === 'VALIDATION',
+        `listConfigs('${bad}') harus VALIDATION`,
+      );
+      assert.throws(
+        () => sm.listProjectEnv(bad),
+        (e) => e?.code === 'VALIDATION',
+        `listProjectEnv('${bad}') harus VALIDATION`,
+      );
+      assert.throws(
+        () => sm.getProjectHook(bad),
+        (e) => e?.code === 'VALIDATION',
+        `getProjectHook('${bad}') harus VALIDATION`,
+      );
+    }
+  });
+
+  test('17. F4: nama file config tidak aman ditolak VALIDATION', () => {
+    const sm = manager.secretManager;
+    const content = Buffer.from('x').toString('base64');
+    for (const bad of ['../evil', '..\\..\\windows', 'a/b', 'a\\b', '.hidden', 'nama..json', '']) {
+      assert.throws(
+        () => sm.saveConfig(PID, { filename: bad, contentBase64: content }),
+        (e) => e?.code === 'VALIDATION',
+        `saveConfig('${bad}') harus VALIDATION`,
+      );
+      assert.throws(
+        () => sm.getConfig(PID, bad),
+        (e) => e?.code === 'VALIDATION',
+        `getConfig('${bad}') harus VALIDATION`,
+      );
+      assert.throws(
+        () => sm.removeConfig(PID, bad),
+        (e) => e?.code === 'VALIDATION',
+        `removeConfig('${bad}') harus VALIDATION`,
+      );
+    }
+  });
+
+  test('18. F4: _getKey32 tanpa masterKey/env → VAULT_CONFIG (bukan konstanta default)', () => {
+    const saved = process.env.VPANEL_MASTER_KEY;
+    delete process.env.VPANEL_MASTER_KEY;
+    const dir = mkdtempSync(join(tmpdir(), 'vmpanel-k32-'));
+    try {
+      const sm = new SecretManager({ rootDir: dir }); // tanpa masterKey
+      assert.throws(
+        () => sm._getKey32(),
+        (e) => e?.code === 'VAULT_CONFIG',
+        '_getKey32 tanpa kunci harus VAULT_CONFIG',
+      );
+      assert.throws(
+        () => sm.saveConfig(PID, { filename: 'ok.conf', contentBase64: 'aGk=' }),
+        (e) => e?.code === 'VAULT_CONFIG',
+      );
+    } finally {
+      if (saved !== undefined) process.env.VPANEL_MASTER_KEY = saved;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -74,8 +74,10 @@ class FakeProcessManager {
   constructor() {
     this.aliveImpl = () => false;
     this.exitRecords = new Map();
+    this.aliveCalls = []; // {pid, hint} — untuk asersi penerusan hint #30
   }
-  async isAlive(pid /*, startTimeHint */) {
+  async isAlive(pid, startTimeHint) {
+    this.aliveCalls.push({ pid, hint: startTimeHint ?? null });
     return this.aliveImpl(pid) === true;
   }
   getExitRecord(id) {
@@ -438,4 +440,172 @@ test('stop() menghentikan loop (tidak ada tick lagi)', async () => {
   const frozen = ticks;
   await sleep(80);
   assert.equal(ticks, frozen, 'tidak ada tick baru setelah stop');
+});
+
+/* ---------------- F5: wire sweepDisconnected (§7.3) ---------------- */
+
+test('F5: tanpa deploymentManager → sweepDeployments no-op, tick tetap jalan', async () => {
+  const { supervisor, serviceManager, processManager } = rig({
+    services: [svc({ service_id: 'svc-nosweep', pid: 1212 })],
+  });
+  processManager.aliveImpl = () => true;
+  assert.deepEqual(await supervisor.sweepDeployments(), []);
+  await supervisor.tick();
+  assert.equal(serviceManager.healthCalls.length, 1, 'tick tetap memeriksa service');
+});
+
+test('F5: sweepDeployments dipanggil tick dengan throttle deploySweepIntervalMs', async () => {
+  let calls = 0;
+  const seenOpts = [];
+  const deploymentManager = {
+    sweepDisconnected: async (opts) => {
+      calls++;
+      seenOpts.push(opts);
+      return [{ deploymentId: 'dep_x', projectId: 'prj_A1B2C3D4E5F' }];
+    },
+  };
+  const { supervisor, events } = rig({
+    supOpts: { deploymentManager, deploySweepIntervalMs: 1000 },
+    services: [svc({ service_id: 'svc-sw', pid: 1313 })],
+  });
+  supervisor.processManager.aliveImpl = () => true;
+
+  await supervisor.tick(); // pertama (last=0) → sweep jalan
+  assert.equal(calls, 1);
+  assert.deepEqual(seenOpts[0], {}, 'tick pakai default DeploymentManager');
+  await supervisor.tick(); // dalam window yang sama → TIDAK sweep lagi
+  assert.equal(calls, 1);
+  assert.ok(events.some((e) => e.msg === 'supervisor.deploy_sweep.applied'), 'hasil sweep dicatat');
+
+  nowMs += 1001;
+  await supervisor.tick(); // interval lewat → sweep lagi
+  assert.equal(calls, 2);
+
+  // opsi eksplisit diteruskan ke sweepDisconnected
+  await supervisor.sweepDeployments({ olderThanMs: 60_000 });
+  assert.equal(calls, 3);
+  assert.deepEqual(seenOpts[2], { olderThanMs: 60_000 });
+});
+
+test('F5: error sweep tidak mengganggu supervisor dan tidak bocor keluar', async () => {
+  const deploymentManager = {
+    sweepDisconnected: async () => {
+      throw new Error('deployments.db terkunci');
+    },
+  };
+  const { supervisor, events } = rig({ supOpts: { deploymentManager } });
+  const out = await supervisor.sweepDeployments();
+  assert.deepEqual(out, [], 'error → array kosong');
+  assert.ok(events.some((e) => e.msg === 'supervisor.deploy_sweep.error'), 'error dicatat logger');
+  await supervisor.tick(); // tick berikutnya tetap aman
+});
+
+test('F5: sweep concurrent → hanya satu jalan (guard #sweeping)', async () => {
+  let calls = 0;
+  let releaseSweep;
+  const gate = new Promise((r) => {
+    releaseSweep = r;
+  });
+  const deploymentManager = {
+    sweepDisconnected: async () => {
+      calls++;
+      await gate;
+      return [];
+    },
+  };
+  const { supervisor } = rig({ supOpts: { deploymentManager } });
+  const p1 = supervisor.sweepDeployments();
+  const p2 = supervisor.sweepDeployments();
+  releaseSweep();
+  await Promise.all([p1, p2]);
+  assert.equal(calls, 1, 'sweep kedua memakai promise yang sama');
+});
+
+test('F5: start() memicu sweep awal (tanpa menunggu interval penuh)', async () => {
+  let calls = 0;
+  const deploymentManager = {
+    sweepDisconnected: async () => {
+      calls++;
+      return [];
+    },
+  };
+  const { supervisor } = rig({
+    supOpts: { deploymentManager, deploySweepIntervalMs: 600_000 },
+    services: [svc({ service_id: 'svc-start', pid: 1414 })],
+  });
+  supervisor.processManager.aliveImpl = () => true;
+  await supervisor.start();
+  await sleep(60);
+  supervisor.stop();
+  assert.ok(calls >= 1, `start() memanggil sweepDisconnected (calls=${calls})`);
+});
+
+/* ---------------- #30 / #32 — hint creation-time & alasan kematian ---------------- */
+
+test('#30 supervisor meneruskan start_time_hint baris services ke isAlive() (guard PID-reuse)', async () => {
+  const { supervisor, processManager, serviceManager } = rig({
+    services: [svc({ service_id: 'svc-hint', pid: 7777, start_time_hint: 1_700_111_000_000 })],
+  });
+  // Hidup hanya bila hint yang datang cocok dengan creation-time anak kita.
+  processManager.aliveImpl = (pid) => pid === 7777;
+
+  await supervisor.tick();
+  const call = processManager.aliveCalls.find((c) => c.pid === 7777);
+  assert.ok(call, 'isAlive harus dipanggil dengan pid baris');
+  assert.equal(call.hint, 1_700_111_000_000, 'hint creation-time dari row harus diteruskan');
+  assert.equal(serviceManager.restartCalls.length, 0, 'hidup → tidak ada restart');
+
+  // Baris TANPA hint → null (perilaku lama, bukan 0 yang bisa salah cocok).
+  const rig2 = rig({ services: [svc({ service_id: 'svc-nohint', pid: 8888 })] });
+  await rig2.supervisor.tick();
+  const call2 = rig2.processManager.aliveCalls.find((c) => c.pid === 8888);
+  assert.equal(call2.hint, null, 'tanpa hint → null');
+});
+
+test('#30 PID hidup tapi creation-time tak cocok → cabang DEAD (restart dijadwalkan)', async () => {
+  const { supervisor, serviceManager, processManager, events } = rig({
+    services: [svc({ service_id: 'svc-reuse', pid: 9999, start_time_hint: 1_600_000_000_000 })],
+  });
+  // FAKE isAlive meniru guard: proses dengan pid itu hidup, tapi hint-nya beda
+  // → processManager melapor tidak hidup (bukan anak kita).
+  processManager.aliveImpl = (pid, hint) => hint === 1_600_000_000_000;
+
+  await supervisor.tick();
+  assert.ok(
+    events.some((e) => e.msg === 'supervisor.service.died'),
+    'PID reuse harus diperlakukan sebagai kematian, bukan service hidup',
+  );
+  const st = serviceManager.getSupervisorState('svc-reuse');
+  assert.equal(st.state, 'recovering', 'backoff/recovery berjalan seperti service mati');
+});
+
+test('#32 exit record reason port_taken_at_spawn → pesan alert dibedakan dari crash biasa', async () => {
+  const { supervisor, processManager, events } = rig({
+    services: [svc({ service_id: 'svc-port', pid: 3333, restart_policy: { mode: 'never' } })],
+  });
+  processManager.exitRecords.set('svc-port', { exitCode: 1, reason: 'port_taken_at_spawn' });
+
+  await supervisor.tick();
+  assert.ok(
+    events.some((e) => e.msg === 'supervisor.service.died' && e.extra.reason === 'port_taken_at_spawn'),
+    'log kematian membawa reason',
+  );
+  const alerts = alertRows(dataDir, 'SERVICE_FAILED');
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0].message, /port_taken_at_spawn/);
+  assert.match(alerts[0].message, /tabrakan port/);
+  void supervisor;
+});
+
+test('#32 tanpa reason → pesan alert tetap format crash biasa', async () => {
+  const { supervisor, processManager } = rig({
+    services: [svc({ service_id: 'svc-crash', pid: 4444, restart_policy: { mode: 'never' } })],
+  });
+  processManager.exitRecords.set('svc-crash', { exitCode: 2, reason: null });
+  await supervisor.tick();
+  const alerts = alertRows(dataDir, 'SERVICE_FAILED');
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0].message, /restart_policy=never/);
+  assert.ok(!/port_taken_at_spawn/.test(alerts[0].message), 'tidak menyebut port untuk crash biasa');
+  void supervisor;
 });

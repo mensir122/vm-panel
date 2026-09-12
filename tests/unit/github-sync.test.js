@@ -192,7 +192,7 @@ describe('github-sync (panel → GitHub Actions runner)', () => {
         headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
         body: form(spec),
       });
-      assert.equal(res.status, 302, `sukses → redirect (${spec.name})`);
+      if (res.status !== 302) console.log(await res.text()); assert.equal(res.status, 302, `sukses → redirect (${spec.name})`);
       assert.match(res.headers.get('location') ?? '', /^\/projects\/prj_/, 'redirect ke detail');
     }
   });
@@ -329,5 +329,36 @@ describe('github-sync (panel → GitHub Actions runner)', () => {
       body: form({}),
     });
     assert.equal(res.status, 403);
+  });
+
+  test('(8) POST /projects/sync-all-cloud → daftarkan semua project (termasuk lokal) ke manifest + commit', { skip: !gitAvailable }, async () => {
+    const res = await req(ctx.port, 'POST', '/projects/sync-all-cloud', {
+      jar: ctx.ownerJar,
+      headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
+      body: form({}),
+    });
+    assert.equal(res.status, 302, 'redirect setelah sync all sukses');
+    assert.equal(res.headers.get('location'), '/projects');
+
+    const statusRes = await req(ctx.port, 'GET', '/projects/sync-status', { jar: ctx.ownerJar });
+    assert.equal(statusRes.status, 200);
+    const body = await statusRes.json();
+    assert.equal(body.exists, true);
+    assert.ok(body.content.length >= 2, 'semua project masuk manifest');
+    assert.ok(body.content.some((e) => e.name === 'sync-local-only'), 'local project otomatis masuk manifest');
+  });
+
+  test('(9) POST /projects/:id/sync-cloud → daftarkan project individual ke Cloud 24/7', { skip: !gitAvailable }, async () => {
+    const listRes = await ctx.managerClient.request('GET', '/projects');
+    const localProj = listRes.find((p) => p.name === 'sync-local-only');
+    assert.ok(localProj, 'project local ditemukan');
+
+    const res = await req(ctx.port, 'POST', `/projects/${encodeURIComponent(localProj.id)}/sync-cloud`, {
+      jar: ctx.ownerJar,
+      headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
+      body: form({}),
+    });
+    assert.equal(res.status, 302, 'redirect setelah sync individual sukses');
+    assert.equal(res.headers.get('location'), '/projects');
   });
 });

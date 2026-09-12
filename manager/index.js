@@ -6,10 +6,11 @@
 //   rekan — jangan diubah), HTTP API loopback (manager/api.js), PID file
 //   atomic runtime/pid/manager.pid, audit event system.startup.
 //   stop(): graceful — tutup HTTP → audit system.shutdown → close DB → hapus
-//   PID file. Supervisor (F2) = placeholder startSupervisor().
+//   PID file. Supervisor nyata = InternalSupervisor (#startModules); guard
+//   crash F7 = installCrashGuards() (log redacted + stop() sekali).
 
 import { join } from 'node:path';
-import { chmodSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, unlinkSync, rmSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { openDatabase } from '../lib/db.js';
 import { VmPanelError, REFUSE_START_DB, VALIDATION } from '../lib/errors.js';
@@ -224,6 +225,7 @@ export class Manager {
       processManager: this.processManager,
       auditManager: this.auditManager,
       projectsDbPath: join(this.dataDir, 'projects.db'),
+      logger: this.logger,
     });
 
     const { RollbackManager } = await import('./rollback_manager/index.js');
@@ -231,6 +233,10 @@ export class Manager {
       dataDir: this.dataDir,
       serviceManager: this.serviceManager,
       healthManager: this.healthManager,
+      // Gate-1 F5 (warisan M-B): lock 'deploy-<prj>' rollback SATU direktori
+      // dengan DeploymentManager/backup/supervisor (runtime/locks) — guard
+      // deploy-vs-rollback harus saling melihat.
+      lockDir: join(this.rootDir, 'runtime', 'locks'),
     });
 
     const { DeploymentManager } = await import('./deployment_manager/index.js');
@@ -240,6 +246,11 @@ export class Manager {
       projectManager: this.projectManager,
       healthManager: this.healthManager,
       rollbackManager: this.rollbackManager,
+      logger: this.logger,
+      // Gate-1 F5/lockDir: deploy lock 'deploy-<prj>' harus SATU direktori
+      // dengan lock supervisor/backup (runtime/locks) — default lama
+      // dataDir/locks membuat kedua dunia saling tidak melihat.
+      lockDir: join(this.rootDir, 'runtime', 'locks'),
     });
 
     const { BackupManager } = await import('./backup_manager/index.js');
@@ -283,6 +294,10 @@ export class Manager {
       stableWindowMs: (supCfg.stableWindowSec ?? 600) * 1000,
       notificationWebhook: supCfg.notificationWebhook ?? null,
       lockDir: join(this.rootDir, 'runtime', 'locks'),
+      // Warisan M-B (F5 wire): aktifkan sweepDeployments() §7.3 di tick;
+      // tanpa injeksi ini sweep no-op di produksi.
+      deploymentManager: this.deploymentManager,
+      deploySweepIntervalMs: (supCfg.deploySweepIntervalSec ?? 300) * 1000,
     });
     this.logger.info('manager.modules_ready', {
       process: !!this.processManager,
@@ -293,6 +308,25 @@ export class Manager {
       backup: !!this.backupManager,
       supervisor: 'created-not-started',
     });
+
+    // #31b — Rekonsiliasi baris 'running' yatim SEBELUM supervisor auto-start:
+    // manager yang crash/restart meninggalkan status 'running' padahal prosesnya
+    // sudah mati. Error di sini tidak boleh memblok start (supervisor tetap
+    // bisa jalan; baris akan ditangani branch DEAD pada tick pertama).
+    try {
+      const rec = await this.serviceManager.reconcileStaleRunning();
+      if (rec.checked > 0) {
+        this.logger.info('manager.service_reconciled', {
+          checked: rec.checked,
+          failed: rec.reconciled.length,
+          orphanAlive: rec.orphans.length,
+        });
+      }
+    } catch (e) {
+      this.logger.warn('manager.service_reconcile_failed', {
+        reason: String(e?.message ?? e),
+      });
+    }
 
     // Auto-start HANYA bila config.supervisor.autoStart === true (default false).
     const autoStart = supCfg.autoStart === true || supCfg.auto_start === true;
@@ -380,7 +414,6 @@ export class Manager {
     this.#writePlatformMeta(); // (b)
     await this.#loadPartnerModules(); // (c) — lazy import rekan Wave 2
     await this.#startModules(); // (c2) — lazy init modul F2/F3/F4 + supervisor
-    this.startSupervisor(); // placeholder F2 — log only (no-op)
     await this.#startApiAndPid(); // (d)(e)(f)
     this.startedAt = Date.now();
     this.running = true;
@@ -388,13 +421,93 @@ export class Manager {
   }
 
   /**
-   * Placeholder supervisor (F2). Fase ini TIDAK menjalankan project.
-   * @returns {{started: boolean, note: string}}
+   * Pembersihan total project secara atomik & tuntas (Clean Purge).
+   * Menghapus semua service, proses, port, deployment, secret/config,
+   * workspace fisik, dan baris projects.db.
    */
-  startSupervisor() {
-    const note = 'supervisor not-implemented-yet (F2)';
-    this.logger.info('manager.supervisor_placeholder', { note });
-    return { started: false, note };
+  async purgeProject(id, { confirmToken, actor = 'system' } = {}) {
+    if (!this.projectManager) {
+      throw new VmPanelError(VALIDATION, 'ProjectManager belum siap');
+    }
+    const project = this.projectManager.getProject(id);
+    const projectName = project.name;
+
+    // 1. Hentikan & hapus semua service yang terkait project ini
+    if (this.serviceManager?.store?.db) {
+      try {
+        const svcs = this.serviceManager.store.db
+          .prepare('SELECT id, status FROM services WHERE project_id = ?')
+          .all(id);
+        for (const s of svcs) {
+          try {
+            if (s.status === 'running') {
+              await this.serviceManager.stopService(s.id, { graceMs: 3000 });
+            }
+          } catch (e) {
+            this.logger.warn('manager.purge_service_stop_failed', { serviceId: s.id, reason: String(e?.message ?? e) });
+          }
+          try {
+            this.serviceManager.releasePort(s.id);
+          } catch {}
+          try {
+            this.serviceManager.store.db.prepare('DELETE FROM service_supervisor_state WHERE service_id = ?').run(s.id);
+            this.serviceManager.store.db.prepare('DELETE FROM services WHERE id = ?').run(s.id);
+          } catch (e) {
+            this.logger.warn('manager.purge_service_delete_failed', { serviceId: s.id, reason: String(e?.message ?? e) });
+          }
+        }
+      } catch (e) {
+        this.logger.warn('manager.purge_services_query_failed', { projectId: id, reason: String(e?.message ?? e) });
+      }
+    }
+
+    // 2. Hapus semua deployment, deployment_events, dan revisions terkait
+    if (this.deploymentManager?.store?.db) {
+      try {
+        const depDb = this.deploymentManager.store.db;
+        depDb.prepare('DELETE FROM deployment_events WHERE deployment_id IN (SELECT id FROM deployments WHERE project_id = ?)').run(id);
+        depDb.prepare('DELETE FROM deployments WHERE project_id = ?').run(id);
+        depDb.prepare('DELETE FROM revisions WHERE project_id = ?').run(id);
+      } catch (e) {
+        this.logger.warn('manager.purge_deployments_failed', { projectId: id, reason: String(e?.message ?? e) });
+      }
+    }
+
+    // 3. Bersihkan secret refs, hooks, dan custom configs terkait project
+    if (this.secretManager) {
+      try {
+        this.secretManager.removeProjectHook(id);
+      } catch {}
+      try {
+        const envs = this.secretManager.listProjectEnv(id);
+        for (const e of envs) {
+          this.secretManager.removeProjectEnv(id, e.envName);
+        }
+      } catch {}
+      try {
+        const cfgDir = this.secretManager._projectConfigDir(id);
+        if (existsSync(cfgDir)) {
+          rmSync(cfgDir, { recursive: true, force: true });
+        }
+      } catch {}
+    }
+
+    // 4. Hapus workspace fisik & row project via ProjectManager
+    const tok = confirmToken || 'PURGE_CONFIRMED';
+    this.projectManager.removeProject(id, { confirmToken: tok, expectedToken: tok });
+
+    // 5. Catat audit event
+    try {
+      this.auditManager?.append({
+        actor,
+        operation: 'project.delete',
+        input: { projectId: id, name: projectName },
+        result: 'ok',
+      });
+    } catch {}
+
+    this.logger.info('manager.project_purged', { projectId: id, name: projectName });
+    return { ok: true, removed: true, id, name: projectName };
   }
 
   /**
@@ -509,6 +622,54 @@ export class Manager {
   }
 }
 
+/**
+ * F7 — guard crash untuk proses daemon: unhandledRejection/uncaughtException
+ * dulu DIAM-DIAM membunuh manager (atau membiarkan setengah-hidup) tanpa jejak
+ * terstruktur. Sekarang: log REDACTED (logger sudah membawa redactor + token
+ * di extraValues) → stop() terkontrol SEKALI (guard reentrancy — event
+ * kedua selama shutdown langsung diabaikan) → exit(1).
+ *
+ * Diekspor agar unit test bisa memancarkan event tanpa menjalankan daemon.
+ * @param {Manager} manager
+ * @param {{exit?: (code: number) => void, emitter?: {on: Function, off?: Function}}} [opts]
+ *   emitter default = process global; injectable agar unit test tidak
+ *   mencemari listener proses test-runner.
+ * @returns {{dispose: () => void}} penghapus listener (dipakai test)
+ */
+export function installCrashGuards(
+  manager,
+  { exit = (code) => process.exit(code), emitter = process } = {},
+) {
+  const redactor = makeRedactor();
+  let fired = false;
+  const handle = (label) => (err) => {
+    if (fired) return; // reentrancy: shutdown sedang berjalan — abaikan
+    fired = true;
+    const reason = redactor(String(err?.stack ?? err?.message ?? err ?? label));
+    try {
+      manager.logger?.error?.(label, { reason: typeof reason === 'string' ? reason : String(reason) });
+    } catch {
+      /* logger mati — jangan sampai guard ikut crash */
+    }
+    Promise.resolve()
+      .then(() => manager.stop?.())
+      .catch(() => {
+        /* stop gagal — tetap exit terkontrol */
+      })
+      .finally(() => exit(1));
+  };
+  const onRejection = handle('manager.unhandled_rejection');
+  const onException = handle('manager.uncaught_exception');
+  emitter.on('unhandledRejection', onRejection);
+  emitter.on('uncaughtException', onException);
+  return {
+    dispose() {
+      emitter.off?.('unhandledRejection', onRejection);
+      emitter.off?.('uncaughtException', onException);
+    },
+  };
+}
+
 /** CLI entrypoint langsung: `node manager/index.js`. */
 const isMain =
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
@@ -518,6 +679,7 @@ if (isMain) {
   const { loadConfig } = await import('../lib/config.js');
   const config = loadConfig({ rootDir: process.env.VPANEL_ROOT || process.cwd() });
   const manager = new Manager({ rootDir: config.rootDir, config });
+  installCrashGuards(manager); // F7
   const shutdown = async (sig) => {
     manager.logger.info('manager.signal', { signal: sig });
     await manager.stop();

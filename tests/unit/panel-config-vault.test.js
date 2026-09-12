@@ -292,6 +292,27 @@ function csrfHeaders() {
   return { 'x-csrf-token': ctx.jar.get('vpanel_csrf') };
 }
 
+/**
+ * A2#13: hapus destruktif kini dua-fase di sisi SERVER — POST pertama tanpa
+ * token mengembalikan halaman konfirmasi (200) TANPA menyentuh manager; POST
+ * kedua membawa confirmToken sekali-pakai baru mengeksekusi (302). Helper
+ * menjalankan kedua fase; assertion rantai manager tetap di test pemanggil.
+ */
+async function twoPhaseRemove(path, removedCallMatcher) {
+  const callsBefore = ctx.stub.calls.filter(removedCallMatcher).length;
+  const r1 = await req(ctx.port, 'POST', path, { jar: ctx.jar, headers: csrfHeaders(), body: form({}) });
+  assert.equal(r1.status, 200, 'fase-1: halaman konfirmasi (BUKAN eksekusi langsung)');
+  const html1 = await r1.text();
+  assert.equal(
+    ctx.stub.calls.filter(removedCallMatcher).length,
+    callsBefore,
+    'fase-1 tidak boleh memanggil manager /remove',
+  );
+  const tok = (html1.match(/name="confirmToken" value="([^"]+)"/) || [])[1];
+  assert.ok(tok && /^[0-9a-f]{64}$/.test(tok), 'token konfirmasi sekali-pakai dirender');
+  return req(ctx.port, 'POST', path, { jar: ctx.jar, headers: csrfHeaders(), body: form({ confirmToken: tok }) });
+}
+
 // --- tests -----------------------------------------------------------------------
 
 describe('panel-config-vault (Config & Brankas)', () => {
@@ -444,12 +465,11 @@ describe('panel-config-vault (Config & Brankas)', () => {
     assert.ok(text.includes('connect ECONNREFUSED 127.0.0.1:3456'), 'teks error tampil');
   });
 
-  test('(10) config delete → two-phase remove-request → remove (confirmToken dicek stub)', async () => {
-    const res = await req(ctx.port, 'POST', `/projects/${PID}/config/settings.json/remove`, {
-      jar: ctx.jar,
-      headers: csrfHeaders(),
-      body: form({}),
-    });
+  test('(10) config delete → dua-fase server panel lalu dua-fase manager chain', async () => {
+    const res = await twoPhaseRemove(
+      `/projects/${PID}/config/settings.json/remove`,
+      (c) => c.method === 'POST' && c.path.includes('/config/settings%2Ejson/remove'),
+    );
     assert.equal(res.status, 302);
     // remove-request → manager path dengan segmen filename ter-encode (titik
     // di-escape panel agar segmen tidak bisa dipakai traversal).
@@ -466,12 +486,11 @@ describe('panel-config-vault (Config & Brankas)', () => {
     assert.ok(text.includes('passthrough.txt'), 'file lain tetap ada');
   });
 
-  test('(11) env delete → two-phase chain', async () => {
-    const res = await req(ctx.port, 'POST', `/projects/${PID}/env/DB_PASSWORD/remove`, {
-      jar: ctx.jar,
-      headers: csrfHeaders(),
-      body: form({}),
-    });
+  test('(11) env delete → dua-fase server panel lalu chain manager', async () => {
+    const res = await twoPhaseRemove(
+      `/projects/${PID}/env/DB_PASSWORD/remove`,
+      (c) => c.method === 'POST' && c.path.includes('/env/DB_PASSWORD/remove'),
+    );
     assert.equal(res.status, 302);
     const rm = ctx.stub.lastCall('POST', '/remove');
     assert.ok(rm && rm.path.includes('/env/DB_PASSWORD/remove'), 'remove env dipanggil');
@@ -480,12 +499,11 @@ describe('panel-config-vault (Config & Brankas)', () => {
     assert.ok(!text.includes('<td class="mono">DB_PASSWORD</td>'), 'baris env hilang');
   });
 
-  test('(12) hook delete → two-phase chain → empty state kembali', async () => {
-    const res = await req(ctx.port, 'POST', `/projects/${PID}/hook/remove`, {
-      jar: ctx.jar,
-      headers: csrfHeaders(),
-      body: form({}),
-    });
+  test('(12) hook delete → dua-fase server panel lalu chain manager → empty state', async () => {
+    const res = await twoPhaseRemove(
+      `/projects/${PID}/hook/remove`,
+      (c) => c.method === 'POST' && c.path.endsWith('/hook/remove'),
+    );
     assert.equal(res.status, 302);
     const rm = ctx.stub.lastCall('POST', '/remove');
     assert.ok(rm && rm.path.endsWith('/hook/remove'), 'hook remove dipanggil');

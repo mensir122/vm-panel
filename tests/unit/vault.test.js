@@ -1,7 +1,7 @@
 // tests/unit/vault.test.js — encrypted store, scope enforcement, tamper (node:test)
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Vault } from '../../lib/vault.js';
@@ -158,5 +158,34 @@ describe('Vault — at-rest & tamper', () => {
     // tidak ada file .tmp-* tersisa di dir
     const names = readdirSync(dir).filter((n) => n.includes('.tmp'));
     assert.deepEqual(names, []);
+  });
+
+  test('F3 sweep: tmp tua (age>1h) dibersihkan saat load; tmp muda & pola lain utuh', () => {
+    const p = join(dir, 'vault.enc');
+    // file vault valid dibuat dulu agar load tidak throw
+    const v0 = new Vault({ filePath: p, masterKey: 'k' });
+    v0.set('a', '1');
+
+    const oldAge = Date.now() / 1000 - 7200; // 2 jam lalu
+    const freshAge = Date.now() / 1000 - 60; // 1 menit lalu
+    const mk = (name, age) => {
+      const fp = join(dir, name);
+      writeFileSync(fp, 'partial-write');
+      utimesSync(fp, age, age);
+    };
+    mk('vault.enc.tmp-4242-1789000000000', oldAge); // tua → sapu
+    mk('vault.enc.tmp-1111', oldAge); // tua, satu segmen → sapu
+    mk('vault.enc.tmp-9999-1789000000000', freshAge); // muda → JANGAN
+    mk('vault.enc.tmp-notnum', oldAge); // pola salah → JANGAN
+    mk('other.enc.tmp-4242-1789000000000', oldAge); // file lain → JANGAN
+
+    const v = new Vault({ filePath: p, masterKey: 'k' }); // load → sweep jalan
+    assert.equal(v.get('a'), '1', 'vault tetap terbaca');
+    assert.equal(existsSync(join(dir, 'vault.enc.tmp-4242-1789000000000')), false);
+    assert.equal(existsSync(join(dir, 'vault.enc.tmp-1111')), false);
+    assert.ok(existsSync(join(dir, 'vault.enc.tmp-9999-1789000000000')), 'tmp muda utuh');
+    assert.ok(existsSync(join(dir, 'vault.enc.tmp-notnum')), 'pola salah utuh');
+    assert.ok(existsSync(join(dir, 'other.enc.tmp-4242-1789000000000')), 'file lain utuh');
+    assert.ok(existsSync(p), 'vault utuh');
   });
 });

@@ -11,8 +11,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Manager } from '../../manager/index.js';
+import { EventEmitter } from 'node:events';
+import { Manager, installCrashGuards } from '../../manager/index.js';
 import { registerDataRoutes } from '../../manager/api-data-routes.js';
+import { acquire, release } from '../../lib/lock.js';
 import { VmPanelError } from '../../lib/errors.js';
 
 const H = (t) => ({ Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' });
@@ -128,6 +130,18 @@ describe('api-data-routes (F4 Wave 1)', () => {
     assert.ok(svc, 'service untuk project harus ada');
     assert.equal(svc.status, 'running');
     serviceId = svc.id;
+
+    // Filter by projectId query
+    const srFiltered = await fetch(`${base}/services?projectId=${projectId}`, { headers: H(token) });
+    assert.equal(srFiltered.status, 200);
+    const sbFiltered = await srFiltered.json();
+    assert.equal(sbFiltered.rows.length, 1);
+    assert.equal(sbFiltered.rows[0].id, serviceId);
+
+    // Filter with non-existent projectId
+    const srNone = await fetch(`${base}/services?projectId=prj_non_existent_123`, { headers: H(token) });
+    const sbNone = await srNone.json();
+    assert.equal(sbNone.rows.length, 0);
   });
 
   test('GET /services/:id → 200 record; GET /services/:id/health → ok', async () => {
@@ -252,5 +266,226 @@ describe('api-data-routes (F4 Wave 1)', () => {
   test('token salah → 401', async () => {
     const r = await fetch(`${base}/services`, { headers: H('token-salah') });
     assert.equal(r.status, 401);
+  });
+
+  test('POST /projects/:id/remove-request & remove → project & services dibersihkan', async () => {
+    const reqRes = await fetch(`${base}/projects/${projectId}/remove-request`, {
+      method: 'POST',
+      headers: H(token),
+      body: '{}',
+    });
+    assert.equal(reqRes.status, 200);
+    const rb = await reqRes.json();
+    assert.ok(rb.confirmToken, 'confirmToken harus ada');
+
+    const badRes = await fetch(`${base}/projects/${projectId}/remove`, {
+      method: 'POST',
+      headers: H(token),
+      body: JSON.stringify({ confirmToken: '' }),
+    });
+    assert.equal(badRes.status, 403);
+
+    const okRes = await fetch(`${base}/projects/${projectId}/remove`, {
+      method: 'POST',
+      headers: H(token),
+      body: JSON.stringify({ confirmToken: rb.confirmToken }),
+    });
+    assert.equal(okRes.status, 200);
+    const ob = await okRes.json();
+    assert.equal(ob.removed, true);
+
+    const getRes = await fetch(`${base}/projects/${projectId}`, { headers: H(token) });
+    assert.equal(getRes.status, 404);
+  });
+
+  // ── Regresi bug-hunt god-mode lane M-A ──────────────────────────────────
+
+  test('F1: POST /projects/:id/remove — token sampah DITOLAK 403 (consume nyata, bukan swallow)', async () => {
+    const c = await fetch(`${base}/projects`, {
+      method: 'POST',
+      headers: H(token),
+      body: JSON.stringify({ name: 'twophase-a', type: 'static' }),
+    });
+    assert.equal(c.status, 201);
+    const p = await c.json();
+    // fase 1
+    const rr = await fetch(`${base}/projects/${p.id}/remove-request`, {
+      method: 'POST',
+      headers: H(token),
+      body: '{}',
+    });
+    assert.equal(rr.status, 200);
+    const good = (await rr.json()).confirmToken;
+    // token garbage → 403 PERMISSION_DENIED (dulu: catch swallow → purge jalan!)
+    const bad = await fetch(`${base}/projects/${p.id}/remove`, {
+      method: 'POST',
+      headers: H(token),
+      body: JSON.stringify({ confirmToken: 'cfgtok-garbage-garbage-garbage' }),
+    });
+    assert.equal(bad.status, 403);
+    assert.equal((await bad.json()).error.code, 'PERMISSION_DENIED');
+    // project masih hidup
+    assert.equal((await fetch(`${base}/projects/${p.id}`, { headers: H(token) })).status, 200);
+    // token valid → 200 (sekali pakai)
+    const ok = await fetch(`${base}/projects/${p.id}/remove`, {
+      method: 'POST',
+      headers: H(token),
+      body: JSON.stringify({ confirmToken: good }),
+    });
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).removed, true);
+  });
+
+  test('F1: DELETE /projects/:id wajib confirmToken + consume nyata', async () => {
+    const c = await fetch(`${base}/projects`, {
+      method: 'POST',
+      headers: H(token),
+      body: JSON.stringify({ name: 'twophase-b', type: 'static' }),
+    });
+    const p = await c.json();
+    // tanpa body → 403 (dulu: purge langsung)
+    const noTok = await fetch(`${base}/projects/${p.id}`, { method: 'DELETE', headers: H(token) });
+    assert.equal(noTok.status, 403);
+    assert.equal((await noTok.json()).error.code, 'PERMISSION_DENIED');
+    // token garbage → 403
+    const bad = await fetch(`${base}/projects/${p.id}`, {
+      method: 'DELETE',
+      headers: H(token),
+      body: JSON.stringify({ confirmToken: 'cfgtok-tidak-kenal-sama-sekali' }),
+    });
+    assert.equal(bad.status, 403);
+    assert.equal((await bad.json()).error.code, 'PERMISSION_DENIED');
+    // dua fase penuh: remove-request → DELETE dengan token
+    const rr = await fetch(`${base}/projects/${p.id}/remove-request`, {
+      method: 'POST',
+      headers: H(token),
+      body: '{}',
+    });
+    const { confirmToken } = await rr.json();
+    assert.ok(String(confirmToken).startsWith('cfgtok-'), 'token berasal dari SecretManager');
+    const ok = await fetch(`${base}/projects/${p.id}`, {
+      method: 'DELETE',
+      headers: H(token),
+      body: JSON.stringify({ confirmToken }),
+    });
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).removed, true);
+    assert.equal((await fetch(`${base}/projects/${p.id}`, { headers: H(token) })).status, 404);
+  });
+
+  test('F1: remove-request tanpa SecretManager → NOT_READY (fallback randomToken dihapus)', async () => {
+    const routes = registerDataRoutes({
+      manager: { projectManager: { getProject: () => ({ id: 'prj_A1B2C3D4E5', name: 'x' }) } },
+    });
+    const reqRoute = routes.find(
+      (r) => r.method === 'POST' && r.pattern === '/projects/:id/remove-request',
+    );
+    assert.throws(
+      () =>
+        reqRoute.handler({
+          params: { id: 'prj_A1B2C3D4E5' },
+          url: null,
+          body: null,
+          user: 'system',
+        }),
+      (e) => e instanceof VmPanelError && e.code === 'NOT_READY',
+    );
+    const delRoute = routes.find((r) => r.method === 'DELETE' && r.pattern === '/projects/:id');
+    await assert.rejects(
+      () =>
+        delRoute.handler({
+          params: { id: 'prj_A1B2C3D4E5' },
+          url: null,
+          body: { confirmToken: 'cfgtok-x' },
+          user: 'system',
+        }),
+      (e) => e instanceof VmPanelError && e.code === 'NOT_READY',
+    );
+  });
+
+  test('serviceAction: permission PER-VERB sesuai matriks §11.2', () => {
+    const routes = registerDataRoutes({ manager });
+    for (const verb of ['start', 'stop', 'restart']) {
+      const r = routes.find((x) => x.method === 'POST' && x.pattern === `/services/:id/${verb}`);
+      assert.ok(r, `route /services/:id/${verb} harus ada`);
+      assert.equal(r.permission, `service.${verb}`);
+    }
+  });
+
+  test('serviceAction: lock svc-<id> dipegang pihak lain → LOCK_HELD pesan jelas', async () => {
+    const routes = registerDataRoutes({ manager });
+    const stopRoute = routes.find(
+      (r) => r.method === 'POST' && r.pattern === '/services/:id/stop',
+    );
+    const fakeId = 'svc_TESTK0P3R1';
+    const lockName = `svc-${fakeId}`;
+    const lockDir = join(dir, 'runtime', 'locks');
+    const tok = await acquire(lockName, { dir: lockDir, ttlMs: 30_000 });
+    try {
+      await assert.rejects(
+        () => stopRoute.handler({ params: { id: fakeId }, url: null, body: null, user: 'system' }),
+        (e) =>
+          e instanceof VmPanelError &&
+          e.code === 'LOCK_HELD' &&
+          /sedang diproses aksi\/recovery lain/.test(e.message),
+      );
+    } finally {
+      assert.equal(release(lockName, tok, { dir: lockDir }), true);
+    }
+    // setelah lock lepas → handler jalan lagi (service tak dikenal → NOT_FOUND)
+    await assert.rejects(
+      () => stopRoute.handler({ params: { id: fakeId }, url: null, body: null, user: 'system' }),
+      (e) => e instanceof VmPanelError && e.code === 'NOT_FOUND',
+    );
+  });
+
+  test('F13: audit field error di-clamp ≤2KB POST-redaksi', () => {
+    assert.ok(manager.auditManager, 'auditManager harus hidup');
+    const long = `password: bocor123 ${'E'.repeat(5000)}`;
+    manager.auditManager.append({
+      actor: 'system',
+      operation: 'test.f13.clamp',
+      error: long,
+      result: 'error',
+    });
+    const { rows } = manager.auditManager.list({ operation: 'test.f13.clamp' });
+    assert.equal(rows.length, 1);
+    const err = rows[0].error;
+    assert.ok(
+      Buffer.byteLength(err, 'utf8') <= 2048,
+      `harus ≤2048 byte, dapat ${Buffer.byteLength(err)}`,
+    );
+    assert.ok(err.includes('***REDACTED***'), 'redaksi jalan sebelum clamp');
+    assert.ok(!err.includes('bocor123'), 'secret tidak boleh tersisa');
+  });
+
+  test('F7: installCrashGuards → log redacted + stop() sekali + exit terkontrol (guard reentrancy)', async () => {
+    const emitter = new EventEmitter();
+    let stops = 0;
+    const exits = [];
+    const logs = [];
+    const fakeManager = {
+      logger: { error: (msg, fields) => logs.push([msg, fields]) },
+      stop: async () => {
+        stops += 1;
+      },
+    };
+    const { dispose } = installCrashGuards(fakeManager, {
+      emitter,
+      exit: (code) => exits.push(code),
+    });
+    try {
+      emitter.emit('unhandledRejection', new Error('boom token=RAHASIA-X'));
+      emitter.emit('unhandledRejection', new Error('dua-kali'));
+      emitter.emit('uncaughtException', new Error('tiga-kali'));
+      await new Promise((r) => setImmediate(r));
+      assert.equal(stops, 1, 'stop() hanya sekali (guard reentrancy)');
+      assert.deepEqual(exits, [1], 'exit(1) tepat satu kali');
+      assert.equal(logs.length, 1);
+      assert.equal(logs[0][0], 'manager.unhandled_rejection');
+      assert.ok(!String(logs[0][1].reason).includes('RAHASIA-X'), 'reason harus teredaksi');
+    } finally {
+      dispose();
+    }
   });
 });

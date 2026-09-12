@@ -12,6 +12,14 @@ import { genId } from '../../lib/ids.js';
 import { VmPanelError, VALIDATION, NOT_FOUND, PERMISSION_DENIED } from '../../lib/errors.js';
 
 const CACHE_TTL_MS = 60 * 1000; // §11.3: cache permission 60 detik
+// A2#11: `perm_epoch` di meta users.db dipakai untuk invalidate cache LINTAS
+// proses (panel vs manager). Mutasi role/status/scope/user menaikkan epoch dalam
+// transaksi yang sama; setiap checkPermission pada cache-HIT membandingkan epoch
+// (1 SELECT baris PK — murah, sinkron) alih-alih menunggu entry lokal kedaluwarsa
+// 60 dtk → instance lain tak lagi layani role basi. Semantik izin TIDAK berubah,
+// hanya freshness. Reload entry penuh (role+status+scopes) HANYA saat epoch berubah
+// atau TTL habis → jalur panas tetap murah.
+const EPOCH_KEY = 'perm_epoch';
 
 /**
  * Matriks izin §11.2. Set = role yang diizinkan per action.
@@ -105,15 +113,43 @@ export class PermissionManager {
       deleteScope: this.#h.db.prepare(
         'DELETE FROM project_scopes WHERE user_id = ? AND project_id = ?',
       ),
+      // A2#11: epoch izin lintas proses (tabel meta users.db — sudah ada dari
+      // BASE_STATEMENTS). getEpoch murah (1 baris PK); bumpEpoch dijalankan
+      // DALAM transaksi mutasi yang sama sehingga writer & reader melihat nilai
+      // monotonik. Kalau row belum ada (DB lama), ensureEpoch membuatnya.
+      ensureEpoch: this.#h.db.prepare(
+        `INSERT INTO meta (key, value, updated_at)
+         SELECT ?, '1', ?
+         WHERE NOT EXISTS (SELECT 1 FROM meta WHERE key = ?)`,
+      ),
+      getEpoch: this.#h.db.prepare('SELECT value FROM meta WHERE key = ?'),
+      bumpEpoch: this.#h.db.prepare(
+        `UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), updated_at = ?
+         WHERE key = ?`,
+      ),
     };
+    // Pastikan baris epoch ada sekali saat init (idempotent).
+    this.#stmts.ensureEpoch.run(EPOCH_KEY, nowIso(), EPOCH_KEY);
   }
 
   #h;
-  /** Map<userId, {role, status, scopes: Map<projectId, boolean>, expiresAt}> */
+  /** Map<userId, {role, status, scopes: Map<projectId, boolean>, expiresAt, epoch}> */
   #cache = new Map();
   #stmts;
 
   // --- internal helpers --------------------------------------------------
+
+  /** Baca epoch izin saat ini (1 SELECT baris PK — murah & sinkron). */
+  #readEpochNow() {
+    const row = this.#stmts.getEpoch.get(EPOCH_KEY);
+    const v = row ? Number(row.value) : 0;
+    return Number.isFinite(v) ? v : 0;
+  }
+
+  /** Naikkan epoch (dipanggil DALAM transaksi mutasi yang sama). */
+  #bumpEpoch() {
+    this.#stmts.bumpEpoch.run(nowIso(), EPOCH_KEY);
+  }
 
   #rowToUser(r) {
     if (!r) return null;
@@ -142,8 +178,12 @@ export class PermissionManager {
   /** Entry cache (role+status+scopes) atau null jika user tidak ada. */
   #getCached(userId) {
     const now = Date.now();
+    const epoch = this.#readEpochNow();
     const hit = this.#cache.get(userId);
-    if (hit && hit.expiresAt > now) return hit;
+    // A2#11: entry valid hanya jika belum kedaluwarsa TTL DAN epoch global belum
+    // berubah. Perubahan oleh instance lain (epoch naik) → cache lokal dianggap
+    // basi meski TTL belum habis → dibaca ulang.
+    if (hit && hit.expiresAt > now && hit.epoch === epoch) return hit;
     this.#cache.delete(userId);
     const row = this.#loadUserRow(userId);
     const entry = row
@@ -152,6 +192,7 @@ export class PermissionManager {
           status: row.status,
           scopes: this.#loadScopes(userId),
           expiresAt: now + CACHE_TTL_MS,
+          epoch,
         }
       : null;
     if (entry) this.#cache.set(userId, entry);
@@ -198,6 +239,7 @@ export class PermissionManager {
       status: 'active',
       scopes: new Map(),
       expiresAt: Date.now() + CACHE_TTL_MS,
+      epoch: this.#readEpochNow(),
     });
     return { userId, created: true };
   }
@@ -235,12 +277,18 @@ export class PermissionManager {
       throw new VmPanelError(VALIDATION, `createUser: username sudah dipakai: ${u}`, { username: u });
     }
     const userId = genId('usr_');
-    this.#stmts.insertUser.run(userId, u, role, st, nowIso());
+    // A2#11: user baru mengubah lanskap izin lintas proses → bump epoch dalam
+    // transaksi insert yang sama.
+    this.#h.tx(() => {
+      this.#stmts.insertUser.run(userId, u, role, st, nowIso());
+      this.#bumpEpoch();
+    });
     this.#cache.set(userId, {
       role,
       status: st,
       scopes: new Map(),
       expiresAt: Date.now() + CACHE_TTL_MS,
+      epoch: this.#readEpochNow(),
     });
     return { userId, username: u, role, status: st };
   }
@@ -255,6 +303,7 @@ export class PermissionManager {
     const uid = String(userId);
     this.#h.tx(() => {
       this.#stmts.setStatus.run('active', uid);
+      this.#bumpEpoch(); // A2#11
     });
     this.#cache.delete(uid);
     return {
@@ -292,6 +341,7 @@ export class PermissionManager {
     }
     this.#h.tx(() => {
       this.#stmts.setRole.run(role, uid);
+      this.#bumpEpoch(); // A2#11
     });
     this.#cache.delete(uid);
     return { userId: uid, username: row.username, role, changedBy: actor.id };
@@ -321,8 +371,8 @@ export class PermissionManager {
       } else {
         this.#stmts.deleteScope.run(uid, pid);
       }
+      this.#bumpEpoch(); // A2#11
     });
-    this.#cache.delete(uid);
     this.#cache.delete(uid);
     return { userId: uid, projectId: pid, allowed };
   }
