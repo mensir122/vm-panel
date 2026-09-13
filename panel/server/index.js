@@ -60,6 +60,10 @@ const RATE_WINDOW_MS = 60_000;
 const DEFAULT_PORT = 8080;
 const DEFAULT_RATE_PER_MIN = 60;
 const DEFAULT_LOGIN_RATE_PER_MIN = 10;
+// FX-2 BUG 2: /static + /assets dapat bucket TERPISAH (s:<ip>) dengan limit
+// tinggi — dokumen + css + js + logo + revalidasi ETag = 5-10 req per
+// navigasi, sehingga sebelumnya cepat menghabiskan bucket global 60/menit.
+const DEFAULT_STATIC_RATE_PER_MIN = 600;
 const DEFAULT_SESSION_TTL_MIN = 480;
 const DEFAULT_MANAGER_API_PORT = 8097;
 const MANAGER_DOWN_BANNER = 'Manager tidak terjangkau';
@@ -86,13 +90,23 @@ const PROJECT_DETAIL_CACHE_TTL_MS = 60_000;
 const PROJECT_DETAIL_MAX = 100;
 /** execFile git tanpa shell (argumen aman); timeout melindungi dari hang. */
 const execFileP = promisify(execFile);
+// FX-3: motif KANONIK 12 halaman template (lingkaran putih %23FFFFFF di atas
+// kanvas obsidian %230A0D0C, rx=8) — sebelumnya memakai chevron biru GitHub
+// %2358a6ff yang menyimpang dari brand monokrom ORIONT.
 const FAVICON_SVG =
-  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0a0a'/%3E%3Cpath d='M9 9l7 14 7-14' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E";
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230A0D0C'/%3E%3Ccircle cx='16' cy='16' r='9' stroke='%23FFFFFF' stroke-width='2' fill='none'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%23FFFFFF'/%3E%3C/svg%3E";
+/** FX-3: payload data-URI di-decode untuk body respons rute /favicon.ico. */
+const FAVICON_BODY = decodeURIComponent(FAVICON_SVG.slice('data:image/svg+xml,'.length));
+/** ETag-mini konstan (aset statis dari konstanta, bukan mtime file). */
+const FAVICON_ETAG = `W/"fav-${FAVICON_BODY.length.toString(36)}"`;
 
 const STATIC_TYPES = {
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.svg': 'image/svg+xml',
+  // FX-2 BUG 1: '/static/oriont-logo.png' direferensikan login.html + sidebar
+  // SEMUA template tanpa '.png' di map → selalu 404 di browser.
+  '.png': 'image/png',
 };
 
 const STATUS_BY_CODE = {
@@ -669,6 +683,9 @@ export class PanelServer {
     this.#loginRatePerMin = Number.isInteger(panelCfg.loginRatePerMin)
       ? panelCfg.loginRatePerMin
       : DEFAULT_LOGIN_RATE_PER_MIN;
+    this.#staticRatePerMin = Number.isInteger(panelCfg.staticRatePerMin)
+      ? panelCfg.staticRatePerMin
+      : DEFAULT_STATIC_RATE_PER_MIN;
     const ttlMin = Number.isInteger(panelCfg.sessionTtlMin) ? panelCfg.sessionTtlMin : DEFAULT_SESSION_TTL_MIN;
     const localhostBypass2fa = panelCfg.localhostBypass2fa !== undefined ? Boolean(panelCfg.localhostBypass2fa) : true;
 
@@ -692,6 +709,7 @@ export class PanelServer {
   #port;
   #ratePerMin;
   #loginRatePerMin;
+  #staticRatePerMin;
   #auth;
   #managerClient;
   #defaultManager;
@@ -1093,12 +1111,37 @@ export class PanelServer {
       } catch {
         return this.#sendError(res, req, 400, VALIDATION, 'path tidak valid');
       }
-      // A2#21: static JUGA dibatasi rate limit global (sebelumnya lolos
-      // total); /health dikecualikan — probe monitoring tidak boleh di-throttle.
-      if (pathname !== '/health' && this.#isRateLimited(`g:${ip}`, this.#ratePerMin)) {
+      // FX-2 BUG 2: /static + /assets pakai bucket TERPISAH `s:${ip}`
+      // (staticRatePerMin, default 600/menit) — tidak lagi memakan bucket
+      // global dokumen/API. /health tetap dikecualikan (probe monitoring).
+      if (pathname !== '/health' && this.#isRateLimited(`s:${ip}`, this.#staticRatePerMin)) {
         return this.#sendError(res, req, 429, 'RATE_LIMITED', 'Terlalu banyak permintaan. Coba lagi nanti.');
       }
       return await this.#serveStatic(req, res, rest);
+    }
+
+    // FX-3: /favicon.ico — browser memintanya tanpa cookie (sebelum login juga),
+    // jadi ditulis BERSEBELAHAN dengan rute static dan SEBELUM gerbang session.
+    // Ikut bucket static `s:${ip}` (aset, bukan dokumen) + ETag-mini/304.
+    if (method === 'GET' && pathname === '/favicon.ico') {
+      if (this.#isRateLimited(`s:${ip}`, this.#staticRatePerMin)) {
+        return this.#sendError(res, req, 429, 'RATE_LIMITED', 'Terlalu banyak permintaan. Coba lagi nanti.');
+      }
+      const inm = req.headers['if-none-match'];
+      if (typeof inm === 'string' && inm.split(',').some((t) => t.trim() === FAVICON_ETAG || t.trim() === '*')) {
+        res.writeHead(304, { ETag: FAVICON_ETAG });
+        res.end();
+        return;
+      }
+      if (!res.headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'image/svg+xml',
+          'Cache-Control': 'no-cache',
+          ETag: FAVICON_ETAG,
+        });
+        res.end(FAVICON_BODY);
+      }
+      return;
     }
 
     try {

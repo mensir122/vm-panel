@@ -84,6 +84,15 @@ function makeFixtures() {
     writeFileSync(join(templates, `${name}.html`), content);
   }
   writeFileSync(join(staticDir, 'style.css'), '.x { color: red; }');
+  // FX-2 BUG 1: dummy PNG 1x1 — logo yang direferensikan template
+  // (oriont-logo.png) diuji lewat fixture staticDir, pola sama dgn style.css.
+  writeFileSync(
+    join(staticDir, 'oriont-logo.png'),
+    Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+      'base64',
+    ),
+  );
   // file DI LUAR static dir — target uji traversal (harus ditolak)
   writeFileSync(join(root, 'secret.txt'), 'TOPSECRET');
   return { root, templates, staticDir };
@@ -477,6 +486,29 @@ describe('PanelServer', () => {
     assert.ok(r.body.includes('ERROR_PAGE'));
     assert.ok(!r.body.includes('at '), 'tanpa stack trace');
   });
+
+  test('FX-3: GET /favicon.ico tanpa cookie → 200 image/svg+xml (motif oriont) + 304 ETag', async () => {
+    // TANPA header cookie sama sekali — browser minta favicon juga pra-login.
+    const r = await request(ctx.port, 'GET', '/favicon.ico');
+    assert.equal(r.status, 200, 'favicon harus 200 tanpa session (rute publik)');
+    assert.ok(r.headers['content-type'].includes('image/svg+xml'), `content-type (${r.headers['content-type']})`);
+    assert.equal(r.headers['cache-control'], 'no-cache');
+    assert.ok(r.body.includes("<svg xmlns='http://www.w3.org/2000/svg'"), `body SVG (${r.body.slice(0, 60)})`);
+    assert.ok(r.body.includes("circle cx='16' cy='16' r='9'"), 'motif lingkaran oriont (bukan chevron lama)');
+    const etag = r.headers.etag;
+    assert.ok(typeof etag === 'string' && etag.startsWith('W/"'), `ETag mini ada (${etag})`);
+    const r2 = await request(ctx.port, 'GET', '/favicon.ico', { headers: { 'if-none-match': etag } });
+    assert.equal(r2.status, 304, 'revalidasi If-None-Match → 304 tanpa body');
+    assert.equal(r2.body, '');
+  });
+
+  test('FX-3: FAVICON_SVG brand sync — tidak lagi memuat biru GitHub 58a6ff', async () => {
+    const r = await request(ctx.port, 'GET', '/favicon.ico');
+    assert.equal(r.status, 200);
+    assert.ok(!r.body.includes('58a6ff'), 'stroke biru GitHub hilang dari favicon');
+    assert.ok(r.body.includes("fill='#0A0D0C'"), 'kanvas obsidian kanonik (%230A0D0C ter-decode)');
+    assert.ok(r.body.includes("stroke='#FFFFFF'"), 'stroke putih monokrom ORIONT');
+  });
 });
 
 describe('PanelServer: rate limit login', () => {
@@ -510,6 +542,63 @@ describe('PanelServer: rate limit login', () => {
     assert.ok(bodies[10].includes('Terlalu banyak percobaan login'));
     // dan pasti sudah terkunci sejak request ke-6
     assert.ok(bodies[5].includes('terkunci') || bodies[5].includes('Terlalu banyak'));
+  });
+});
+
+describe('PanelServer: static png MIME + rate bucket static terpisah (FX-2)', () => {
+  const ctx = {};
+
+  before(async () => {
+    ctx.s = makeServer(); // instance BARU → bucket bersih; ratePerMin 60, static default 600
+    await ctx.s.server.start();
+    ctx.port = ctx.s.server.port;
+  });
+
+  after(async () => {
+    await ctx.s.close();
+  });
+
+  test('BUG1: GET /static/oriont-logo.png → 200 image/png (bukan 404)', async () => {
+    const r = await request(ctx.port, 'GET', '/static/oriont-logo.png');
+    assert.equal(r.status, 200, 'logo png harus disajikan (STATIC_TYPES .png)');
+    assert.ok(r.headers['content-type'].includes('image/png'), `content-type (${r.headers['content-type']})`);
+    // alias /assets/ juga harus dapat MIME yang sama
+    const a = await request(ctx.port, 'GET', '/assets/oriont-logo.png');
+    assert.equal(a.status, 200);
+    assert.ok(a.headers['content-type'].includes('image/png'));
+  });
+
+  test('BUG1: extension unknown tetap 404 (bukan dibuka mentah-mentah)', async () => {
+    const r = await request(ctx.port, 'GET', '/static/tidakada.webp');
+    assert.equal(r.status, 404);
+  });
+
+  test('BUG2: 70 GET /static/style.css beruntun → SEMUA 200/304 (bukan 429)', async () => {
+    for (let i = 0; i < 70; i++) {
+      const r = await request(ctx.port, 'GET', '/static/style.css');
+      assert.ok(r.status === 200 || r.status === 304, `static req #${i + 1} → ${r.status} (harus 200/304)`);
+    }
+  });
+
+  test('BUG2: 70 GET /login beruntun → #61+ kena 429 (bucket halaman 60/menit utuh)', async () => {
+    const statuses = [];
+    for (let i = 0; i < 70; i++) {
+      const r = await request(ctx.port, 'GET', '/login');
+      statuses.push(r.status);
+    }
+    for (let i = 0; i < 60; i++) {
+      assert.equal(statuses[i], 200, `login req #${i + 1} masih dalam limit 60`);
+    }
+    for (let i = 60; i < 70; i++) {
+      assert.equal(statuses[i], 429, `login req #${i + 1} harus 429 (bucket global halaman utuh)`);
+    }
+  });
+
+  test('BUG2: setelah halaman di-throttle, static MASIH 200 (bucket tidak saling makan)', async () => {
+    const r = await request(ctx.port, 'GET', '/login');
+    assert.equal(r.status, 429, 'bucket halaman masih penuh (sanity)');
+    const s = await request(ctx.port, 'GET', '/static/style.css');
+    assert.equal(s.status, 200, 'bucket static terpisah → tidak terpengaruh throttle halaman');
   });
 });
 
