@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PanelServer } from '../../panel/server/index.js';
-import { VmPanelError, NOT_FOUND, VALIDATION } from '../../lib/errors.js';
+import { VmPanelError, NOT_FOUND, VALIDATION, PERMISSION_DENIED } from '../../lib/errors.js';
 import { totpGenerate } from '../../lib/crypto.js';
 
 const PID = 'prj_stub01';
@@ -96,6 +96,45 @@ class StubManagerClient {
         refsFile: 'secrets/secrets.yaml',
         secretCount: this.secrets.length,
       };
+    }
+    // L5b: tulis/rotasi nilai (upsert) + hapus dua-fase — respons metadata-only.
+    if (m === 'POST' && /^\/secrets\/[^/]+$/.test(path)) {
+      const name = decodeURIComponent(path.slice('/secrets/'.length));
+      const value = typeof opts.body?.value === 'string' ? opts.body.value : '';
+      const scopeRaw = opts.body?.projectScope;
+      const scope = scopeRaw === null || scopeRaw === undefined || scopeRaw === '' ? '' : String(scopeRaw);
+      if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) {
+        throw new VmPanelError(VALIDATION, 'nama secret tidak valid');
+      }
+      if (value === '' || Buffer.byteLength(value, 'utf8') > 4096) {
+        throw new VmPanelError(VALIDATION, 'value wajib 1..4096 byte');
+      }
+      this.secrets = this.secrets.filter((s) => !(s.name === name && (s.projectScope || '') === scope));
+      this.secrets.push({
+        name,
+        projectScope: scope,
+        createdAt: '2026-09-01T00:00:00Z',
+        updatedAt: '2026-09-06T00:00:00Z',
+        rotatedAt: null,
+        expiresAt: null,
+      });
+      return { name, projectScope: scope, updatedAt: '2026-09-06T00:00:00Z' };
+    }
+    if (m === 'POST' && path.startsWith('/secrets/') && path.endsWith('/remove-request')) {
+      const token = `sectok-${String(++this.seq).padStart(4, '0')}`;
+      this.tokens.push(token);
+      return { confirmToken: token, expiresAt: '2026-09-06T00:00:00Z' };
+    }
+    if (m === 'POST' && path.startsWith('/secrets/') && path.endsWith('/remove')) {
+      const token = String(opts.body?.confirmToken ?? '');
+      if (!this.tokens.includes(token)) {
+        throw new VmPanelError(PERMISSION_DENIED, 'confirmToken manager tidak dikenal');
+      }
+      const name = decodeURIComponent(path.slice('/secrets/'.length).replace(/\/remove$/, ''));
+      const scopeRaw = opts.body?.projectScope;
+      const scope = scopeRaw === null || scopeRaw === undefined || scopeRaw === '' ? '' : String(scopeRaw);
+      this.secrets = this.secrets.filter((s) => !(s.name === name && (s.projectScope || '') === scope));
+      return { removed: true, name, projectScope: scope };
     }
 
     // --- project config files ---
@@ -540,5 +579,113 @@ describe('panel-config-vault (Config & Brankas)', () => {
     assert.ok(text.includes('Manager tidak terjangkau'), 'banner manager down');
     assert.ok(!text.includes('Terjadi kesalahan internal'), 'tanpa crash');
     ctx.stub.failAll = false;
+  });
+
+  // ── L5b: jalur input NILAI rahasia dari kartu Brankas ─────────────────────
+  const SEKRET = 'SEKRITPALSUxyz-panel-l5b';
+
+  test('(16) kartu Brankas punya form nilai (password-masked) + tabel metadata', async () => {
+    const text = await getPage();
+    assert.ok(text.includes('action="/vault/secret"'), 'form simpan rahasia POST ke /vault/secret');
+    assert.ok(text.includes('type="password"'), 'input nilai ter-mask');
+    assert.ok(text.includes('autocomplete="new-password"'), 'browser tidak menyimpan nilai');
+    assert.ok(text.includes('name="projectScope"'), 'pemilih cakupan ada');
+    assert.ok(text.includes('data-confirm="Simpan rahasia ke Brankas?"'), 'Simpan berkunci dialog');
+    assert.ok(text.includes('>db_password</td>'), 'rahasia existing tampil sebagai sel tabel metadata');
+    assert.ok(text.includes('name="name" value="db_password"'), 'tombol Hapus per baris memakai aksi dua-fase');
+    assert.ok(!text.includes(SEKRET), 'nilai tidak pernah muncul di HTML');
+  });
+
+  test('(17) POST /vault/secret → manager menerima nilai, halaman TANPA nilai', async () => {
+    const res = await req(ctx.port, 'POST', '/vault/secret', {
+      jar: ctx.jar,
+      headers: csrfHeaders(),
+      body: form({ name: 'OPENAI_API_KEY', value: SEKRET, projectScope: '', projectId: PID }),
+    });
+    assert.equal(res.status, 302, 'sukses → redirect balik ke halaman detail');
+    assert.equal(res.headers.get('location'), `/projects/${PID}`);
+    assert.ok(!res.headers.get('location').includes(SEKRET));
+    const call = ctx.stub.lastCall('POST', '/secrets/OPENAI_API_KEY');
+    assert.ok(call, 'panel meneruskan POST /secrets/:name ke manager');
+    assert.equal(call.body.value, SEKRET, 'nilai hanya lewat body ke manager');
+    assert.equal(call.body.projectScope, null, 'cakupan global dikirim sebagai null');
+
+    const text = await getPage();
+    // presence dicek dari form Hapus per-baris (bukan placeholder input form)
+    assert.ok(
+      text.includes('name="name" value="OPENAI_API_KEY"'),
+      'metadata nama tampil sebagai baris tabel brankas',
+    );
+    assert.ok(!text.includes(SEKRET), 'nilai haram muncul di HTML');
+  });
+
+  test('(18) /vault/secret: nama/nilai invalid ditolak server-side, CSRF wajib', async () => {
+    const post = (fields) =>
+      req(ctx.port, 'POST', '/vault/secret', {
+        jar: ctx.jar,
+        headers: csrfHeaders(),
+        body: form(fields),
+      });
+    const badName = await post({ name: 'bad-name', value: 'x', projectId: PID });
+    assert.notEqual(badName.status, 302, 'nama invalid tidak boleh dianggap sukses');
+    assert.ok((await badName.text()).includes('Nama rahasia tidak valid'));
+    const emptyVal = await post({ name: 'OK_NAME', value: '', projectId: PID });
+    assert.ok((await emptyVal.text()).includes('Nilai rahasia wajib diisi'));
+    const bigVal = await post({ name: 'OK_NAME', value: 'A'.repeat(4097), projectId: PID });
+    assert.ok((await bigVal.text()).includes('terlalu besar'));
+    assert.equal(ctx.stub.lastCall('POST', '/secrets/OK_NAME'), null, 'validasi gagal → tidak ada panggilan manager');
+
+    const callsBefore = ctx.stub.calls.length;
+    const noCsrf = await req(ctx.port, 'POST', '/vault/secret', {
+      jar: ctx.jar,
+      body: form({ name: 'NO_CSRF', value: 'x', projectId: PID }),
+    });
+    assert.equal(noCsrf.status, 403, 'tanpa CSRF token → ditolak');
+    assert.equal(ctx.stub.calls.length, callsBefore, 'tanpa CSRF tidak ada panggilan manager');
+  });
+
+  test('(19) /vault/secret-remove dua-fase → chain manager remove-request + remove', async () => {
+    const fields = { name: 'OPENAI_API_KEY', projectScope: '', projectId: PID };
+    const removeMatcher = (c) => c.method === 'POST' && c.path === '/secrets/OPENAI_API_KEY/remove';
+    const before = ctx.stub.calls.filter(removeMatcher).length;
+
+    const r1 = await req(ctx.port, 'POST', '/vault/secret-remove', {
+      jar: ctx.jar,
+      headers: csrfHeaders(),
+      body: form(fields),
+    });
+    assert.equal(r1.status, 200, 'fase-1 = halaman konfirmasi, bukan eksekusi');
+    const html1 = await r1.text();
+    assert.ok(html1.includes('Konfirmasi hapus rahasia'), 'halaman konfirmasi fase-1');
+    assert.ok(html1.includes('name="name" value="OPENAI_API_KEY"'), 'identitas terbawa ke fase-2');
+    assert.ok(!html1.includes(SEKRET), 'fase-1 tidak memuat nilai');
+    assert.equal(ctx.stub.calls.filter(removeMatcher).length, before, 'fase-1 jangan memanggil remove');
+    const tok = (html1.match(/name="confirmToken" value="([^"]+)"/) || [])[1];
+    assert.ok(tok && /^[0-9a-f]{64}$/.test(tok), 'token panel sekali-pakai dirender');
+
+    const bogus = await req(ctx.port, 'POST', '/vault/secret-remove', {
+      jar: ctx.jar,
+      headers: csrfHeaders(),
+      body: form({ ...fields, confirmToken: 'f'.repeat(64) }),
+    });
+    assert.notEqual(bogus.status, 302, 'token palsu tidak boleh eksekusi');
+    assert.ok((await bogus.text()).includes('Token konfirmasi tidak valid'));
+    assert.equal(ctx.stub.calls.filter(removeMatcher).length, before, 'token palsu berhenti di panel');
+
+    const r2 = await req(ctx.port, 'POST', '/vault/secret-remove', {
+      jar: ctx.jar,
+      headers: csrfHeaders(),
+      body: form({ ...fields, confirmToken: tok }),
+    });
+    assert.equal(r2.status, 302, 'fase-2 tereksekusi');
+    assert.ok(ctx.stub.lastCall('POST', '/secrets/OPENAI_API_KEY/remove-request'), 'remove-request lebih dulu');
+    assert.equal(ctx.stub.calls.filter(removeMatcher).length, before + 1, 'fase-2 men-chain manager remove');
+
+    const text = await getPage();
+    assert.ok(
+      !text.includes('name="name" value="OPENAI_API_KEY"'),
+      'baris tabel + tombol Hapus rahasia hilang setelah dua-fase',
+    );
+    assert.ok(!text.includes('>OPENAI_API_KEY</td>'), 'sel tabel nama ikut hilang');
   });
 });

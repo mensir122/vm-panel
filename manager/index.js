@@ -52,11 +52,17 @@ export class Manager {
     this.dataDir = join(rootDir, 'data');
     this.config = config ?? null;
     this.version = VERSION;
-    this.logger =
-      logger ??
-      createLogger({ dir: join(rootDir, 'logs', 'manager'), name: 'manager', redactor: makeRedactor({ extraValues: token ? [token] : [] }) });
     // Token API: argumen > env > random sekali per proses (loopback-only).
     this.token = typeof token === 'string' && token.length > 0 ? token : process.env.MANAGER_API_TOKEN || randomToken(32);
+    // Redactor SHARED — SATU instans dipegang logger Manager, AuditManager, dan
+    // ServiceManager. D3: saat start service, nilai env-secret hasil resolve
+    // ditambahkan via `addExtraValues` sehingga TIDAK PERNAH muncul utuh di
+    // log/audit jalur mana pun (defense-in-depth di luar pola nama-key). Token
+    // API ikut di-seed sejak awal.
+    this.redactor = makeRedactor({ extraValues: this.token ? [this.token] : [] });
+    this.logger =
+      logger ??
+      createLogger({ dir: join(rootDir, 'logs', 'manager'), name: 'manager', redactor: this.redactor });
 
     this.dbs = { platform: null, projects: null, services: null };
     this.auditManager = null;
@@ -179,6 +185,9 @@ export class Manager {
     this.auditManager = new AuditManager({
       dataDir: this.dataDir,
       logDir: join(this.rootDir, 'logs', 'manager'),
+      // D3: SATU redactor shared dengan logger Manager — nilai secret yang
+      // ditambahkan runtime ikut tereduksi di log internal audit + input_json.
+      redactor: this.redactor,
     });
     this.permissionManager = new PermissionManager({ dataDir: this.dataDir });
     // Owner-bootstrap: actor 'system' untuk cek permission /audit.
@@ -219,6 +228,36 @@ export class Manager {
     const { HealthManager } = await import('./health_manager/index.js');
     this.healthManager = new HealthManager({ dataDir: this.dataDir });
 
+    // SecretManager dibuat LEBIH DULU dari ServiceManager (D3): ServiceManager
+    // butuh referensinya untuk me-resolve project_env_refs → nilai Vault saat
+    // start service. Tidak ada dependensi ServiceManager pada konstruktor SecretManager.
+    const { SecretManager } = await import('./secret_manager/index.js');
+    this.secretManager = new SecretManager({
+      rootDir: this.rootDir,
+      dataDir: this.dataDir,
+      masterKey: process.env.VPANEL_MASTER_KEY,
+      projectsDb: this.dbs.projects?.db ?? null,
+    });
+
+    // Gate-3 R2: preload SEMUA nilai vault yang ADA SEBELUM boot ke redactor
+    // SHARED — menutup jendela bocor: tanpa ini, nilai secret hasil boot
+    // sebelumnya tidak ter-redaksi di log/audit sampai startService pertama
+    // mendaftarkannya ulang. Vault belum init / satu entri korup → skip
+    // fail-soft; start manager tidak pernah diblokir oleh prelaod ini.
+    try {
+      const vaultMetas = this.secretManager.listSecrets();
+      let preRedacted = 0;
+      for (const m of vaultMetas) {
+        try {
+          const val = this.secretManager.getSecretValue(m.name, { projectScope: m.projectScope });
+          if (typeof val === 'string' && val !== '' && this.redactor.addExtraValues([val]) > 0) {
+            preRedacted += 1;
+          }
+        } catch { /* satu secret tak terbaca — lewati, jangan gagalkan boot */ }
+      }
+      if (preRedacted > 0) this.logger.info('manager.secrets_preredacted', { count: preRedacted });
+    } catch { /* vault belum diinisialisasi — jalur sah fresh install */ }
+
     const { ServiceManager } = await import('./service_manager/index.js');
     this.serviceManager = new ServiceManager({
       dataDir: this.dataDir,
@@ -226,6 +265,11 @@ export class Manager {
       auditManager: this.auditManager,
       projectsDbPath: join(this.dataDir, 'projects.db'),
       logger: this.logger,
+      // D3: materialisasi env-secret saat start — pointer di projects.db
+      // (project_env_refs) di-resolve ke nilai Vault lewat SecretManager; nilai
+      // ikut didaftarkan ke redactor SHARED agar tak pernah bocor ke log/audit.
+      secretManager: this.secretManager,
+      redactor: this.redactor,
     });
 
     const { RollbackManager } = await import('./rollback_manager/index.js');
@@ -273,14 +317,6 @@ export class Manager {
 
     const { ImportManager } = await import('./import_manager/index.js');
     this.importManager = new ImportManager({ dataDir: this.dataDir });
-
-    const { SecretManager } = await import('./secret_manager/index.js');
-    this.secretManager = new SecretManager({
-      rootDir: this.rootDir,
-      dataDir: this.dataDir,
-      masterKey: process.env.VPANEL_MASTER_KEY,
-      projectsDb: this.dbs.projects?.db ?? null,
-    });
 
     const { InternalSupervisor } = await import('./recovery_manager/index.js');
     this.internalSupervisor = new InternalSupervisor({

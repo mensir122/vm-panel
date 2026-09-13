@@ -19,10 +19,12 @@ bm.close?.();
 ")
 echo "[backup_final] backup final valid: ${BACKUP_ID}"
 
-# Enkripsi SATU backup dir terbaru → runtime/vm-state.enc (AES-256-GCM,
-# kunci = PBKDF2(VPANEL_MASTER_KEY)). Hanya file ini yang di-upload ke
-# artifact — plaintext TIDAK PERNAH meninggalkan runner.
-node scripts/state-container.mjs encrypt "backups/manual/${BACKUP_ID}" runtime/vm-state.enc "${VPANEL_MASTER_KEY:?VPANEL_MASTER_KEY wajib}"
+# Enkripsi SATU backup dir terbaru + vault secrets (secrets/vault.enc,
+# secrets/secrets.yaml, secrets/configs/** — cap 4MB, guard fingerprint kunci
+# di header) → runtime/vm-state.enc (AES-256-GCM, kunci =
+# PBKDF2(VPANEL_MASTER_KEY)). Hanya file ini yang di-upload ke artifact —
+# plaintext TIDAK PERNAH meninggalkan runner.
+node scripts/state-container.mjs encrypt "backups/manual/${BACKUP_ID}" runtime/vm-state.enc "${VPANEL_MASTER_KEY:?VPANEL_MASTER_KEY wajib}" --secretsroot .
 echo "[backup_final] state terenkripsi: runtime/vm-state.enc"
 
 # --- VAULT BRANCH: commit .enc ke branch 'state' (backup permanen otomatis) ---

@@ -13,6 +13,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { openDatabase } from '../../lib/db.js';
 import { genId, isValidId } from '../../lib/ids.js';
@@ -49,6 +50,15 @@ function safeJsonParse(text, fallback = null) {
 }
 
 /**
+ * D3 — fingerprint SHA-256 nilai secret (8 hex pertama). Dipakai HANYA untuk
+ * log/audit `service.env_resolved` sehingga jejak verifikasi ada TANPA pernah
+ * menuliskan nilai rahasia apa pun.
+ */
+function secretFingerprint(value) {
+  return createHash('sha256').update(String(value)).digest('hex').slice(0, 8);
+}
+
+/**
  * ServiceManager — lifecycle service: create/start/stop/restart/health,
  * registry port, state supervisor, enable/disable.
  */
@@ -61,6 +71,8 @@ export class ServiceManager {
    *   auditManager?: object|null,
    *   projectsDbPath?: string|null,
    *   logger?: {debug,info,warn,error}|null,
+   *   secretManager?: object|null,
+   *   redactor?: ((input: any) => any)|null,
    * }} opts
    */
   constructor({
@@ -70,6 +82,8 @@ export class ServiceManager {
     auditManager = null,
     projectsDbPath = null,
     logger = null,
+    secretManager = null,
+    redactor = null,
   }) {
     if (!dataDir || typeof dataDir !== 'string') {
       throw new VmPanelError(VALIDATION, 'ServiceManager: dataDir wajib');
@@ -82,6 +96,13 @@ export class ServiceManager {
     this.adapters = adapters;
     this.auditManager = auditManager;
     this.logger = logger ?? NOOP_LOGGER;
+    // D3 — materialisasi env-secret saat start. `secretManager` menyediakan
+    // listProjectEnv (pointer env→secret di projects.db), listSecrets (metadata
+    // TANPA nilai: nama→projectScope), getSecretValue (isi Vault). `redactor`
+    // HARUS instans SHARED yang sama dengan logger+audit (manager/index.js) agar
+    // nilai hasil resolve ikut diredaksi di SEMUA jalur tulis (addExtraValues).
+    this.secretManager = secretManager;
+    this.redactor = redactor;
     fs.mkdirSync(this.dataDir, { recursive: true });
 
     const opened = openDatabase(path.join(this.dataDir, 'services.db'), {
@@ -385,6 +406,116 @@ export class ServiceManager {
   }
 
   /**
+   * D3 — Materialisasi env-secret sebelum spawn.
+   *
+   * Sumber kebenaran: `project_env_refs` di projects.db (pointer envName →
+   * secret_ref), dibaca via SecretManager.listProjectEnv(projectId). Nilainya
+   * hidup terenkripsi di Vault; diambil via getSecretValue dengan projectScope
+   * yang SESUNGGUHNYA tercatat di metadata (listSecrets — TANPA pernah
+   * membaca/mencetak nilai).
+   *
+   * Kontrak (dipakai juga lane L3):
+   *  - listProjectEnv(projectId) → [{ envName: string, secretName: string }]
+   *  - listSecrets()             → [{ name, projectScope, ... }]  (metadata saja)
+   *  - getSecretValue(name, { projectScope }) → string (throw bila tak resolve)
+   *
+   * Aturan:
+   *  - secretManager tidak diinjeksi / projectId bukan `prj_` valid / TIDAK ada
+   *    ref  → kembalikan {} (perilaku identik seperti sebelum D3; nol regresi).
+   *  - ref tak resolve (nama hilang di Vault, scope tak cocok, vault absent,
+   *    atau nilai kosong) → throw VmPanelError(VALIDATION) SEBELUM spawn +
+   *    audit `startService.env_resolve_failed`. DILARANG start tanpa token.
+   *  - tiap nilai yang BERHASIL: didaftarkan ke redactor SHARED (addExtraValues)
+   *    lalu dicatat `service.env_resolved` { name, fp } — fp = 8 hex sha256,
+   *    TIDAK PERNAH nilai.
+   *
+   * @param {string|null} projectId
+   * @param {string} serviceId
+   * @returns {Record<string, string>} envName → nilai (hanya untuk child env)
+   */
+  _resolveSecretEnv(projectId, serviceId) {
+    const resolved = {};
+    const sm = this.secretManager;
+    // Tanpa SecretManager: fitur mati rapet — jangan pernah menyentuh vault/DB.
+    if (!sm || typeof sm.listProjectEnv !== 'function') return resolved;
+    if (!isValidId(projectId, 'prj_')) return resolved;
+
+    const refs = sm.listProjectEnv(projectId);
+    if (!Array.isArray(refs) || refs.length === 0) return resolved;
+
+    // Temukan projectScope tiap secret lewat METADATA saja (listSecrets tidak
+    // memuat nilai). Kegagalan baca vault = semua ref tak bisa di-resolve.
+    let scopeByName;
+    try {
+      const metas =
+        typeof sm.listSecrets === 'function' ? sm.listSecrets() : null;
+      scopeByName = new Map();
+      for (const m of metas ?? []) {
+        if (m && typeof m.name === 'string') scopeByName.set(m.name, m.projectScope ?? null);
+      }
+    } catch (e) {
+      const first = refs.find((r) => r && r.envName) ?? {};
+      const envName = first.envName ?? 'unknown';
+      this._audit('startService.env_resolve_failed', {
+        actor: 'system',
+        serviceId,
+        projectId,
+        result: 'error',
+        input: { envName, reason: 'vault_unavailable', detail: String(e?.message ?? e) },
+      });
+      throw new VmPanelError(VALIDATION, `secret_ref tidak resolve: ${envName}`, {
+        serviceId,
+        projectId,
+        envName,
+      });
+    }
+
+    for (const ref of refs) {
+      const envName = ref?.envName;
+      const secretName = ref?.secretName;
+      const fail = (detail) => {
+        this._audit('startService.env_resolve_failed', {
+          actor: 'system',
+          serviceId,
+          projectId,
+          result: 'error',
+          input: { envName: envName ?? null, secretName: secretName ?? null, reason: 'secret_ref_unresolved', detail },
+        });
+        throw new VmPanelError(VALIDATION, `secret_ref tidak resolve: ${String(envName)}`, {
+          serviceId,
+          projectId,
+          envName: envName ?? null,
+        });
+      };
+      if (!envName || !secretName) fail('ref_tidak_lengkap');
+      if (!scopeByName.has(secretName)) fail('nama_tidak_ada_di_vault');
+
+      let value;
+      try {
+        value = sm.getSecretValue(secretName, { projectScope: scopeByName.get(secretName) });
+      } catch (e) {
+        fail(String(e?.message ?? e));
+      }
+      // Nilai kosong/undefined bukan token sah — start tanpa token DILARANG.
+      if (typeof value !== 'string' || value.length === 0) fail('nilai_kosong');
+
+      // Daftarkan ke redactor SHARED SEBELUM log apa pun → nilai tak pernah
+      // lolos ke baris log/audit berikutnya, bahkan di jalur tak terduga.
+      if (typeof this.redactor?.addExtraValues === 'function') {
+        this.redactor.addExtraValues([value]);
+      }
+      resolved[envName] = value;
+      this.logger.info('service.env_resolved', {
+        serviceId,
+        projectId,
+        name: envName,
+        fp: secretFingerprint(value),
+      });
+    }
+    return resolved;
+  }
+
+  /**
    * Start service. Status wajib stopped/failed (else VALIDATION 'bad state').
    * portBindTest dulu → false → PORT_IN_USE. Setelah spawn: upsert
    * supervisor_state (running, restart_count 0), UPDATE services
@@ -418,11 +549,19 @@ export class ServiceManager {
     const adapter = this._resolveAdapter(rec, serviceLike);
     const spec = adapter.startSpec(serviceLike);
 
+    // D3 — resolve env-secret SEBELUM spawn. Failure → throw (start gagal, tidak
+    // pernah spawn tanpa token). Merge dipertahankan: hierarki lama utuh untuk
+    // non-rahasia (whitelist < extraEnv < env), rahasia DITAMBAHKAN di puncak
+    // `env` sehingga menang atas env mentah namun tak mengubah yang lain.
+    const baseEnv = spec.env ?? {};
+    const resolvedEnv = this._resolveSecretEnv(rec.projectId, serviceId);
+    const startEnv = Object.keys(resolvedEnv).length > 0 ? { ...baseEnv, ...resolvedEnv } : baseEnv;
+
     const { pid, startTimeHint } = this.processManager.startProcess({
       serviceId,
       argv: spec.argv,
       cwd: spec.cwd,
-      env: spec.env ?? {},
+      env: startEnv,
       extraEnv: {},
       // #32 — port ikut dilaporkan ke ProcessManager supaya exit-handler bisa
       // mengenali pola "gagal segera karena port sudah dipegang pihak lain".

@@ -1319,10 +1319,119 @@
     syncActive();
   }
 
+  /* ---------- One-Click Cloud 24/7 (form[data-cloud247]) ---------- */
+
+  /* Progressive enhancement: form bertanda data-cloud247 dikirim sebagai
+     fetch JSON ({steps:[{name,status,detail}], next}) dan hasilnya dipakai
+     untuk mengisi #cloud247-steps (semua node dibuat dengan createElement +
+     textContent — TIDAK ada innerHTML dari data server). Bila fetch/parse
+     gagal, form fallback ke submit native (server tetap merender halaman
+     hasil yang sama). Rute server: POST /projects/:id/deploy-cloud-247.
+     Publish state TIDAK pernah dipanggil dari sini — aksi destruktif itu
+     selalu lewat halaman konfirmasi dua fase sisi server. */
+
+  function cloud247Form(form) {
+    if (!form || form.nodeType !== 1) return null;
+    if (form.hasAttribute && form.hasAttribute("data-cloud247")) return form;
+    return form.closest ? form.closest("form[data-cloud247]") : null;
+  }
+
+  function renderCloud247Steps(target, steps) {
+    if (!target) return;
+    while (target.firstChild) target.removeChild(target.firstChild);
+    target.hidden = false;
+    for (var i = 0; i < steps.length; i++) {
+      var s = steps[i] || {};
+      var row = document.createElement("p");
+      row.className = "field__hint";
+      row.setAttribute("data-cloud-step", String(s.name || "langkah"));
+      var badge = document.createElement("span");
+      var st = String(s.status || "");
+      badge.className =
+        "badge" +
+        (st === "ok" ? " badge--ok" : st === "failed" ? " badge--err" : st === "pending" ? " badge--warn" : "");
+      badge.textContent = st === "skipped" ? "lewati" : st || "-";
+      var name = document.createElement("span");
+      name.className = "mono";
+      name.textContent = String(s.name || "-") + " ";
+      var detail = document.createElement("span");
+      detail.className = "muted";
+      detail.textContent = String(s.detail || "");
+      row.appendChild(name);
+      row.appendChild(badge);
+      row.appendChild(document.createTextNode(" "));
+      row.appendChild(detail);
+      target.appendChild(row);
+    }
+  }
+
+  async function submitCloud247(form) {
+    var targetSel = form.getAttribute("data-cloud247-target") || "#cloud247-steps";
+    var target = document.querySelector(targetSel);
+    var csrfEl = form.querySelector('input[type="hidden"][name="_csrf"]');
+    var body = new URLSearchParams(new FormData(form));
+    body.set("_format", "json");
+    var btn = form.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
+    var res = null;
+    try {
+      res = await fetch(form.getAttribute("action"), {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          accept: "application/json",
+          "x-csrf-token": csrfEl ? csrfEl.value : "",
+        },
+        body: body.toString(),
+      });
+    } catch (err) {
+      /* jaringan mati total (respons belum tentu diproses server) → native */
+      if (btn) btn.disabled = false;
+      if (target) {
+        target.hidden = false;
+        target.textContent = "Tidak bisa menghubungi panel — mencoba kirim ulang tanpa JavaScript.";
+      }
+      if (typeof form.submit === "function") form.submit();
+      return;
+    }
+    var data = null;
+    try {
+      data = await res.json();
+    } catch (err) {
+      data = null;
+    }
+    if (btn) btn.disabled = false;
+    if (!data || !Array.isArray(data.steps)) {
+      /* respons bukan JSON (mis. sesi kedaluwarsa → redirect HTML) → ikut alur native */
+      window.location.href = "/projects";
+      return;
+    }
+    renderCloud247Steps(target, data.steps);
+    if (data.ok && data.next === "publish-state") {
+      var note = document.createElement("p");
+      note.className = "field__hint";
+      note.textContent =
+        "Manifest ter-push. Langkah terakhir (publish state) menimpa state cloud dan butuh konfirmasi terpisah — gunakan tombol Publish state di kartu ini.";
+      if (target) target.appendChild(note);
+      var publish = document.querySelector("[data-publish-state]");
+      if (publish) publish.hidden = false;
+    }
+  }
+
+  function onCloud247Submit(e) {
+    var form = cloud247Form(e.target);
+    if (!form) return;
+    if (e.defaultPrevented) return; /* masih di tahap dialog data-confirm */
+    if (!window.fetch || !window.URLSearchParams) return; /* tanpa JS: native */
+    e.preventDefault();
+    submitCloud247(form);
+  }
+
   /* ---------- Init ---------- */
 
   function init() {
     document.addEventListener("submit", onSubmit, true);
+    document.addEventListener("submit", onCloud247Submit, true);
     document.addEventListener("click", onClickReveal, true);
     document.addEventListener("click", onClick, true);
     var logs = document.querySelectorAll("[data-autoscroll]");

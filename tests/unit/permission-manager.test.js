@@ -7,6 +7,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PermissionManager } from '../../manager/permission_manager/index.js';
+import { registerDataRoutes } from '../../manager/api-data-routes.js';
 import { openDatabase } from '../../lib/db.js';
 import { VmPanelError, VALIDATION, NOT_FOUND, PERMISSION_DENIED } from '../../lib/errors.js';
 
@@ -118,6 +119,7 @@ describe('matriks izin §11.2 — semua action × 3 role', () => {
     'backup.restore',
     'deployment.rollback',
     'secret.view',
+    'secret.manage',
     'permission.manage',
     'user.manage',
     'audit.view',
@@ -132,6 +134,7 @@ describe('matriks izin §11.2 — semua action × 3 role', () => {
     'backup.restore',
     'deployment.rollback',
     'secret.view',
+    'secret.manage',
     'permission.manage',
     'user.manage',
     'audit.purge',
@@ -461,5 +464,55 @@ describe('cache 60s + invalidasi', () => {
     } finally {
       pm2.close();
     }
+  });
+});
+
+describe('secret.manage (L5b) — owner-only + terikat rute tulis brankas', () => {
+  test('owner allowed; operator & viewer & tanpa user ditolak', () => {
+    const { owner, operator, viewer } = setupUsers();
+    assert.equal(
+      pm.checkPermission({ userId: owner.userId, action: 'secret.manage' }).allowed,
+      true,
+      'owner wajib bisa secret.manage',
+    );
+    assert.equal(
+      pm.checkPermission({ userId: operator.userId, action: 'secret.manage' }).allowed,
+      false,
+      'operator TIDAK boleh secret.manage',
+    );
+    assert.equal(
+      pm.checkPermission({ userId: viewer.userId, action: 'secret.manage' }).allowed,
+      false,
+      'viewer TIDAK boleh secret.manage',
+    );
+    assert.equal(pm.checkPermission({ action: 'secret.manage' }).allowed, false);
+  });
+
+  test('matriks role: hanya owner yang diizinkan pada secret.manage', () => {
+    const granted = [];
+    for (const role of ['owner', 'operator', 'viewer']) {
+      const u = pm.createUser({ username: `sm-${role}`, role, status: 'active' });
+      if (pm.checkPermission({ userId: u.userId, action: 'secret.manage' }).allowed) {
+        granted.push(role);
+      }
+    }
+    assert.deepEqual(granted, ['owner']);
+  });
+
+  test('rute tulis /secrets terikat secret.manage; rute baca tetap secret.view', () => {
+    const routes = registerDataRoutes({ manager: {} });
+    const pick = (method, pattern) =>
+      routes.find((r) => r.method === method && r.pattern === pattern);
+    for (const [method, pattern] of [
+      ['POST', '/secrets/:name'],
+      ['PUT', '/secrets/:name'],
+      ['POST', '/secrets/:name/remove-request'],
+      ['POST', '/secrets/:name/remove'],
+    ]) {
+      const r = pick(method, pattern);
+      assert.ok(r, `rute ${method} ${pattern} harus terdaftar`);
+      assert.equal(r.permission, 'secret.manage', `${method} ${pattern} wajib secret.manage`);
+    }
+    assert.equal(pick('GET', '/secrets').permission, 'secret.view');
   });
 });

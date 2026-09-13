@@ -27,7 +27,15 @@ import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readFileSync, writeFileSync, statSync } from 'node:fs';
+import {
+  readFileSync,
+  writeFileSync,
+  statSync,
+  renameSync,
+  rmSync,
+  mkdirSync,
+  existsSync,
+} from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { renderTemplate, escapeHtml } from './render.js';
@@ -56,6 +64,12 @@ const CONFIG_VIEW_MAX_CHARS = 200_000;
 const CONFIG_MAX_FILES_VIEW = 20;
 /** Action PermissionManager untuk Config & Brankas (owner-only, matriks §11.2). */
 const VAULT_ACTION = 'secret.view';
+/** L5b: aksi TULIS brankas (set/rotate/hapus nilai) — owner-only; `secret.view`
+ *  tetap dipakai untuk membaca daftar metadata. */
+const VAULT_MANAGE_ACTION = 'secret.manage';
+/** L5b: validasi sisi panel (umpan balik cepat) — cermin aturan manager. */
+const VAULT_SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+const VAULT_SECRET_MAX_BYTES = 4096;
 const RATE_WINDOW_MS = 60_000;
 const DEFAULT_PORT = 8080;
 const DEFAULT_RATE_PER_MIN = 60;
@@ -88,8 +102,27 @@ const GIT_PUSH_REF = 'main';
 /** Cache detail project (badge sync) — sejajar window rate limit manager. */
 const PROJECT_DETAIL_CACHE_TTL_MS = 60_000;
 const PROJECT_DETAIL_MAX = 100;
+// --- L3 "One-Click 24/7": publish state ke branch 'state' + badge jujur ------
+/** Timeout tiap execFile langkah publish-state (backup→encrypt→push): 120 dtk. */
+const STATE_STEP_TIMEOUT_MS = 120_000;
+/** Timeout git read-only untuk badge (jangan menahan render halaman). */
+const BADGE_GIT_TIMEOUT_MS = 8_000;
+/** Branch cloud tempat runner menyimpan container state terenkripsi. */
+const STATE_BRANCH = 'state';
+/** Nama file di branch 'state' — kontrak runner (restore_state.sh / backup_final.sh). */
+const STATE_FILE_IN_BRANCH = 'vm-state.enc';
+/** File lokal hasil publish panel — TIDAK menimpa runtime/vm-state.enc milik restore lokal. */
+const PUBLISH_ENC_FILE = join('runtime', 'vm-state-publish.enc');
+/** Kunci optimistik publish: token konfirmasi menyimpan sha branch 'state' saat user diminta konfirmasi. */
+const CLOUD_PUSH_CACHE_TTL_MS = 30_000;
+/** Cache /system/github sisi panel (manager sudah cache 60 dtk). */
+const GH_STATUS_CACHE_TTL_MS = 60_000;
+/** Commit message branch 'state' dari panel. */
+const STATE_COMMIT_MSG_PREFIX = 'state: publish dari panel ORIONT';
 /** execFile git tanpa shell (argumen aman); timeout melindungi dari hang. */
 const execFileP = promisify(execFile);
+/** Repo tempat modul panel berasal (rootDir bisa dibedakan saat test/sandbox). */
+const MODULE_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 // FX-3: motif KANONIK 12 halaman template (lingkaran putih %23FFFFFF di atas
 // kanvas obsidian %230A0D0C, rx=8) — sebelumnya memakai chevron biru GitHub
 // %2358a6ff yang menyimpang dari brand monokrom ORIONT.
@@ -115,6 +148,8 @@ const STATUS_BY_CODE = {
   [PERMISSION_DENIED]: 403,
   RATE_LIMITED: 429,
   BODY_TOO_LARGE: 413,
+  // L3: benturan state (rantai cloud lebih baru / publish ganda) → 409.
+  CONFLICT: 409,
   // A2#28: error transport manager → 502 dengan pesan jelas (bukan 500 'INTERNAL').
   [TIMEOUT]: 502,
   [UNREACHABLE]: 502,
@@ -210,10 +245,11 @@ function actionForm(action, { label, cls = 'btn btn--sm', confirm = '', detail =
  * ditulis dua kali). Kontrol: textarea bila `rows` di-set, select bila
  * `options` diisi, sisanya input text (mono bila `mono`).
  */
-function fieldHtml(name, label, { hint = '', rows = 0, options = [], value = '', placeholder = '', mono = false, disabled = false } = {}) {
+function fieldHtml(name, label, { hint = '', rows = 0, options = [], value = '', placeholder = '', mono = false, disabled = false, type = 'text', autocomplete = 'off' } = {}) {
   const id = `cv-${escapeHtml(name)}`;
   const dis = disabled ? ' disabled' : '';
   const ph = placeholder ? ` placeholder="${escapeHtml(placeholder)}"` : '';
+  const ac = ` autocomplete="${escapeHtml(autocomplete)}"`;
   const cls = mono ? 'field__input field__input--mono' : 'field__input';
   let control;
   if (rows > 0) {
@@ -224,7 +260,9 @@ function fieldHtml(name, label, { hint = '', rows = 0, options = [], value = '',
       .join('');
     control = `<select class="${cls}" id="${id}" name="${escapeHtml(name)}"${dis}>${opts}</select>`;
   } else {
-    control = `<input class="${cls}" type="text" id="${id}" name="${escapeHtml(name)}" value="${escapeHtml(value)}"${dis}${ph} autocomplete="off" spellcheck="false">`;
+    // type/password dipakai form brankas (L5b): nilai tidak pernah di-echo balik.
+    const safeType = type === 'password' ? 'password' : 'text';
+    control = `<input class="${cls}" type="${safeType}" id="${id}" name="${escapeHtml(name)}" value="${escapeHtml(value)}"${dis}${ph}${ac} spellcheck="false">`;
   }
   const hintHtml = hint ? `<p class="field__hint">${escapeHtml(hint)}</p>` : '';
   return `<div class="field"><label class="field__label" for="${id}">${escapeHtml(label)}</label>${control}${hintHtml}</div>`;
@@ -269,6 +307,41 @@ function githubDotClass(status) {
 function badgeHtml(text, variant = '') {
   const cls = variant ? `badge badge--${variant}` : 'badge';
   return `<span class="${cls}">${escapeHtml(String(text ?? ''))}</span>`;
+}
+
+/**
+ * L3 badge jujur "Cloud 24/7". Kontrak untuk lane desainer: chip memakai kelas
+ * `badge badge--{ok|warn|err|info}` EXISTING (panel.css:1474-1500) + atribut
+ * `data-cloud-state="<state>"` sebagai anchor stabil (jangan parsing teks label).
+ * state ∈ belum-cloud | belum-terpush | queued | active | gagal | aktif.
+ */
+const CLOUD_BADGE_STATES = {
+  'belum-cloud': { label: 'belum cloud', variant: 'warn', hint: 'Project belum terdaftar di manifest projects.auto.json — cloud tidak tahu apa pun tentang project ini.' },
+  'belum-terpush': { label: 'belum ter-push', variant: 'warn', hint: 'Manifest lokal belum sama dengan branch main di origin (belum di-commit/push, atau remote tidak terbaca).' },
+  queued: { label: 'antre', variant: 'info', hint: 'Runner GitHub Actions sudah mengantrikan siklus berikutnya.' },
+  active: { label: 'berjalan', variant: 'info', hint: 'Siklus runner sedang berjalan.' },
+  gagal: { label: 'gagal', variant: 'err', hint: 'Run terakhir GitHub Actions tidak sukses.' },
+  aktif: { label: 'aktif', variant: 'ok', hint: 'Run terakhir sukses — project hidup di cloud 24/7.' },
+};
+
+function cloudChip(state, { extraHint = '' } = {}) {
+  const meta = CLOUD_BADGE_STATES[state] ?? CLOUD_BADGE_STATES['belum-cloud'];
+  const variant = meta.variant ? ` badge--${meta.variant}` : '';
+  const title = `${meta.hint}${extraHint ? ` ${extraHint}` : ''}`;
+  return (
+    `<span class="badge${variant}" data-cloud-state="${escapeHtml(String(state))}"` +
+    ` title="${escapeHtml(title)}">${escapeHtml(meta.label)}</span>`
+  );
+}
+
+/** Nama manifest → Set ternormalisasi (trim, kosong dibuang). */
+function toNameSet(names) {
+  const out = new Set();
+  for (const n of names) {
+    const s = String(n ?? '').trim();
+    if (s !== '') out.add(s);
+  }
+  return out;
 }
 
 /** Detail error git untuk pesan ke user — baris terakhir, tanpa kredensial URL. */
@@ -430,8 +503,11 @@ function safeDecode(seg) {
  * Kartu BRANKAS: status line ("Brankas aktif — N rahasia" / "Brankas belum
  * diinisialisasi" / manager down) + tombol "Nyalakan Brankas". Setelah aktif,
  * note "Simpan cadangan kunci .env di tempat aman" tampil di bawah status.
+ * L5b: tambah tabel rahasia (metadata ONLY) + form input NILAI (name + value
+ * password-masked + cakupan) + tombol Hapus dua-fase per baris. Semua ditulis
+ * sebagai fragmen |raw yang sudah ada — TIDAK ada tag template baru.
  */
-function cvVaultCard({ vault, csrf, encId }) {
+function cvVaultCard({ vault, csrf, encId, projectId = '', canWrite = false }) {
   const statusLine = !vault.ok
     ? 'Manager tidak merespons'
     : vault.initialized
@@ -453,12 +529,81 @@ function cvVaultCard({ vault, csrf, encId }) {
       ? 'Rahasia tersimpan terenkripsi di disk panel.'
       : 'Brankas menyimpan rahasia (password, token API) terenkripsi. Nyalakan sekali — lalu pasang variabel di bawah.'
     : 'Periksa manager lalu muat ulang halaman.';
+
+  // Tabel rahasia — nama/cakupan/tanggal saja. Tombol Hapus memakai rantai
+  // dua-fase panel (/vault/secret-remove) yang meneruskan ke manager.
+  const secretRows = (Array.isArray(vault.rows) ? vault.rows : []).map((r) => {
+    const name = String(r?.name ?? '');
+    const scope = String(r?.projectScope ?? '');
+    return {
+      name,
+      scope: scope === '' ? 'global' : scope,
+      updated: String(r?.updatedAt ?? '') || '—',
+      actions: canWrite
+        ? actionForm('/vault/secret-remove', {
+            label: 'Hapus',
+            cls: 'btn btn--sm btn--danger',
+            confirm: `Hapus rahasia "${name}"?`,
+            detail: 'Variabel env / hook yang menunjuk rahasia ini gagal resolve saat service start.',
+            phrase: name,
+            csrf,
+            hidden: { name, projectScope: scope, projectId },
+          })
+        : '',
+    };
+  });
+  const secretTable = vault.ok && vault.initialized
+    ? buildTable(
+        [
+          { label: 'Rahasia', cls: 'mono', cell: (r) => escapeHtml(r.name) },
+          { label: 'Cakupan', cls: 'mono', cell: (r) => escapeHtml(r.scope) },
+          { label: 'Diperbarui', cls: 'mono', cell: (r) => escapeHtml(r.updated) },
+          { label: 'Aksi', cell: (r) => r.actions },
+        ],
+        secretRows,
+        {
+          empty: {
+            title: 'Belum ada rahasia tersimpan.',
+            hint: 'Simpan nilai pertama di bawah — namai seperti identifier, mis. OPENAI_API_KEY.',
+          },
+        },
+      )
+    : '';
+
+  // Form input NILAI rahasia (L5b). Nilai type=password + autocomplete=new-password
+  // dan tidak pernah di-echo balik setelah tersimpan.
+  const scopeOptions = [{ value: '', label: 'Global (semua proyek)' }];
+  if (projectId !== '') scopeOptions.push({ value: projectId, label: `Proyek ini (${projectId})` });
+  const secretForm = vault.ok && vault.initialized && canWrite
+    ? `<form method="post" action="/vault/secret" class="stack">` +
+      csrfInput(csrf) +
+      (projectId !== '' ? `<input type="hidden" name="projectId" value="${escapeHtml(projectId)}">` : '') +
+      fieldHtml('name', 'Nama rahasia', {
+        mono: true,
+        placeholder: 'OPENAI_API_KEY',
+        hint: 'Identifier: huruf/underscore di awal, hanya [A-Za-z0-9_], maksimal 64 karakter.',
+      }) +
+      fieldHtml('value', 'Nilai', {
+        type: 'password',
+        autocomplete: 'new-password',
+        mono: true,
+        placeholder: 'tempel nilai rahasia',
+        hint: 'Maksimal 4096 byte. Nilai tidak ditampilkan lagi setelah disimpan — menimpa nama yang sama = rotasi.',
+      }) +
+      fieldHtml('projectScope', 'Cakupan', { options: scopeOptions }) +
+      `<button class="btn btn--primary" type="submit" data-confirm="Simpan rahasia ke Brankas?" data-confirm-detail="Nilai dienkripsi di disk panel. Bila nama sudah ada, nilainya TIMPA (rotasi).">Simpan rahasia</button>` +
+      `</form>`
+    : '';
+  const writeLockNote = vault.ok && vault.initialized && !canWrite
+    ? `<p class="field__hint">Hanya owner yang dapat mengubah isi brankas.</p>`
+    : '';
+
   return (
     `<section class="card"><header class="card__header"><h2 class="card__title">Brankas</h2></header>` +
     `<div class="card__body"><dl class="kv"><dt class="kv__key">Status</dt>` +
     `<dd class="kv__value">${escapeHtml(statusLine)}</dd></dl>` +
     `<p class="field__hint">${escapeHtml(hint)}</p>` +
-    `${initNoteHtml}${initForm}</div></section>`
+    `${initNoteHtml}${initForm}${secretTable}${secretForm}${writeLockNote}</div></section>`
   );
 }
 
@@ -731,6 +876,15 @@ export class PanelServer {
   #rootDir; // repo root: lokasi projects.auto.json + cwd git sync
   #lastSync = null; // hasil sync GitHub terakhir (alert sukses kartu GitHub Sync)
   #detailCache = { at: 0, map: new Map() }; // name → repoUrl (badge sync, TTL)
+  // L3 badge jujur: hasil cek "manifest lokal sudah ter-push ke origin main?"
+  // (1 rangkaian git ls-remote + rev-parse + status per CLOUD_PUSH_CACHE_TTL_MS)
+  // dan cache /system/github sisi panel (GH_STATUS_CACHE_TTL_MS).
+  #pushStateCache = { at: 0, value: null };
+  #ghStatusCache = { at: 0, value: null };
+  // Publish state hanya satu pada satu waktu (worktree/index file bersama).
+  #publishInFlight = false;
+  // Hasil publish-state terakhir (alert sukses di halaman /projects, pola #lastSync).
+  #lastPublish = null;
   // Hasil test "Suntik otomatis" terakhir per project (badge di kartu hook) —
   // in-memory sekali sesi server, pola sama dengan #lastSync.
   #lastHookTest = null; // { id, ok, status, attempts, error, at }
@@ -1043,16 +1197,25 @@ export class PanelServer {
       const data = await this.#getManager().request('GET', '/secrets');
       const rows = Array.isArray(data?.secrets) ? data.secrets : [];
       const names = [];
+      // L5b: salinan metadata-sahaja untuk tabel Brankas — field lain (mis.
+      // nilai, bila manager berubah) TIDAK pernah diteruskan ke render.
+      const meta = [];
       for (const s of rows) {
         const n = String(s?.name ?? '');
-        if (n !== '') names.push(n);
+        if (n === '') continue;
+        names.push(n);
+        meta.push({
+          name: n,
+          projectScope: String(s?.projectScope ?? ''),
+          updatedAt: String(s?.updatedAt ?? s?.createdAt ?? ''),
+        });
       }
-      return { ok: true, initialized: true, count: rows.length, names };
+      return { ok: true, initialized: true, count: rows.length, names, rows: meta };
     } catch (e) {
       if (e instanceof VmPanelError && e.code === NOT_FOUND) {
-        return { ok: true, initialized: false, count: 0, names: [] };
+        return { ok: true, initialized: false, count: 0, names: [], rows: [] };
       }
-      return { ok: false, initialized: false, count: 0, names: [] };
+      return { ok: false, initialized: false, count: 0, names: [], rows: [] };
     }
   }
 
@@ -1599,10 +1762,12 @@ export class PanelServer {
         };
       });
 
-    // (c) tulis manifest (JSON 2-space + newline) di repo root.
+    // (c) tulis manifest (JSON 2-space + newline) di repo root. Entri invalid
+    // (name kosong/port rusak) dibuang — jangan hasilkan manifest rusak (bug 3).
+    const { valid } = this.#sanitizeManifest(entries);
     const manifestPath = join(this.#rootDir, 'projects.auto.json');
     try {
-      writeFileSync(manifestPath, `${JSON.stringify(entries, null, 2)}\n`, 'utf8');
+      writeFileSync(manifestPath, `${JSON.stringify(valid, null, 2)}\n`, 'utf8');
     } catch (e) {
       return { ok: false, message: `Gagal menulis projects.auto.json: ${gitErrDetail(e)}` };
     }
@@ -1623,7 +1788,7 @@ export class PanelServer {
       await execFileP(git, ['commit', '-m', GIT_COMMIT_MSG], opts);
     } catch (e) {
       const out = `${e?.stdout ?? ''}\n${e?.stderr ?? ''}`;
-      if (/nothing to commit|no changes added/i.test(out)) {
+      if (/nothing to commit|nothing added to commit|no changes added/i.test(out)) {
         committed = false;
       } else {
         return { ok: false, message: `git commit gagal — pastikan identitas git (user.name/user.email) sudah di-set di repo ini. Detail: ${gitErrDetail(e)}` };
@@ -1641,7 +1806,805 @@ export class PanelServer {
     }
 
     const repoUrl = await this.#gitRemoteWebUrl();
-    return { ok: true, projectCount: entries.length, committed, repoUrl };
+    return { ok: true, projectCount: valid.length, committed, repoUrl };
+  }
+
+  /**
+   * Validasi sederhana entry manifest sebelum tulis/push (bug fix-19#3):
+   * name string non-kosong, port integer > 0 atau null (format lama statis),
+   * repo_url string non-kosong, enabled boolean. Entri invalid DIbuang —
+   * jangan pernah menghasilkan projects.auto.json rusak untuk runner.
+   */
+  #isValidManifestEntry(e) {
+    if (!e || typeof e !== 'object' || Array.isArray(e)) return false;
+    if (typeof e.name !== 'string' || e.name.trim() === '') return false;
+    if (!(e.port === null || (Number.isInteger(e.port) && e.port > 0))) return false;
+    if (typeof e.repo_url !== 'string' || e.repo_url.trim() === '') return false;
+    if (typeof e.enabled !== 'boolean') return false;
+    return true;
+  }
+
+  /** Filter list manifest → hanya entri valid; mengembalikan jumlah yang dibuang. */
+  #sanitizeManifest(list) {
+    const valid = [];
+    let dropped = 0;
+    for (const e of list) {
+      if (this.#isValidManifestEntry(e)) valid.push(e);
+      else dropped += 1;
+    }
+    return { valid, dropped };
+  }
+
+  /** Baca + parse projects.auto.json (array; corrupt/absen → []). */
+  #readManifestList() {
+    try {
+      const list = JSON.parse(readFileSync(join(this.#rootDir, 'projects.auto.json'), 'utf8'));
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * git add + commit + push projects.auto.json — TIDAK ADA catch kosong
+   * (bug fix-19#1): kegagalan nyata dipropagasikan sebagai {ok:false,
+   * message} agar panel tidak melaporkan sukses padahal push gagal.
+   * Pola sama dengan #runGithubSync (d1-d3).
+   */
+  async #commitAndPushManifest() {
+    const git = process.platform === 'win32' ? 'git.exe' : 'git';
+    const opts = { cwd: this.#rootDir, timeout: GIT_TIMEOUT_MS, windowsHide: true };
+    try {
+      await execFileP(git, ['add', 'projects.auto.json'], opts);
+    } catch (e) {
+      return { ok: false, message: `git add gagal — folder panel bukan repo git atau file tidak bisa di-stage. Detail: ${gitErrDetail(e)}` };
+    }
+    try {
+      await execFileP(git, ['commit', '-m', GIT_COMMIT_MSG], opts);
+    } catch (e) {
+      const out = `${e?.stdout ?? ''}\n${e?.stderr ?? ''}`;
+      // "nothing to commit" / "nothing added to commit but untracked files
+      // present" (repo punya untracked lain) / "no changes added" → benign.
+      if (!/nothing to commit|nothing added to commit|no changes added/i.test(out)) {
+        return { ok: false, message: `git commit gagal — pastikan identitas git (user.name/user.email) sudah di-set di repo ini. Detail: ${gitErrDetail(e)}` };
+      }
+    }
+    try {
+      await execFileP(git, ['push', 'origin', GIT_PUSH_REF], opts);
+    } catch (e) {
+      return { ok: false, message: `git push gagal — pastikan remote origin sudah di-set dan kredensial GitHub valid. Detail: ${gitErrDetail(e)}` };
+    }
+    return { ok: true };
+  }
+
+  // --- L3 "One-Click 24/7": git helpers, badge jujur, publish-state ----------
+
+  /** Binary git (win32: git.exe — sama seperti jalur sync). */
+  #gitBin() {
+    return process.platform === 'win32' ? 'git.exe' : 'git';
+  }
+
+  /**
+   * execFile git TANPA shell (DEP0190), `-c core.quotepath=false` (path
+   * non-ASCII tidak di-oktal-escape) + windowsHide + timeout per langkah.
+   */
+  async #gitRun(args, { cwd = this.#rootDir, timeout = BADGE_GIT_TIMEOUT_MS, env } = {}) {
+    return execFileP(
+      this.#gitBin(),
+      ['-c', 'core.quotepath=false', ...args],
+      {
+        cwd,
+        timeout,
+        windowsHide: true,
+        ...(env ? { env: { ...process.env, ...env } } : {}),
+      },
+    );
+  }
+
+  /**
+   * sha branch di origin lewat `git ls-remote`.
+   * @returns {Promise<string|null|undefined>} sha | '' (branch belum ada) |
+   *          null (git/remote tidak terbaca — BUKAN "belum ada").
+   */
+  async #gitRemoteSha(ref, timeout = BADGE_GIT_TIMEOUT_MS) {
+    try {
+      const { stdout } = await this.#gitRun(['ls-remote', 'origin', `refs/heads/${ref}`], { timeout });
+      const first = String(stdout).trim().split(/\r?\n/)[0] ?? '';
+      const sha = first.split(/\s+/)[0] ?? '';
+      return /^[0-9a-f]{7,40}$/.test(sha) ? sha : '';
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Apakah manifest lokal SUDAH sampai ke origin/main? Definisi jujur sesuai
+   * kontrak lane: sha HEAD lokal == sha origin/main DAN projects.auto.json
+   * tidak dirty. Satu rangkaian `git ls-remote` per render list, cache 30 dtk.
+   */
+  async #manifestPushStatus() {
+    const now = Date.now();
+    if (now - this.#pushStateCache.at < CLOUD_PUSH_CACHE_TTL_MS) return this.#pushStateCache.value;
+    const value = { pushed: null, local: null, remote: null, reason: '' };
+    try {
+      const { stdout } = await this.#gitRun(['rev-parse', 'HEAD']);
+      value.local = String(stdout).trim() || null;
+    } catch {
+      value.reason = 'repo git lokal tidak terbaca';
+    }
+    value.remote = await this.#gitRemoteSha(GIT_PUSH_REF);
+    if (value.local && value.remote) {
+      let dirty = false;
+      try {
+        const st = await this.#gitRun(['status', '--porcelain', '--', 'projects.auto.json']);
+        dirty = String(st.stdout).trim() !== '';
+      } catch {
+        dirty = false;
+      }
+      value.pushed = value.local === value.remote && !dirty;
+      if (!value.pushed) {
+        value.reason = dirty
+          ? 'projects.auto.json belum di-commit'
+          : 'commit lokal belum ter-push ke origin/main';
+      }
+    } else if (value.local && value.remote === '') {
+      value.pushed = false;
+      value.reason = 'branch main belum ada di origin';
+    } else if (value.remote === null || !value.local) {
+      value.pushed = null;
+      value.reason = value.reason || 'origin tidak terbaca (git/remote gagal)';
+    }
+    this.#pushStateCache = { at: now, value };
+    return value;
+  }
+
+  /**
+   * Buang cache badge cloud (dipakai setelah push sukses; publik agar test/UI
+   * bisa memaksa ulang pengukuran tanpa menunggu TTL 30/60 dtk).
+   */
+  invalidateCloudBadgeCache() {
+    this.#pushStateCache = { at: 0, value: null };
+    this.#ghStatusCache = { at: 0, value: null };
+  }
+
+  /** GET /system/github dengan cache 60 dtk sisi panel (manager juga cache 60 dtk). */
+  async #githubRunnerStatus() {
+    const now = Date.now();
+    if (now - this.#ghStatusCache.at < GH_STATUS_CACHE_TTL_MS) return this.#ghStatusCache.value;
+    const res = await this.#managerGet('/system/github');
+    this.#ghStatusCache = { at: now, value: res.ok && res.data ? res.data : null };
+    return this.#ghStatusCache.value;
+  }
+
+  /** Peta run GitHub Actions → state badge (queued/active/gagal/aktif). */
+  #cloudStateFromRuns(gh) {
+    if (!gh || gh.available !== true) return 'queued';
+    const active = gh.activeRun ?? null;
+    if (active) {
+      const s = String(active.status ?? '').toLowerCase();
+      return s === 'queued' || s === 'waiting' || s === 'pending' ? 'queued' : 'active';
+    }
+    const last = gh.lastRun ?? null;
+    if (!last) return 'queued';
+    return String(last.conclusion ?? '').toLowerCase() === 'success' ? 'aktif' : 'gagal';
+  }
+
+  /**
+   * State badge jujur satu project TANPA menunggu apa pun (sinkron) — ctx
+   * sudah dihitung sekali per render list.
+   * @param {{name?: string, inManifest?: boolean}} p
+   * @param {{push?: object, gh?: object, inManifest?: boolean}} ctx
+   */
+  #cloudStateFor(p, ctx = {}) {
+    const name = String(p?.name ?? '').trim();
+    const inManifest = ctx.inManifest ?? this.#readManifestList().some((e) => String(e?.name ?? '').trim() === name && name !== '');
+    if (!inManifest) return { state: 'belum-cloud', hint: '' };
+    const push = ctx.push ?? { pushed: null, reason: 'belum dihitung' };
+    if (push.pushed !== true) return { state: 'belum-terpush', hint: push.reason ? `(${push.reason})` : '' };
+    const gh = ctx.gh === undefined ? null : ctx.gh;
+    const ghHint =
+      ctx.gh === undefined
+        ? '(status runner belum dibaca)'
+        : gh && gh.available !== true
+          ? '(status runner tidak terbaca dari panel)'
+          : '';
+    return { state: this.#cloudStateFromRuns(gh), hint: ghHint };
+  }
+
+  /** Chip badge jujur (markup = kelas `badge badge--*` + data-cloud-state). */
+  #cloudBadgeHtml(p, ctx = {}) {
+    const { state, hint } = this.#cloudStateFor(p, ctx);
+    return cloudChip(state, { extraHint: hint });
+  }
+
+  /**
+   * Badge jujur cloud 24/7 satu project (asinkron: melengkapi ctx yang belum
+   * tersedia — dipakai jalur detail). `ctx` {inManifest, push, gh} opsional;
+   * halaman list mengirim ctx hasil hitung sekali untuk semua row.
+   */
+  async #cloudBadge(project, ctx = {}) {
+    const full = {
+      inManifest:
+        ctx.inManifest ??
+        this.#readManifestList().some(
+          (e) => String(e?.name ?? '').trim() === String(project?.name ?? '').trim() && String(project?.name ?? '').trim() !== '',
+        ),
+      push: ctx.push ?? (await this.#manifestPushStatus()),
+      gh: ctx.gh !== undefined ? ctx.gh : await this.#githubRunnerStatus(),
+    };
+    return this.#cloudBadgeHtml(project, full);
+  }
+
+  /** Redaksi total: buang nilai master key + baris command argv dari teks error. */
+  #redactSecretText(text, secret) {
+    let s = String(text ?? '');
+    if (secret) s = s.split(String(secret)).join('***REDACTED***');
+    return s
+      .split(/\r?\n/)
+      .filter((line) => !/state-container\.mjs\s+encrypt/i.test(line))
+      .join(' | ')
+      .replace(/Command failed:/gi, 'eksekusi gagal:')
+      .slice(0, 300);
+  }
+
+  /**
+   * Langkah enkripsi publish: panggil CLI L2 yang TERAKHIR di disk
+   * (`node scripts/state-container.mjs encrypt <srcDir> <outFile> <masterKey>
+   * --secretsroot <root>`). masterKey lewat argv tidak bisa dihindari (kontrak
+   * L2) — karena itu SEMUA pesan error diredaksi (#redactSecretText).
+   */
+  async #runStateEncrypt({ srcDir, outFile, secretsRoot, masterKey }) {
+    // CLI L2: `node scripts/state-container.mjs encrypt <srcDir> <outFile>
+    // <masterKey> --secretsroot <root>`. Cari di repo panel (rootDir), fallback
+    // ke repo tempat modul panel ini berasal (rootDir sandbox/test ≠ repo).
+    const candidates = [
+      resolve(this.#rootDir, 'scripts', 'state-container.mjs'),
+      resolve(MODULE_REPO_ROOT, 'scripts', 'state-container.mjs'),
+    ];
+    const script = candidates.find((p) => existsSync(p));
+    if (!script) {
+      throw new Error(`scripts/state-container.mjs tidak ditemukan (${candidates.join(' atau ')})`);
+    }
+    try {
+      await execFileP(
+        process.execPath,
+        [script, 'encrypt', srcDir, outFile, masterKey, '--secretsroot', secretsRoot],
+        { cwd: this.#rootDir, timeout: STATE_STEP_TIMEOUT_MS, windowsHide: true },
+      );
+    } catch (e) {
+      const detail = String(e?.stderr ?? '').trim() || String(e?.stdout ?? '').trim() || String(e?.message ?? e);
+      throw new Error(this.#redactSecretText(detail, masterKey) || 'enkripsi gagal');
+    }
+  }
+
+  /**
+   * Commit + push container terenkripsi ke branch 'state' TANPA menyentuh
+   * working tree user: index git sementara di runtime/ (plumbing
+   * read-tree/update-index/write-tree/commit-tree) — working tree, index asli,
+   * dan branch aktif user tidak pernah disentuh, dan tidak ada file checkout
+   * di runtime/. Push selalu non-fast-forward-safe dan TANPA --force.
+   * @param {{encFile: string, expectedSha: string, message: string}} p
+   */
+  async #pushStateBranch({ encFile, expectedSha, message }) {
+    // (0) kunci optimistik: rantai tidak boleh bergerak sejak user mengonfirmasi.
+    const nowSha = await this.#gitRemoteSha(STATE_BRANCH, STATE_STEP_TIMEOUT_MS);
+    if (nowSha === null) {
+      return { ok: false, status: 502, message: `git ls-remote origin ${STATE_BRANCH} gagal — rantai cloud tidak bisa diverifikasi, publish dibatalkan.` };
+    }
+    if (nowSha !== (expectedSha || '')) {
+      return {
+        ok: false,
+        status: 409,
+        message:
+          `rantai lebih baru — tunggu cycle selesai ` +
+          `(branch '${STATE_BRANCH}' bergerak dari ${expectedSha ? expectedSha.slice(0, 10) : '(belum ada)'} ke ` +
+          `${nowSha ? nowSha.slice(0, 10) : '(dihapus)'}); buka ulang konfirmasi publish.`,
+      };
+    }
+    const step = (args, opts = {}) => this.#gitRun(args, { timeout: STATE_STEP_TIMEOUT_MS, ...opts });
+    if (expectedSha) {
+      try {
+        await step(['fetch', '--no-tags', 'origin', `refs/heads/${STATE_BRANCH}:refs/remotes/origin/${STATE_BRANCH}`]);
+      } catch (e) {
+        return { ok: false, status: 502, message: `git fetch origin ${STATE_BRANCH} gagal — ${gitErrDetail(e)}` };
+      }
+    }
+    const indexFile = resolve(this.#rootDir, 'runtime', 'state-publish.index');
+    try {
+      rmSync(indexFile, { force: true });
+    } catch {
+      /* belum ada */
+    }
+    const gitOpts = () => ({ env: { ...process.env, GIT_INDEX_FILE: indexFile } });
+    try {
+      mkdirSync(dirname(indexFile), { recursive: true });
+      if (expectedSha) await step(['read-tree', expectedSha], gitOpts());
+      let blob = '';
+      try {
+        blob = String((await step(['hash-object', '-w', encFile], gitOpts())).stdout).trim();
+      } catch (e) {
+        return { ok: false, status: 502, message: `git hash-object gagal — ${gitErrDetail(e)}` };
+      }
+      if (!/^[0-9a-f]{40}$/.test(blob)) {
+        return { ok: false, status: 502, message: 'git hash-object tidak mengembalikan sha blob — publish dibatalkan.' };
+      }
+      try {
+        await step(['update-index', '--add', '--cacheinfo', `100644,${blob},${STATE_FILE_IN_BRANCH}`], gitOpts());
+      } catch (e) {
+        return { ok: false, status: 502, message: `git update-index gagal — ${gitErrDetail(e)}` };
+      }
+      let tree = '';
+      try {
+        tree = String((await step(['write-tree'], gitOpts())).stdout).trim();
+      } catch (e) {
+        return { ok: false, status: 502, message: `git write-tree gagal — ${gitErrDetail(e)}` };
+      }
+      if (!/^[0-9a-f]{40}$/.test(tree)) {
+        return { ok: false, status: 502, message: 'git write-tree tidak mengembalikan sha tree — publish dibatalkan.' };
+      }
+      const commitArgs = ['commit-tree', tree];
+      if (expectedSha) commitArgs.push('-p', expectedSha);
+      commitArgs.push('-m', message);
+      let commit = '';
+      try {
+        commit = String((await step(commitArgs, gitOpts())).stdout).trim();
+      } catch (e) {
+        return {
+          ok: false,
+          status: 502,
+          message: `git commit-tree gagal — pastikan identitas git (user.name/user.email) sudah di-set di repo ini. Detail: ${gitErrDetail(e)}`,
+        };
+      }
+      if (!/^[0-9a-f]{40}$/.test(commit)) {
+        return { ok: false, status: 502, message: 'git commit-tree tidak mengembalikan sha commit — publish dibatalkan.' };
+      }
+      try {
+        await step(['push', 'origin', `${commit}:refs/heads/${STATE_BRANCH}`]);
+      } catch (e) {
+        const out = `${e?.stderr ?? ''}\n${e?.stdout ?? ''}\n${e?.message ?? ''}`;
+        if (/non-fast-forward|fetch first|\[rejected\]|stale info|remote contains work/i.test(out)) {
+          return {
+            ok: false,
+            status: 409,
+            message: `rantai lebih baru — tunggu cycle selesai (push branch '${STATE_BRANCH}' ditolak non-fast-forward; panel TIDAK pernah memaksa/force push).`,
+          };
+        }
+        return { ok: false, status: 502, message: `git push origin ${STATE_BRANCH} gagal — ${gitErrDetail(e)}` };
+      }
+      // Sinkronkan remote-tracking ref lokal (best-effort, bukan bagian kontrak).
+      try {
+        await step(['update-ref', `refs/remotes/origin/${STATE_BRANCH}`, commit]);
+      } catch {
+        /* abaikan */
+      }
+      return { ok: true, commit, baseSha: expectedSha || '' };
+    } finally {
+      try {
+        rmSync(indexFile, { force: true });
+      } catch {
+        /* abaikan */
+      }
+    }
+  }
+
+  /**
+   * RINGKASAN KONFIRMASI publish-state (fase 1): timestamp backup lokal vs
+   * commit terakhir branch 'state' (sha + author date) — user harus bisa
+   * melihat apa yang akan ditimpa. Metadata saja, tanpa nilai secret.
+   */
+  async #publishStateSummary() {
+    let localBackupAt = 'tidak terbaca';
+    try {
+      const res = await this.#managerGet('/backups', { limit: 1 });
+      const row = res.ok && Array.isArray(res.data?.rows) ? res.data.rows[0] : null;
+      if (row) {
+        localBackupAt = `${String(row.at ?? '?')} (id ${String(row.id ?? '?')}, trigger ${String(row.trigger ?? '?')})`;
+      } else if (res.ok) {
+        localBackupAt = 'belum ada backup lokal';
+      }
+    } catch {
+      /* fail-soft: tampilkan 'tidak terbaca' */
+    }
+    const remoteShaRaw = await this.#gitRemoteSha(STATE_BRANCH, STATE_STEP_TIMEOUT_MS);
+    let stateLine = '';
+    let remoteSha = '';
+    if (remoteShaRaw === null) {
+      stateLine = 'origin tidak terbaca (git/remote gagal) — publish akan ditolak sampai rantai bisa diverifikasi';
+    } else if (remoteShaRaw === '') {
+      stateLine = `branch '${STATE_BRANCH}' belum ada di origin (publish pertama — tidak ada yang ditimpa)`;
+    } else {
+      remoteSha = remoteShaRaw;
+      stateLine = `commit ${remoteSha.slice(0, 10)} (tanggal tidak terbaca)`;
+      try {
+        await this.#gitRun(
+          ['fetch', '--no-tags', 'origin', `refs/heads/${STATE_BRANCH}:refs/remotes/origin/${STATE_BRANCH}`],
+          { timeout: STATE_STEP_TIMEOUT_MS },
+        );
+        const { stdout } = await this.#gitRun([
+          'show', '-s', '--format=%aI%x1f%an', `refs/remotes/origin/${STATE_BRANCH}`,
+        ]);
+        const [when, who] = String(stdout).trim().split('\u001f');
+        if (when) stateLine = `commit ${remoteSha.slice(0, 10)} · ${when} · oleh ${who || '?'}`;
+      } catch {
+        /* tetap tampilkan sha */
+      }
+    }
+    return { localBackupAt, stateLine, remoteSha };
+  }
+
+  /** Fase 1 publish-state: ringkas risiko + issue token (mengikat sha rantai saat ini). */
+  async #publishStatePhase1(session, res) {
+    const s = await this.#publishStateSummary();
+    const token = this.#issueConfirmToken('publish-state:global', session.user.userId, {
+      expectedStateSha: s.remoteSha,
+    });
+    const html = this.#confirmDestructiveHtml({
+      actionUrl: '/projects/publish-state',
+      token,
+      csrf: session.csrfToken,
+      title: 'Konfirmasi publish state ke cloud',
+      message:
+        `PUBLISH STATE = MENIMPA STATE CLOUD. Branch '${STATE_BRANCH}' akan ditimpa dengan state laptop ini ` +
+        '(termasuk database dan Brankas terenkripsi). Pada siklus berikutnya runner MEMULIHKAN state laptop ini: ' +
+        'data yang dibuat runner atau di cloud lain sejak backup ini akan HILANG. Aksi tidak dapat dibatalkan ' +
+        'selain restore manual.',
+      detail:
+        `Backup lokal terakhir : ${s.localBackupAt}\n` +
+        `State cloud saat ini : ${s.stateLine}\n` +
+        `Yang di-push : ${STATE_FILE_IN_BRANCH} (branch ${STATE_BRANCH}, tanpa force)`,
+      cancelHref: '/projects',
+      confirmLabel: 'Ya — publish state ke cloud',
+    });
+    return this.#sendHtml(res, 200, html);
+  }
+
+  /**
+   * FASE 2 publish-state. Langkah: (1) backup manual via manager → (2) enkripsi
+   * ke runtime/vm-state-publish.enc (tmp + rename atomik; TIDAK menimpa
+   * runtime/vm-state.enc milik restore lokal) → (3) commit+push branch 'state'
+   * dengan kunci optimistik → (4) audit metadata.
+   */
+  async #runPublishState({ expectedStateSha, session }) {
+    const masterKey = String(process.env.VPANEL_MASTER_KEY ?? '').trim();
+    if (masterKey === '') {
+      return {
+        ok: false,
+        status: 502,
+        message: 'master key tidak tersedia di lingkungan panel (VPANEL_MASTER_KEY) — publish state dibatalkan, state cloud tidak diubah.',
+      };
+    }
+    // (1) backup manual via manager (sebelum menimpa cloud, wajib ada titik pulih lokal)
+    let backup = null;
+    try {
+      backup = await this.#getManager().request('POST', '/backups', { body: {} });
+    } catch (e) {
+      return {
+        ok: false,
+        status: STATUS_BY_CODE[e?.code] ?? 502,
+        message: `Backup lokal gagal — publish dibatalkan, state cloud tidak diubah: ${this.#userSafeErrorText(e)}`,
+      };
+    }
+    const backupId = String(backup?.backupId ?? '');
+    const backupPath = String(backup?.path ?? '');
+    if (backupPath === '') {
+      return { ok: false, status: 502, message: 'Manager tidak mengirim path backup — publish dibatalkan.' };
+    }
+    if (backup?.verification && backup.verification.ok !== true) {
+      return {
+        ok: false,
+        status: 502,
+        message: `Backup baru tidak lolos verifikasi (${String(backup.verification.error ?? 'tanpa detail')}) — publish dibatalkan.`,
+      };
+    }
+    const srcDir = resolve(this.#rootDir, backupPath);
+    if (!existsSync(srcDir)) {
+      return { ok: false, status: 502, message: 'Direktori backup tidak ditemukan di disk — publish dibatalkan.' };
+    }
+    // (2) enkripsi ke file TERPISAH, tmp + rename atomik
+    const encAbs = resolve(this.#rootDir, PUBLISH_ENC_FILE);
+    const tmpAbs = `${encAbs}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      mkdirSync(dirname(encAbs), { recursive: true });
+      await this.#runStateEncrypt({ srcDir, outFile: tmpAbs, secretsRoot: this.#rootDir, masterKey });
+      renameSync(tmpAbs, encAbs);
+    } catch (e) {
+      try {
+        rmSync(tmpAbs, { force: true });
+      } catch {
+        /* abaikan */
+      }
+      const msg = this.#redactSecretText(e?.message ?? e, masterKey);
+      return { ok: false, status: 502, message: `Enkripsi state gagal — publish dibatalkan, state cloud tidak diubah: ${msg}` };
+    }
+    let encBytes = 0;
+    try {
+      encBytes = statSync(encAbs).size;
+    } catch {
+      /* abaikan */
+    }
+    // (3) commit + push branch 'state'
+    const stamp = new Date().toISOString();
+    const push = await this.#pushStateBranch({
+      encFile: encAbs,
+      expectedSha: expectedStateSha || '',
+      message: `${STATE_COMMIT_MSG_PREFIX} ${stamp} (backup ${backupId || '?'})`,
+    });
+    // (4) audit — METADATA SAJA (tanpa nilai secret, tanpa path isi backup penuh)
+    this.#auditCloudPublish(session, {
+      result: push.ok ? 'ok' : 'failed',
+      backupId,
+      branch: STATE_BRANCH,
+      file: STATE_FILE_IN_BRANCH,
+      baseSha: expectedStateSha || '',
+      commit: push.commit ?? '',
+      encBytes,
+      error: push.ok ? '' : this.#redactSecretText(push.message ?? '', masterKey),
+    });
+    if (!push.ok) return push;
+    return { ok: true, commit: push.commit, backupId, at: stamp };
+  }
+
+  /** Audit CLOUD_PUBLISH_STATE — hanya ID/referensi, tidak pernah nilai secret. */
+  #auditCloudPublish(session, meta) {
+    if (!this.#auditManager) return;
+    try {
+      this.#auditManager.append({
+        operation: 'cloud.publish_state',
+        actor: session?.user?.username ?? 'unknown',
+        userId: session?.user?.userId ?? null,
+        role: session?.user?.role ?? null,
+        backupId: meta.backupId ?? null,
+        input: {
+          backupId: meta.backupId ?? '',
+          branch: meta.branch ?? STATE_BRANCH,
+          file: meta.file ?? STATE_FILE_IN_BRANCH,
+          baseSha: meta.baseSha ?? '',
+          commit: meta.commit ?? '',
+          encBytes: Number.isFinite(Number(meta.encBytes)) ? Number(meta.encBytes) : 0,
+          error: meta.error ?? '',
+        },
+        result: meta.result ?? 'ok',
+      });
+    } catch {
+      /* audit tidak boleh memutus aksi */
+    }
+  }
+
+  /**
+   * Prasyarat cloud sebuah project (kontrak L1): repo_url harus https valid
+   * (runner meng-clone via https — path lokal tidak bisa di-clone) dan SETIAP
+   * envName punya secretName yang ADA di metadata vault (scope global atau
+   * project ini). Tidak pernah membaca nilai secret.
+   */
+  async #cloudPrerequisites(id) {
+    const problems = [];
+    let project = null;
+    try {
+      project = await this.#getManager().request('GET', `/projects/${encodeURIComponent(id)}`);
+    } catch (e) {
+      return { ok: false, project: null, repoUrl: '', problems: [`project tidak terbaca dari manager: ${this.#userSafeErrorText(e)}`] };
+    }
+    if (!project || typeof project !== 'object') {
+      return { ok: false, project: null, repoUrl: '', problems: ['project tidak ditemukan'] };
+    }
+    const rawUrl = String(project.repoUrl ?? project.repo_url ?? '').trim();
+    const repoUrl = rawUrl === '' ? '' : cleanRepoUrl(rawUrl) ?? '';
+    if (repoUrl === '') {
+      problems.push('repo_url kosong — cloud 24/7 butuh repo git di GitHub (runner meng-clone, bukan menyalin folder)');
+    } else if (!/^https:\/\//i.test(repoUrl)) {
+      problems.push(`repo_url harus https:// (runner tidak bisa memakai "${repoUrl.slice(0, 60)}")`);
+    }
+    // env-refs: tiap variabel wajib menunjuk rahasia yang benar-benar ada.
+    let envRows = null;
+    try {
+      const envRes = await this.#getManager().request('GET', `/projects/${encodeURIComponent(id)}/env`);
+      envRows = Array.isArray(envRes?.env) ? envRes.env : [];
+    } catch (e) {
+      problems.push(`binding env tidak terbaca: ${this.#userSafeErrorText(e)}`);
+    }
+    let secretMeta = null;
+    if (envRows && envRows.length > 0) {
+      try {
+        const sres = await this.#getManager().request('GET', '/secrets');
+        secretMeta = Array.isArray(sres?.secrets) ? sres.secrets : null;
+      } catch (e) {
+        problems.push(`daftar rahasia di Brankas tidak terbaca: ${this.#userSafeErrorText(e)}`);
+      }
+    }
+    const missing = [];
+    const wrongScope = [];
+    if (envRows && secretMeta) {
+      const byName = new Map();
+      for (const s of secretMeta) {
+        const n = String(s?.name ?? '');
+        if (n !== '') byName.set(n, s);
+      }
+      for (const row of envRows) {
+        const envName = String(row?.envName ?? '').trim();
+        const secretName = String(row?.secretName ?? '').trim();
+        if (envName === '') continue;
+        if (secretName === '') {
+          missing.push(envName);
+          continue;
+        }
+        const meta = byName.get(secretName);
+        if (!meta) {
+          missing.push(`${envName}→${secretName}`);
+          continue;
+        }
+        const scope = String(meta.projectScope ?? '');
+        if (scope !== '' && scope !== String(id)) wrongScope.push(`${envName}→${secretName}`);
+      }
+      if (missing.length > 0) {
+        problems.push(`variabel belum ter-binding rahasia yang ada di Brankas: ${missing.join(', ')} — isi lewat Brankas + Config & Brankas`);
+      }
+      if (wrongScope.length > 0) {
+        problems.push(`rahasianya milik project lain (scope tidak cocok): ${wrongScope.join(', ')}`);
+      }
+    }
+    return {
+      ok: problems.length === 0,
+      project,
+      repoUrl,
+      envCount: Array.isArray(envRows) ? envRows.length : 0,
+      problems,
+    };
+  }
+
+  /**
+   * POST /projects/:id/deploy-cloud-247 — ONE-CLICK langkah A-C.
+   * A validasi prasyarat → B upsert manifest (repo_url bersih tanpa kredensial)
+   * → C commit+push main → D respons steps + next='publish-state'.
+   * TIDAK dua fase: langkah 1-3 tidak merusak apa pun (hanya menambah manifest +
+   * push). Publish state (MENIMPA cloud) tetap lewat form dua fase tersendiri —
+   * konfirmasi tidak pernah tersembunyi di balik satu POST.
+   */
+  async #handleDeployCloud247Post(id, session, req, res, body) {
+    const steps = [];
+    const wantsJson =
+      String(body?._format ?? '') === 'json' ||
+      String(req.headers.accept ?? '').includes('application/json');
+
+    // (A) validasi prasyarat
+    const pre = await this.#cloudPrerequisites(id);
+    if (!pre.ok) {
+      steps.push({ name: 'validasi', status: 'failed', detail: pre.problems.join('; ') });
+      steps.push({ name: 'manifest', status: 'skipped', detail: 'dihentikan — prasyarat cloud belum terpenuhi' });
+      steps.push({ name: 'push-main', status: 'skipped', detail: 'dihentikan' });
+      steps.push({ name: 'publish-state', status: 'pending', detail: 'belum dijalankan (butuh konfirmasi dua fase)' });
+      return this.#cloud247Response(session, req, res, {
+        wantsJson,
+        status: 400,
+        ok: false,
+        id,
+        steps,
+        next: 'fix-prerequisites',
+      });
+    }
+    steps.push({
+      name: 'validasi',
+      status: 'ok',
+      detail: `repo https valid + ${pre.envCount} binding env lengkap di Brankas`,
+    });
+
+    // (B) upsert manifest entry
+    const name = String(pre.project?.name ?? '').trim();
+    const list = this.#readManifestList();
+    const port = Number(pre.project?.port);
+    const entry = {
+      name,
+      type: String(pre.project?.type ?? 'static'),
+      port: Number.isInteger(port) && port > 0 ? port : null,
+      repo_url: pre.repoUrl,
+      git_branch:
+        typeof pre.project?.branch === 'string' && pre.project.branch.trim() !== ''
+          ? pre.project.branch.trim()
+          : 'main',
+      enabled: true,
+    };
+    const idx = list.findIndex((e) => String(e?.name ?? '').trim() === name && name !== '');
+    if (idx >= 0) list[idx] = entry;
+    else list.push(entry);
+    const { valid } = this.#sanitizeManifest(list);
+    if (!valid.some((e) => String(e?.name ?? '').trim() === name)) {
+      steps.push({ name: 'manifest', status: 'failed', detail: 'entri project ditolak validator manifest (name/port/repo_url tidak sah)' });
+      steps.push({ name: 'push-main', status: 'skipped', detail: 'dihentikan' });
+      return this.#cloud247Response(session, req, res, {
+        wantsJson, status: 400, ok: false, id, steps, next: 'fix-prerequisites',
+      });
+    }
+    try {
+      writeFileSync(join(this.#rootDir, 'projects.auto.json'), `${JSON.stringify(valid, null, 2)}\n`, 'utf8');
+    } catch (e) {
+      steps.push({ name: 'manifest', status: 'failed', detail: `gagal menulis projects.auto.json: ${gitErrDetail(e)}` });
+      steps.push({ name: 'push-main', status: 'skipped', detail: 'dihentikan' });
+      return this.#cloud247Response(session, req, res, {
+        wantsJson, status: 502, ok: false, id, steps, next: 'fix-prerequisites',
+      });
+    }
+    steps.push({
+      name: 'manifest',
+      status: 'ok',
+      detail: `entri "${name}" di-upsert (${valid.length} project di manifest, repo_url tanpa kredensial)`,
+    });
+
+    // (C) commit + push main (helper yang sama dengan sync cloud)
+    const git = await this.#commitAndPushManifest();
+    if (!git.ok) {
+      steps.push({ name: 'push-main', status: 'failed', detail: git.message });
+      this.invalidateCloudBadgeCache();
+      return this.#cloud247Response(session, req, res, {
+        wantsJson, status: 502, ok: false, id, steps, next: 'retry-push',
+      });
+    }
+    this.invalidateCloudBadgeCache(); // manifest baru saja ter-push → jangan pakai cache basi
+    steps.push({ name: 'push-main', status: 'ok', detail: `projects.auto.json ter-commit & ter-push ke origin/${GIT_PUSH_REF}` });
+    steps.push({
+      name: 'publish-state',
+      status: 'pending',
+      detail: 'LANGKAH TERAKHIR & DESTRUKTIF: menimpa state cloud dengan state laptop — butuh konfirmasi dua fase',
+    });
+    return this.#cloud247Response(session, req, res, {
+      wantsJson, status: 200, ok: true, id, steps, next: 'publish-state',
+      autoPublish: body?.auto_publish === '1' || body?.auto_publish === 'on' || body?.auto_publish === 'true',
+    });
+  }
+
+  /**
+   * Serialisasi respons one-click: JSON ({steps, next}) untuk fetch, atau
+   * halaman HTML (pola tanpa-JS) yang mengakhiri alur dengan FORM dua fase
+   * publish-state. `autoPublish` hanya mempercepat sampai ke halaman konfirmasi —
+   * eksekusi tetap butuh klik konfirmasi (tidak ada konfirmasi tersembunyi).
+   */
+  async #cloud247Response(session, req, res, { wantsJson, status, ok, id, steps, next, autoPublish = false }) {
+    if (wantsJson) {
+      return this.#sendJson(res, status, {
+        ok,
+        projectId: String(id),
+        steps,
+        next,
+        publishAction: next === 'publish-state' ? '/projects/publish-state' : null,
+      });
+    }
+    if (ok && next === 'publish-state' && autoPublish) {
+      // Lanjut ke FASE 1 publish-state (halaman konfirmasi) — bukan eksekusi.
+      return await this.#publishStatePhase1(session, res);
+    }
+    const rows = steps
+      .map(
+        (s) =>
+          `<tr><td class="mono">${escapeHtml(s.name)}</td><td>${badgeHtml(
+            s.status,
+            s.status === 'ok' ? 'ok' : s.status === 'failed' ? 'err' : s.status === 'skipped' ? '' : 'warn',
+          )}</td><td class="muted">${escapeHtml(s.detail)}</td></tr>`,
+      )
+      .join('');
+    const inner =
+      `<section class="auth__card" id="cloud247-result">` +
+      `<div class="auth__brand"><span class="brand__mark">VPANEL</span><span class="auth__brand-sub">One-Click Cloud 24/7</span></div>` +
+      alertFrag(ok ? 'success' : 'error', ok ? 'Manifest cloud ter-push. Langkah terakhir masih menanti: publish state.' : 'One-click berhenti — lihat langkah yang gagal.') +
+      `<div class="table-wrap"><table class="table"><thead><tr><th scope="col">Langkah</th><th scope="col">Status</th><th scope="col">Detail</th></tr></thead><tbody>${rows}</tbody></table></div>` +
+      (ok && next === 'publish-state'
+        ? `<p class="field__hint">Publish state menimpa branch <span class="mono">${escapeHtml(STATE_BRANCH)}</span> dengan kondisi laptop ini. Ini aksi destruktif — panel meminta konfirmasi terpisah.</p>` +
+          actionForm('/projects/publish-state', {
+            label: 'Publish state ke cloud…',
+            cls: 'btn btn--danger btn--block',
+            confirm: 'Buka halaman konfirmasi publish state?',
+            csrf: session.csrfToken,
+          })
+        : `<a class="btn btn--block" href="/projects/${encodeURIComponent(String(id))}">Kembali ke project</a>`) +
+      `<a class="btn btn--ghost btn--block" href="/projects">Ke daftar project</a>` +
+      `</section>`;
+    return this.#sendHtml(res, status, this.#pageShell('One-Click Cloud 24/7', inner));
+  }
+
+  /** Render /projects dengan banner error (respons non-sukses handler cloud sync). */
+  async #renderProjectsError(session, res, message, status) {
+    this.#lastSync = null; // jangan tampilkan alert sukses basi
+    const page = await this.#pageProjects(session, '/projects', {
+      banner: alertFrag('error', message),
+    });
+    return this.#renderManaged(res, { ...page, status });
   }
 
   /** POST /projects/sync-to-github (dipanggil dari #handleProtectedPost). */
@@ -1665,23 +2628,35 @@ export class PanelServer {
     return this.#redirect(res, '/projects');
   }
 
-  /** POST /projects/sync-all-cloud: Daftarkan semua project (termasuk lokal) ke manifest + commit */
+  /**
+   * POST /projects/sync-all-cloud: Daftarkan semua project BERPENYANG repo
+   * git ke manifest + commit + push. Project tanpa repo_url DITOLAK dari
+   * registrasi cloud (runner tak akan bisa deploy workspace kosong —
+   * silent failure bug fix-19#2); entri lama yang invalid dibuang (bug 3);
+   * kegagalan git dipropagasikan ke response (bug 1).
+   */
   async #handleSyncAllCloudPost(session, res) {
-    const detail = await this.#fetchProjectDetails();
     const manifestPath = join(this.#rootDir, 'projects.auto.json');
-    let list = [];
+
+    let detail;
     try {
-      list = JSON.parse(readFileSync(manifestPath, 'utf8'));
-      if (!Array.isArray(list)) list = [];
-    } catch {
-      list = [];
+      detail = await this.#fetchProjectDetails();
+    } catch (e) {
+      const msg = e instanceof VmPanelError && e.message ? e.message : `Daftar project tidak dapat dibaca: ${gitErrDetail(e)}`;
+      return this.#renderProjectsError(session, res, msg, 502);
     }
 
+    const list = this.#readManifestList();
+    let skippedNoRepo = 0;
     for (const p of detail) {
       const name = String(p.name ?? '').trim();
       if (!name) continue;
-      const port = Number(p.port);
       const cleanUrl = cleanRepoUrl(p.repoUrl || p.repo_url || '') || '';
+      if (cleanUrl === '') {
+        skippedNoRepo += 1; // wajib repo_url — jangan daftarkan ke cloud
+        continue;
+      }
+      const port = Number(p.port);
       const entry = {
         name,
         type: String(p.type ?? 'static'),
@@ -1690,28 +2665,46 @@ export class PanelServer {
         git_branch: typeof p.branch === 'string' && p.branch.trim() !== '' ? p.branch.trim() : 'main',
         enabled: true,
       };
-      const idx = list.findIndex((e) => e.name === name);
+      const idx = list.findIndex((e) => e?.name === name);
       if (idx >= 0) list[idx] = entry;
       else list.push(entry);
     }
 
+    const { valid: finalList, dropped } = this.#sanitizeManifest(list);
+    if (finalList.length === 0) {
+      const msg = 'Cloud 24/7 butuh repo git — tidak ada project dengan repo_url valid untuk disinkronkan. Tambahkan repo_url pada project terlebih dahulu.';
+      return this.#renderProjectsError(session, res, msg, 400);
+    }
+
     try {
-      writeFileSync(manifestPath, `${JSON.stringify(list, null, 2)}\n`, 'utf8');
-      const git = process.platform === 'win32' ? 'git.exe' : 'git';
-      const opts = { cwd: this.#rootDir, timeout: GIT_TIMEOUT_MS, windowsHide: true };
-      await execFileP(git, ['add', 'projects.auto.json'], opts);
-      try {
-        await execFileP(git, ['commit', '-m', GIT_COMMIT_MSG], opts);
-      } catch {}
-      try {
-        await execFileP(git, ['push', 'origin', GIT_PUSH_REF], opts);
-      } catch {}
-    } catch {}
+      writeFileSync(manifestPath, `${JSON.stringify(finalList, null, 2)}\n`, 'utf8');
+    } catch (e) {
+      return this.#renderProjectsError(session, res, `Gagal menulis projects.auto.json: ${gitErrDetail(e)}`, 502);
+    }
+    const git = await this.#commitAndPushManifest();
+    if (!git.ok) {
+      return this.#renderProjectsError(session, res, `Sync cloud gagal: ${git.message}`, 502);
+    }
+    if (skippedNoRepo > 0 || dropped > 0) {
+      const msg = `Sinkron cloud berhasil — ${finalList.length} project ter-commit. `
+        + `${skippedNoRepo > 0 ? `${skippedNoRepo} project dilewati (tanpa repo_url — cloud 24/7 butuh repo git). ` : ''}`
+        + `${dropped > 0 ? `${dropped} entri manifest invalid dibuang.` : ''}`.trim();
+      this.#lastSync = null;
+      const page = await this.#pageProjects(session, '/projects', {
+        banner: alertFrag('warn', msg),
+      });
+      return this.#renderManaged(res, { ...page, status: 200 });
+    }
 
     return this.#redirect(res, '/projects');
   }
 
-  /** POST /projects/:id/sync-cloud: Daftarkan project individual ke Cloud 24/7 */
+  /**
+   * POST /projects/:id/sync-cloud: Daftarkan project individual ke Cloud
+   * 24/7. Wajib repo_url git valid — tanpa itu runner tidak bisa deploy
+   * (silent failure bug fix-19#2) → 400 VALIDATION, manifest tidak diubah.
+   * Kegagalan commit/push dipropagasikan sebagai error nyata (bug 1).
+   */
   async #handleSyncProjectCloudPost(id, session, res) {
     let project = null;
     try {
@@ -1722,18 +2715,17 @@ export class PanelServer {
     if (!project) return this.#redirect(res, '/projects');
 
     const manifestPath = join(this.#rootDir, 'projects.auto.json');
-    let list = [];
-    try {
-      list = JSON.parse(readFileSync(manifestPath, 'utf8'));
-      if (!Array.isArray(list)) list = [];
-    } catch {
-      list = [];
+    const name = String(project.name ?? '').trim();
+    const cleanUrl = cleanRepoUrl(project.repoUrl || project.repo_url || '') || '';
+    if (cleanUrl === '') {
+      const msg = `Project ${name ? `"${name}" ` : 'ini'}tanpa URL repo git tidak bisa dijalankan di cloud 24/7 — tambahkan repo_url dulu.`;
+      return this.#renderProjectsError(session, res, msg, 400);
     }
 
+    const list = this.#readManifestList();
     const port = Number(project.port);
-    const cleanUrl = cleanRepoUrl(project.repoUrl || project.repo_url || '') || '';
     const entry = {
-      name: String(project.name ?? '').trim(),
+      name,
       type: String(project.type ?? 'static'),
       port: Number.isInteger(port) && port > 0 ? port : null,
       repo_url: cleanUrl,
@@ -1741,22 +2733,22 @@ export class PanelServer {
       enabled: true,
     };
 
-    const idx = list.findIndex((e) => e.name === entry.name);
+    const idx = list.findIndex((e) => e?.name === name);
     if (idx >= 0) list[idx] = entry;
     else list.push(entry);
 
+    // Validasi seluruh entri sebelum push (bug 3): jangan hasilkan manifest rusak.
+    const { valid: finalList } = this.#sanitizeManifest(list);
+
     try {
-      writeFileSync(manifestPath, `${JSON.stringify(list, null, 2)}\n`, 'utf8');
-      const git = process.platform === 'win32' ? 'git.exe' : 'git';
-      const opts = { cwd: this.#rootDir, timeout: GIT_TIMEOUT_MS, windowsHide: true };
-      await execFileP(git, ['add', 'projects.auto.json'], opts);
-      try {
-        await execFileP(git, ['commit', '-m', GIT_COMMIT_MSG], opts);
-      } catch {}
-      try {
-        await execFileP(git, ['push', 'origin', GIT_PUSH_REF], opts);
-      } catch {}
-    } catch {}
+      writeFileSync(manifestPath, `${JSON.stringify(finalList, null, 2)}\n`, 'utf8');
+    } catch (e) {
+      return this.#renderProjectsError(session, res, `Gagal menulis projects.auto.json: ${gitErrDetail(e)}`, 502);
+    }
+    const git = await this.#commitAndPushManifest();
+    if (!git.ok) {
+      return this.#renderProjectsError(session, res, `Sync cloud gagal: ${git.message}`, 502);
+    }
 
     return this.#redirect(res, '/projects');
   }
@@ -2231,6 +3223,13 @@ export class PanelServer {
     );
     const repoUrlByName = await this.#repoUrlMapForBadges(rows);
 
+    // L3 badge JUJUR cloud 24/7: satu cek push (cache 30 dtk) + satu cek
+    // /system/github (cache 60 dtk) untuk SELURUH list — bukan per row.
+    const cloudPush = rows.length > 0 ? await this.#manifestPushStatus() : { pushed: null, reason: '' };
+    const cloudGh = rows.length > 0 ? await this.#githubRunnerStatus() : null;
+    const cloudCtx = { push: cloudPush, gh: cloudGh };
+    const cloudNames = toNameSet(manifestEntries.map((e) => e?.name));
+
     const portByProject = new Map();
     if (services.ok && Array.isArray(services.data?.rows)) {
       for (const s of services.data.rows) {
@@ -2282,6 +3281,18 @@ export class PanelServer {
             : '') +
           `</div>`
         : '';
+    // Alert hijau hasil publish-state terakhir (in-memory sekali render — pola #lastSync).
+    const lastPublish = this.#lastPublish;
+    this.#lastPublish = null;
+    const publishAlert = lastPublish
+      ? `<div class="alert alert--success" role="alert">` +
+        escapeHtml(
+          `State cloud dipublikasikan ke branch '${STATE_BRANCH}' — commit ` +
+            `${String(lastPublish.commit ?? '').slice(0, 10)} (backup ${String(lastPublish.backupId ?? '?')}). ` +
+            `Runner memakai state laptop ini pada siklus berikutnya.`,
+        ) +
+        `</div>`
+      : '';
     // Kartu GitHub Sync (owner-only): isi manifest + jumlah project + tombol
     // sync (POST /projects/sync-to-github, CSRF, confirm). Project tanpa
     // repo_url tidak ikut manifest (runner tidak berbagi filesystem panel).
@@ -2291,16 +3302,28 @@ export class PanelServer {
       ? `<section class="card" id="github-sync"><header class="card__header"><h2 class="card__title">GitHub Sync</h2></header><div class="card__body">` +
         `<p class="field__hint">Remote control untuk GitHub Actions runner: project dengan Git URL di-commit sebagai manifest <span class="mono">projects.auto.json</span> — runner men-deploy-nya otomatis tiap siklus. Project tanpa repo_url hanya lokal.</p>` +
         syncAlert +
+        publishAlert +
         (manifest.exists && manifest.content
           ? `<pre class="mono" aria-label="Isi projects.auto.json">${escapeHtml(JSON.stringify(manifest.content, null, 2))}</pre>`
           : emptyState({ title: 'projects.auto.json belum ada.', hint: 'Klik Sync ke GitHub untuk membuat manifest pertama di repo.' })) +
-        `<p class="field__hint">${manifest.exists ? `Manifest ada · ${manifestEntries.length} project di manifest` : 'Manifest belum ada'} · project dengan repo_url yang sudah synced: ${syncableCount}</p>` +
+        `<p class="field__hint">${manifest.exists ? `Manifest ada · ${manifestEntries.length} project di manifest` : 'Manifest belum ada'} · project dengan repo_url yang sudah synced: ${syncableCount} · status push: ${escapeHtml(cloudPush.pushed === true ? 'sama dengan origin/main' : cloudPush.reason || 'tidak terbaca')}</p>` +
         actionForm('/projects/sync-to-github', {
           label: 'Sync ke GitHub',
           cls: 'btn btn--primary',
           confirm: 'Commit projects.auto.json ke GitHub?',
           csrf: session.csrfToken,
         }) +
+        // L3: publish state = satu-satunya jalur menimpa branch 'state';
+        // form ini MEMBUKA halaman konfirmasi dua fase (bukan langsung eksekusi).
+        `<div class="stack" id="publish-state-actions">` +
+        actionForm('/projects/publish-state', {
+          label: 'Publish state ke cloud 24/7…',
+          cls: 'btn btn--danger btn--sm',
+          confirm: `Buka halaman konfirmasi? Aksi ini MENIMPA state cloud (branch ${STATE_BRANCH}) dengan state laptop.`,
+          csrf: session.csrfToken,
+        }) +
+        `<p class="field__hint">Backup laptop → enkripsi → push branch <span class="mono">${escapeHtml(STATE_BRANCH)}</span> (tanpa force). Butuh konfirmasi terpisah.</p>` +
+        `</div>` +
         `</div></section>`
       : '';
     const projectsTable =
@@ -2320,6 +3343,13 @@ export class PanelServer {
               if (hasRepo) return badgeHtml('lokal', 'warn');
               return '';
             },
+          },
+          {
+            // Badge JUJUR (L3): bukan "synced" selama manifest lokal belum
+            // sama dengan origin/main atau runner belum melaporkan sukses.
+            label: 'Cloud 24/7',
+            cell: (r) =>
+              this.#cloudBadgeHtml({ name: String(r?.name ?? '').trim() }, { ...cloudCtx, inManifest: cloudNames.has(String(r?.name ?? '').trim()) }),
           },
           { label: 'Port', cls: 'mono', cell: (r) => escapeHtml(String(portByProject.get(r.id) ?? '—')) },
           { label: 'Last deploy', cls: 'mono', cell: (r) => escapeHtml(lastDeploy.has(r.id) ? fmtTime(lastDeploy.get(r.id)) : '—') },
@@ -2395,6 +3425,43 @@ export class PanelServer {
     } else {
       overviewGrid = emptyState({ title: 'Project not found.', hint: 'Periksa ID atau kembali ke daftar projects.' });
     }
+
+    // --- L3 kartu "Cloud 24/7" (badge jujur + one-click A-C + publish dua fase)
+    // Kontrak markup untuk lane desainer: section#cloud-247, chip
+    // [data-cloud-state], form#cloud247-form, output#cloud247-steps,
+    // form publish [data-publish-state] (fase 1 → halaman konfirmasi dua fase).
+    const cloudManifestNames = toNameSet(this.#readManifestList().map((e) => e?.name));
+    const cloudProj = { name: String(project?.name ?? '').trim() };
+    const cloudChipHtml = project
+      ? await this.#cloudBadge(cloudProj, { inManifest: cloudManifestNames.has(cloudProj.name) })
+      : '';
+    const cloudInManifest = cloudManifestNames.has(cloudProj.name);
+    const canCloud = session.user.role === 'owner';
+    const cloudFormAction = `/projects/${encodeURIComponent(String(id))}/deploy-cloud-247`;
+    const cloudSection = project
+        ? `<section class="card" id="cloud-247"><header class="card__header"><h2 class="card__title">Cloud 24/7 <span class="mono muted">GitHub Actions</span></h2>${cloudChipHtml}</header><div class="card__body">` +
+        `<p class="field__hint">Runner menjalankan project ini dari manifest <span class="mono">projects.auto.json</span> di branch <span class="mono">main</span> + state terenkripsi di branch <span class="mono">${escapeHtml(STATE_BRANCH)}</span>. Butuh repo git https dan SEMUA variabel rahasia ter-binding di Brankas.</p>` +
+        (canCloud
+          ? `<form method="post" action="${escapeHtml(cloudFormAction)}" id="cloud247-form" data-cloud247 data-cloud247-target="#cloud247-steps">` +
+            csrfInput(session.csrfToken) +
+            `<div class="field"><label class="field__label" for="cloud247-understand"><input type="checkbox" id="cloud247-understand" name="auto_publish" value="1"> Saya paham langkah terakhir (publish state) MENIMPA state cloud dengan state laptop ini dan akan tetap meminta konfirmasi terpisah.</label></div>` +
+            `<button class="btn btn--primary btn--sm" type="submit" data-confirm="Daftarkan project ke cloud 24/7 (manifest + push main)?">Deploy ke Cloud 24/7 (langkah 1-3)</button>` +
+            `</form>` +
+            `<div class="stack" id="cloud247-steps" hidden aria-live="polite"></div>` +
+            (cloudInManifest
+              ? `<div class="stack" data-publish-state>` +
+                actionForm('/projects/publish-state', {
+                  label: 'Publish state ke cloud 24/7…',
+                  cls: 'btn btn--danger btn--sm',
+                  confirm: 'Buka halaman konfirmasi publish state (aksi destruktif)?',
+                  csrf: session.csrfToken,
+                }) +
+                `<p class="field__hint">Panel membuat backup lokal, mengenkripsinya, lalu push ke branch <span class="mono">${escapeHtml(STATE_BRANCH)}</span> tanpa force. Konfirmasi dua fase ditegakkan di server.</p>` +
+                `</div>`
+              : `<p class="field__hint">Jalankan "Deploy ke Cloud 24/7" lebih dulu — project belum ada di manifest.</p>`)
+          : `<p class="field__hint">Kelola cloud 24/7 khusus owner.</p>`) +
+        `</div></section>`
+      : '';
 
     const depTable = buildTable(
       [
@@ -2534,8 +3601,14 @@ export class PanelServer {
         testBadge = alertFrag(t.ok ? 'success' : 'error', detail);
       }
 
+      // L5b: daftar metadata boleh dilihat dengan secret.view, tetapi form tulis
+      // dan tombol hapus hanya dirender bila actor punya secret.manage.
+      const canWriteSecrets = this.#auth.perm.checkPermission({
+        userId: session.user.userId,
+        action: VAULT_MANAGE_ACTION,
+      }).allowed;
       configVaultSection =
-        cvVaultCard({ vault, csrf: session.csrfToken, encId }) +
+        cvVaultCard({ vault, csrf: session.csrfToken, encId, projectId: String(id), canWrite: canWriteSecrets }) +
         cvConfigCard({ configs, csrf: session.csrfToken, encId }) +
         cvEnvCard({ vault, envRows, csrf: session.csrfToken, encId }) +
         cvHookCard({ hook, testBadge, configs, vault, csrf: session.csrfToken, encId });
@@ -2550,7 +3623,10 @@ export class PanelServer {
         found: project ? 'yes' : 'no',
         note: project ? '' : ENDPOINT_TODO_NOTE,
         projectJson: JSON.stringify(project ?? null),
+        // L4: kartu cloud 24/7 = sibling section sendiri di template
+        // (slot {{cloudSection|raw}}); selalu di-export walau '' (aturan §3).
         overviewGrid,
+        cloudSection,
         deploymentsTable: depTableWithDeploy,
         healthSection,
         logsSection,
@@ -2964,6 +4040,21 @@ export class PanelServer {
       return this.#handleProjectCreate(session, body, res);
     }
 
+    // L5b — tulis/rotasi SATU nilai rahasia (owner-only). Nilai hanya lewat
+    // body ke manager; tidak pernah masuk HTML (sukses → redirect, gagal → banner).
+    if (pathname === '/vault/secret') {
+      const body = await readAndCsrf();
+      this.#requirePermission(session, VAULT_MANAGE_ACTION);
+      return this.#handleVaultSecretSave(session, body, res);
+    }
+
+    // L5b — hapus rahasia dua-fase (token panel sekali pakai → chain manager).
+    if (pathname === '/vault/secret-remove') {
+      const body = await readAndCsrf();
+      this.#requirePermission(session, VAULT_MANAGE_ACTION);
+      return this.#handleVaultSecretRemove(session, body, res);
+    }
+
     if (pathname === '/projects/sync-to-github') {
       await readAndCsrf();
       this.#requirePermission(session, 'project.create');
@@ -2991,6 +4082,65 @@ export class PanelServer {
       }
       const id = decodeURIComponent(m[1]);
       return await this.#handleSyncProjectCloudPost(id, session, res);
+    }
+
+    // L3 ONE-CLICK 24/7 (langkah A-C, non-destruktif) — publish state tetap
+    // lewat rute dua fase tersendiri di bawah.
+    m = pathname.match(/^\/projects\/([^/]+)\/deploy-cloud-247$/);
+    if (m) {
+      const body = await readAndCsrf();
+      const id = decodeURIComponent(m[1]);
+      this.#requirePermission(session, 'project.create', id);
+      if (session.user.role !== 'owner') {
+        throw new VmPanelError(PERMISSION_DENIED, 'Deploy ke cloud 24/7 khusus owner.');
+      }
+      return await this.#handleDeployCloud247Post(id, session, req, res, body);
+    }
+
+    // L3 PUBLISH STATE — destruktif (menimpa state cloud dengan state laptop):
+    // dua fase server-side, token konfirmasi mengikat sha branch 'state' saat
+    // user dimintai konfirmasi (kunci optimistik anti menimpa rantai baru).
+    if (pathname === '/projects/publish-state') {
+      const body = await readAndCsrf();
+      this.#requirePermission(session, 'project.create');
+      if (session.user.role !== 'owner') {
+        throw new VmPanelError(PERMISSION_DENIED, 'Publish state cloud khusus owner.');
+      }
+      const tokenField = String(body.confirmToken ?? '');
+      if (tokenField === '') return await this.#publishStatePhase1(session, res);
+      const rec = this.#takeConfirmToken(tokenField, 'publish-state:global', session.user.userId);
+      if (!rec) {
+        throw new VmPanelError(
+          PERMISSION_DENIED,
+          'Token konfirmasi tidak valid atau kedaluwarsa — jalankan ulang publish state.',
+        );
+      }
+      if (this.#publishInFlight) {
+        throw new VmPanelError('CONFLICT', 'Publish state lain sedang berjalan — tunggu selesai.');
+      }
+      this.#publishInFlight = true;
+      let result;
+      try {
+        result = await this.#runPublishState({
+          expectedStateSha: rec.meta?.expectedStateSha ?? '',
+          session,
+        });
+      } catch (e) {
+        result = { ok: false, status: 502, message: `Publish state gagal: ${this.#userSafeErrorText(e)}` };
+      } finally {
+        this.#publishInFlight = false;
+      }
+      if (!result.ok) {
+        return this.#renderProjectsError(session, res, result.message, result.status ?? 502);
+      }
+      this.#lastPublish = {
+        at: result.at,
+        commit: result.commit,
+        backupId: result.backupId,
+        branch: STATE_BRANCH,
+      };
+      this.#lastSync = null; // jangan tampilkan alert sync basi
+      return this.#redirect(res, '/projects');
     }
 
     m = pathname.match(/^\/projects\/([^/]+)\/delete$/);
@@ -3452,28 +4602,43 @@ export class PanelServer {
    * POST dengan confirmToken yang cocok → baru mengeksekusi. TIDAK ADA
    * auto-chain dalam satu request.
    */
-  #issueConfirmToken(key, userId) {
+  #issueConfirmToken(key, userId, meta = {}) {
     const now = Date.now();
     for (const [t, rec] of this.#pendingConfirms) {
       if (rec.expiresAt <= now) this.#pendingConfirms.delete(t);
     }
     const token = randomBytes(32).toString('hex');
-    this.#pendingConfirms.set(token, { key, userId, expiresAt: now + CONFIRM_TOKEN_TTL_MS });
+    this.#pendingConfirms.set(token, { key, userId, expiresAt: now + CONFIRM_TOKEN_TTL_MS, meta: meta || {} });
     return token;
+  }
+
+  /**
+   * Ambil + hanguskan record token sekali-pakai (sekali pakai — hangus walau
+   * gagal cocok). Meta tersimpan (mis. sha kunci optimistik publish-state)
+   * ikut dikembalikan; token TIDAK pernah ke log/audit.
+   */
+  #takeConfirmToken(token, key, userId) {
+    if (typeof token !== 'string' || token === '') return null;
+    const rec = this.#pendingConfirms.get(token);
+    if (rec) this.#pendingConfirms.delete(token);
+    const valid = Boolean(
+      rec && rec.expiresAt > Date.now() && rec.key === key && rec.userId === userId,
+    );
+    return valid ? rec : null;
   }
 
   /** Konsumsi token sekali-pakai; harus cocok aksi (key) + pemilik sesi. */
   #consumeConfirmToken(token, key, userId) {
-    if (typeof token !== 'string' || token === '') return false;
-    const rec = this.#pendingConfirms.get(token);
-    if (rec) this.#pendingConfirms.delete(token); // sekali pakai — hangus walau gagal cocok
-    return Boolean(
-      rec && rec.expiresAt > Date.now() && rec.key === key && rec.userId === userId,
-    );
+    return this.#takeConfirmToken(token, key, userId) !== null;
   }
 
   /** Halaman konfirmasi fase-1: form POST ulang ke aksi yang sama + token + CSRF. */
-  #confirmDestructiveHtml({ actionUrl, token, csrf, title, message, detail, cancelHref }) {
+  #confirmDestructiveHtml({ actionUrl, token, csrf, title, message, detail, cancelHref, confirmLabel = 'Konfirmasi hapus', hidden = {} }) {
+    // `hidden` = identitas tambahan yang harus bertahan ke fase 2 (mis. nama
+    // + cakupan rahasia pada /vault/secret-remove yang tidak ada di path).
+    const hiddenHtml = Object.entries(hidden)
+      .map(([k, v]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(String(v ?? ''))}">`)
+      .join('');
     return this.#pageShell(
       title,
       `<section class="auth__card">` +
@@ -3482,8 +4647,9 @@ export class PanelServer {
         (detail ? `<p class="field__hint mono">${escapeHtml(detail)}</p>` : '') +
         `<form class="auth__form" method="post" action="${escapeHtml(actionUrl)}">` +
         `<input type="hidden" name="confirmToken" value="${escapeHtml(token)}">` +
+        hiddenHtml +
         csrfInput(csrf) +
-        `<button class="btn btn--danger btn--block" type="submit">Konfirmasi hapus</button>` +
+        `<button class="btn btn--danger btn--block" type="submit">${escapeHtml(confirmLabel)}</button>` +
         `</form>` +
         `<a class="btn btn--block" href="${escapeHtml(cancelHref)}">Batal</a>` +
         `<p class="auth__note">Token konfirmasi sekali pakai dan kedaluwarsa dalam 10 menit.</p>` +
@@ -3492,18 +4658,125 @@ export class PanelServer {
   }
 
   /**
+   * L5b — POST /vault/secret: simpan/rotasi SATU nilai rahasia. Panel memvalidasi
+   * bentuk nama + besar nilai (umpan balik cepat), mengirim nilai HANYA di body
+   * ke manager, lalu redirect balik ke halaman detail. Respons manager berupa
+   * metadata, jadi nilai tidak pernah masuk HTML panel.
+   */
+  async #handleVaultSecretSave(session, body, res) {
+    const name = String(body?.name ?? '').trim();
+    const value = typeof body?.value === 'string' ? body.value : '';
+    const scope = String(body?.projectScope ?? '').trim();
+    const projectId = String(body?.projectId ?? '').trim();
+    if (!VAULT_SECRET_NAME_RE.test(name)) {
+      const err = new VmPanelError(
+        VALIDATION,
+        'Nama rahasia tidak valid: huruf/underscore di awal, hanya [A-Za-z0-9_], maksimal 64 karakter.',
+      );
+      if (projectId !== '') return this.#renderProjectError(session, projectId, res, err);
+      throw err;
+    }
+    if (value === '') {
+      const err = new VmPanelError(VALIDATION, 'Nilai rahasia wajib diisi.');
+      if (projectId !== '') return this.#renderProjectError(session, projectId, res, err);
+      throw err;
+    }
+    if (Buffer.byteLength(value, 'utf8') > VAULT_SECRET_MAX_BYTES) {
+      const err = new VmPanelError(
+        VALIDATION,
+        `Nilai rahasia terlalu besar (maks ${VAULT_SECRET_MAX_BYTES} byte).`,
+      );
+      if (projectId !== '') return this.#renderProjectError(session, projectId, res, err);
+      throw err;
+    }
+    try {
+      await this.#getManager().request('POST', `/secrets/${encodeURIComponent(name)}`, {
+        body: { value, projectScope: scope === '' ? null : scope },
+      });
+    } catch (e) {
+      if (e instanceof VmPanelError && projectId !== '') {
+        return this.#renderProjectError(session, projectId, res, e);
+      }
+      throw e;
+    }
+    return this.#redirect(
+      res,
+      projectId !== '' ? `/projects/${encodeURIComponent(projectId)}` : '/projects',
+    );
+  }
+
+  /**
+   * L5b — POST /vault/secret-remove, dua-fase di sisi panel (pola #13):
+   * fase 1 = dialog konfirmasi (token panel, key `secret-remove:<name>`, identitas
+   * dibawa sebagai hidden field); fase 2 = token dikonsumsi lalu panel men-chain
+   * manager remove-request → remove. Token manager tidak pernah singgah di browser.
+   */
+  async #handleVaultSecretRemove(session, body, res) {
+    const name = String(body?.name ?? '').trim();
+    const scope = String(body?.projectScope ?? '').trim();
+    const projectId = String(body?.projectId ?? '').trim();
+    const backHref = projectId !== '' ? `/projects/${encodeURIComponent(projectId)}` : '/projects';
+    if (!VAULT_SECRET_NAME_RE.test(name)) {
+      throw new VmPanelError(VALIDATION, 'Nama rahasia tidak valid.');
+    }
+    const key = `secret-remove:${name}`;
+    const tokenField = String(body?.confirmToken ?? '');
+    if (tokenField !== '' && !this.#consumeConfirmToken(tokenField, key, session.user.userId)) {
+      const err = new VmPanelError(
+        PERMISSION_DENIED,
+        'Token konfirmasi tidak valid atau kedaluwarsa — jalankan ulang aksi hapus.',
+      );
+      if (projectId !== '') return this.#renderProjectError(session, projectId, res, err);
+      throw err;
+    }
+    if (tokenField === '') {
+      const token = this.#issueConfirmToken(key, session.user.userId);
+      return this.#sendHtml(
+        res,
+        200,
+        this.#confirmDestructiveHtml({
+          actionUrl: '/vault/secret-remove',
+          token,
+          csrf: session.csrfToken,
+          title: 'Konfirmasi hapus rahasia',
+          message:
+            'RAHASIA DIHAPUS PERMANEN dari brankas. Variabel env / hook yang menunjuk rahasia ini ' +
+            'akan gagal di-resolve saat service start. Simpan ulang nilainya bila masih dibutuhkan.',
+          detail: `rahasia: ${name}  ·  cakupan: ${scope === '' ? 'global' : scope}`,
+          cancelHref: backHref,
+          confirmLabel: 'Ya — hapus rahasia',
+          hidden: { name, projectScope: scope, projectId },
+        }),
+      );
+    }
+    try {
+      await this.#vaultRemoveChain('POST', `/secrets/${encodeURIComponent(name)}`, {
+        projectScope: scope === '' ? null : scope,
+      });
+    } catch (e) {
+      if (e instanceof VmPanelError && projectId !== '') {
+        return this.#renderProjectError(session, projectId, res, e);
+      }
+      throw e;
+    }
+    return this.#redirect(res, backHref);
+  }
+
+  /**
    * Two-phase remove di sisi panel: POST "<base>/remove-request" → ambil
    * confirmToken → POST "<base>/remove" {confirmToken}. Token TIDAK pernah
    * dikirim ke browser — konfirmasi user lewat dialog data-confirm-phrase.
+   * `extraBody` opsional: field tambahan yang harus ikut di KEDUA panggilan
+   * (mis. projectScope pada rahasia ber-cakupan proyek).
    */
-  async #vaultRemoveChain(method, basePath) {
+  async #vaultRemoveChain(method, basePath, extraBody = {}) {
     const client = this.#getManager();
-    const rr = await client.request(method, `${basePath}/remove-request`, { body: {} });
+    const rr = await client.request(method, `${basePath}/remove-request`, { body: { ...extraBody } });
     const token = rr && typeof rr.confirmToken === 'string' ? rr.confirmToken : '';
     if (token === '') {
       throw new VmPanelError(VALIDATION, 'Manager tidak mengirim token konfirmasi — coba lagi.');
     }
-    return client.request(method, `${basePath}/remove`, { body: { confirmToken: token } });
+    return client.request(method, `${basePath}/remove`, { body: { confirmToken: token, ...extraBody } });
   }
 
   /**

@@ -94,3 +94,137 @@ test('format usage salah → exit 1 dengan usage', () => {
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /usage/i);
 });
+
+// --- D1: state pack bawa vault (prefix rute + fp + cap 4MB + compat gen-1) ---
+import crypto from 'node:crypto';
+import zlib from 'node:zlib';
+import { aesEncrypt, deriveKey } from '../../lib/crypto.js';
+
+const fpOf = (k) => crypto.createHash('sha256').update(`vpkhint:${k}`, 'utf8').digest('hex').slice(0, 12);
+const FAKE_TOKEN = 'x'.repeat(40); // TOKEN PALSU — bukan secret, hanya filler uji
+
+function makeSecretsRoot(withToken = true) {
+  const root = tmp('vpsc-sk-');
+  fs.mkdirSync(path.join(root, 'secrets', 'configs', 'deep'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'secrets', 'vault.enc'), withToken ? `tok:${FAKE_TOKEN}` : 'placeholder');
+  fs.writeFileSync(path.join(root, 'secrets', 'secrets.yaml'), 'ref: vault.enc\n');
+  fs.writeFileSync(path.join(root, 'secrets', 'configs', 'app.yaml'), 'k: v\n');
+  fs.writeFileSync(path.join(root, 'secrets', 'configs', 'deep', 'one.yaml'), 'n: 1\n');
+  return root;
+}
+
+test('D1 gen-2: encrypt --secretsroot → header fp + prefix backup/ dan secrets/', () => {
+  const src = tmp('vpsc-g2-src-');
+  fs.writeFileSync(path.join(src, 'platform.db'), 'sqlite-data-B'.repeat(10));
+  const sk = makeSecretsRoot();
+  const out = path.join(tmp('vpsc-g2-out-'), 'state.enc');
+
+  const e = run(['encrypt', src, out, MASTER, '--secretsroot', sk]);
+  assert.equal(e.status, 0, e.stderr);
+  const j = JSON.parse(fs.readFileSync(out, 'utf8'));
+  // field header lama tidak dirombak + fp baru kompatibel (gen lama = tanpa fp)
+  assert.equal(j.magic, 'VPSTATE1');
+  assert.equal(j.kdf.salt, 'vm-state-artifact');
+  assert.ok(j.envelope && j.envelope.ct);
+  assert.match(j.fp, /^[0-9a-f]{12}$/);
+  assert.equal(j.fp, fpOf(MASTER));
+  // vault plaintext TIDAK boleh bocor ke container (repo publik)
+  assert.ok(!fs.readFileSync(out, 'utf8').includes(FAKE_TOKEN), 'token palsu tidak boleh terlihat');
+  assert.ok(!fs.readFileSync(out, 'utf8').includes('sqlite-data-B'));
+});
+
+test('D1 gen-2: decrypt merutekan backup/* → outDir dan secrets/* → secretsroot (overwrite senyap)', () => {
+  const src = tmp('vpsc-g2r-src-');
+  fs.writeFileSync(path.join(src, 'platform.db'), 'sqlite-data-B'.repeat(10));
+  fs.mkdirSync(path.join(src, 'sub'));
+  fs.writeFileSync(path.join(src, 'sub', 'nested.txt'), 'nested');
+  const sk = makeSecretsRoot();
+  const out = path.join(tmp('vpsc-g2r-out-'), 'state.enc');
+  assert.equal(run(['encrypt', src, out, MASTER, '--secretsroot', sk]).status, 0);
+
+  const dst = path.join(tmp('vpsc-g2r-dst-'), 'restored');
+  const sk2 = makeSecretsRoot(false);
+  fs.writeFileSync(path.join(sk2, 'secrets', 'vault.enc'), 'STALE-LAMA'); // uji "laptop menang"
+  const d = run(['decrypt', out, dst, MASTER, '--secretsroot', sk2]);
+  assert.equal(d.status, 0, d.stderr);
+  // prefix backup/ strip → layout sama seperti gen-1 (restore_state.sh tetap cocok)
+  assert.equal(fs.readFileSync(path.join(dst, 'platform.db'), 'utf8'), 'sqlite-data-B'.repeat(10));
+  assert.equal(fs.readFileSync(path.join(dst, 'sub', 'nested.txt'), 'utf8'), 'nested');
+  // secrets ditulis seperti adanya ke target root, overwrite diterima
+  assert.equal(fs.readFileSync(path.join(sk2, 'secrets', 'vault.enc'), 'utf8'), `tok:${FAKE_TOKEN}`);
+  assert.equal(fs.readFileSync(path.join(sk2, 'secrets', 'configs', 'deep', 'one.yaml'), 'utf8'), 'n: 1\n');
+  // stdout decrypt menyebut rute prefix lengkap
+  assert.match(d.stdout, /backup\/platform\.db/);
+  assert.match(d.stdout, /secrets\/configs\/deep\/one\.yaml/);
+});
+
+test('D1: decrypt TANPA --secretsroot → entri secrets ke fallback <outDir>/secrets (tak menimpa yang hidup)', () => {
+  const src = tmp('vpsc-g2f-src-');
+  fs.writeFileSync(path.join(src, 'a.db'), 'aaa');
+  const sk = makeSecretsRoot();
+  const out = path.join(tmp('vpsc-g2f-out-'), 'state.enc');
+  assert.equal(run(['encrypt', src, out, MASTER, '--secretsroot', sk]).status, 0);
+  const dst = path.join(tmp('vpsc-g2f-dst-'), 'imported');
+  const d = run(['decrypt', out, dst, MASTER]);
+  assert.equal(d.status, 0, d.stderr);
+  assert.ok(fs.existsSync(path.join(dst, 'secrets', 'vault.enc')));
+  assert.ok(fs.existsSync(path.join(dst, 'secrets', 'configs', 'app.yaml')));
+});
+
+test('D1 compat gen-1: container tanpa fp & tanpa prefix masih terbaca', () => {
+  // bangun container gen-1 manual (format lama: key rel datan, header tanpa fp)
+  const inner = {
+    magic: 'VPSTATE1-INNER',
+    files: { 'manifest.json': { b64: Buffer.from('{"backupId":"old-1"}').toString('base64'), size: 18 } },
+    totalFiles: 1,
+    totalBytes: 18,
+  };
+  const gzB64 = zlib.gzipSync(Buffer.from(JSON.stringify(inner), 'utf8')).toString('base64');
+  const key = deriveKey(MASTER, 'vm-state-artifact', 'state-container');
+  const container = {
+    magic: 'VPSTATE1',
+    kdf: { salt: 'vm-state-artifact', label: 'state-container', iterations: 600000 },
+    encryptedAt: new Date().toISOString(),
+    innerFiles: 1,
+    innerBytes: 18,
+    envelope: aesEncrypt(key, gzB64),
+  };
+  assert.ok(!('fp' in container), 'fixture gen-1 memang tanpa fp');
+  const out = path.join(tmp('vpsc-g1-out-'), 'state.enc');
+  fs.writeFileSync(out, JSON.stringify(container));
+  const dst = path.join(tmp('vpsc-g1-dst-'), 'r');
+  const d = run(['decrypt', out, dst, MASTER]);
+  assert.equal(d.status, 0, d.stderr);
+  assert.equal(fs.readFileSync(path.join(dst, 'manifest.json'), 'utf8'), '{"backupId":"old-1"}');
+});
+
+test('D1 cap 4MB: total byte secrets melebihi cap → tolak VALIDATION', () => {
+  const src = tmp('vpsc-cap-src-');
+  fs.writeFileSync(path.join(src, 'a.db'), 'aaa');
+  const sk = tmp('vpsc-cap-sk-');
+  fs.mkdirSync(path.join(sk, 'secrets'), { recursive: true });
+  fs.writeFileSync(path.join(sk, 'secrets', 'vault.enc'), Buffer.alloc(4 * 1024 * 1024 + 1, 0x61));
+  const out = path.join(tmp('vpsc-cap-out-'), 'state.enc');
+  const e = run(['encrypt', src, out, MASTER, '--secretsroot', sk]);
+  assert.notEqual(e.status, 0);
+  assert.match(e.stderr, /VALIDATION/);
+  assert.match(e.stderr, /4MB/);
+});
+
+test('D1 gen-2: kunci salah saat decrypt → throw jelas, tidak ada file tertulis', () => {
+  const src = tmp('vpsc-wk-src-');
+  fs.writeFileSync(path.join(src, 'a.db'), 'xxx');
+  const sk = makeSecretsRoot();
+  const out = path.join(tmp('vpsc-wk-out-'), 'state.enc');
+  assert.equal(run(['encrypt', src, out, MASTER, '--secretsroot', sk]).status, 0);
+  // fp kunci lain ikut membuktikan mismatch dapat dideteksi tanpa dekripsi
+  assert.notEqual(fpOf('kunci-runner-lain'), JSON.parse(fs.readFileSync(out, 'utf8')).fp);
+  const dst = path.join(tmp('vpsc-wk-dst-'), 'r');
+  const sk2 = tmp('vpsc-wk-sk2-');
+  fs.mkdirSync(path.join(sk2, 'secrets'), { recursive: true });
+  const d = run(['decrypt', out, dst, 'kunci-runner-lain', '--secretsroot', sk2]);
+  assert.notEqual(d.status, 0);
+  assert.match(d.stderr, /DECRYPT_FAIL|decrypt/i);
+  assert.ok(!fs.existsSync(path.join(dst, 'a.db')), 'tidak ada backup tertulis');
+  assert.equal(fs.readdirSync(path.join(sk2, 'secrets')).length, 0, 'tidak ada secrets tertulis saat gagal');
+});

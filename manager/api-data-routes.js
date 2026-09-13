@@ -321,6 +321,100 @@ function tailLines(filePath, maxLines) {
  * @returns {Array<{method: string, pattern: string, handler: Function,
  *   permission?: string, status?: number}>}
  */
+// ── brankas: helper validasi nilai secret (L5b) ─────────────────────────────
+// Kontrak: nilai secret HANYA masuk lewat jalur ini, TIDAK PERNAH kembali di
+// respons/audit/log — semua respons adalah metadata ({name, projectScope,
+// updatedAt}). Nama dibatasi bentuk identifier supaya aman dipakai sebagai
+// target token konfirmasi dua-fase dan key vault.
+const SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+const SECRET_SCOPE_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const SECRET_VALUE_MAX_BYTES = 4096;
+
+/** Nama secret dari path → valid; salah → VALIDATION (400). */
+function assertSecretName(raw) {
+  const name = typeof raw === 'string' ? raw : '';
+  if (!SECRET_NAME_RE.test(name)) {
+    throw new VmPanelError(
+      VALIDATION,
+      'nama secret tidak valid: huruf/underscore di awal, hanya [A-Za-z0-9_], maks 64 karakter',
+    );
+  }
+  return name;
+}
+
+/** Nilai secret dari body: string 1..4096 byte (utf8). Tanpa nilai → 400. */
+function assertSecretValue(raw) {
+  if (typeof raw !== 'string' || raw.length === 0) {
+    throw new VmPanelError(VALIDATION, 'value wajib diisi (string)');
+  }
+  const bytes = Buffer.byteLength(raw, 'utf8');
+  if (bytes > SECRET_VALUE_MAX_BYTES) {
+    throw new VmPanelError(
+      VALIDATION,
+      `value terlalu besar (${bytes} byte > maks ${SECRET_VALUE_MAX_BYTES} byte)`,
+    );
+  }
+  return raw;
+}
+
+/** projectScope nullable: null/'' → global; selain itu harus slug pendek. */
+function assertSecretScope(raw) {
+  if (raw === undefined || raw === null) return '';
+  if (typeof raw !== 'string') {
+    throw new VmPanelError(VALIDATION, 'projectScope harus string atau null');
+  }
+  const scope = raw.trim();
+  if (scope === '') return '';
+  if (!SECRET_SCOPE_RE.test(scope)) {
+    throw new VmPanelError(
+      VALIDATION,
+      'projectScope tidak valid (huruf/angka/_/- saja, maks 64 karakter)',
+    );
+  }
+  return scope;
+}
+
+/** expiresAt opsional → ISO string; tak bisa diparse → VALIDATION. */
+function assertSecretExpiry(raw) {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const t = typeof raw === 'number' ? raw : Date.parse(String(raw));
+  if (!Number.isFinite(t)) {
+    throw new VmPanelError(VALIDATION, 'expiresAt tidak bisa diparse sebagai tanggal');
+  }
+  return new Date(t).toISOString();
+}
+
+/** Metadata satu secret (tanpa nilai) — null bila nama/scope tak cocok. */
+function findSecretMeta(sm, name, projectScope = '') {
+  const list = sm.listSecrets();
+  if (!Array.isArray(list)) return null;
+  const wantScope = String(projectScope ?? '');
+  return (
+    list.find(
+      (s) => s && s.name === name && String(s.projectScope ?? '') === wantScope,
+    ) ?? null
+  );
+}
+
+/**
+ * Tulis/rotasi nilai lalu balikan METADATA ONLY. Nilai yang baru ditulis
+ * langsung didaftarkan ke redactor SHARED (manager.redactor) sehingga string
+ * itu juga ter-redaksi di semua log/audit berikutnya.
+ */
+function setSecretMeta(manager, sm, { name, projectScope, value, expiresAt }) {
+  const meta = sm.setSecret({ name, value, projectScope, expiresAt });
+  try {
+    manager?.redactor?.addExtraValues?.([value]);
+  } catch {
+    /* redactor opsional (mis. stub test) — tulis tetap sukses */
+  }
+  return {
+    name: meta?.name ?? name,
+    projectScope: meta?.projectScope ?? projectScope ?? '',
+    updatedAt: meta?.updatedAt ?? new Date().toISOString(),
+  };
+}
+
 export function registerDataRoutes({ manager } = {}) {
   if (!manager) {
     throw new VmPanelError(VALIDATION, 'registerDataRoutes: manager wajib');
@@ -752,6 +846,98 @@ export function registerDataRoutes({ manager } = {}) {
       handler: ({ body }) => {
         const sm = requireMod(manager.secretManager);
         return sm.init(body ?? {});
+      },
+    },
+    // L5b — jalur input NILAI secret. POST = create/upsert (tidak pernah 404),
+    // PUT = rotate (404 bila nama/scope belum ada). Respons = metadata saja.
+    {
+      method: 'POST',
+      pattern: '/secrets/:name',
+      permission: 'secret.manage',
+      handler: ({ params, body }) => {
+        const sm = requireMod(manager.secretManager);
+        const name = assertSecretName(params.name);
+        const value = assertSecretValue(body?.value);
+        const projectScope = assertSecretScope(body?.projectScope);
+        const expiresAt = assertSecretExpiry(body?.expiresAt);
+        return setSecretMeta(manager, sm, { name, projectScope, value, expiresAt });
+      },
+    },
+    {
+      method: 'PUT',
+      pattern: '/secrets/:name',
+      permission: 'secret.manage',
+      handler: ({ params, body }) => {
+        const sm = requireMod(manager.secretManager);
+        const name = assertSecretName(params.name);
+        const value = assertSecretValue(body?.value);
+        const projectScope = assertSecretScope(body?.projectScope);
+        const expiresAt = assertSecretExpiry(body?.expiresAt);
+        if (!findSecretMeta(sm, name, projectScope)) {
+          throw new VmPanelError(NOT_FOUND, `secret "${name}" tidak ditemukan untuk scope ini`);
+        }
+        return setSecretMeta(manager, sm, { name, projectScope, value, expiresAt });
+      },
+    },
+    // Fase 1: terbitkan token konfirmasi penghapusan (target = nama secret).
+    {
+      method: 'POST',
+      pattern: '/secrets/:name/remove-request',
+      permission: 'secret.manage',
+      handler: ({ params, body }) => {
+        const sm = requireMod(manager.secretManager);
+        const name = assertSecretName(params.name);
+        const projectScope = assertSecretScope(body?.projectScope);
+        if (typeof sm.issueConfirmToken !== 'function') {
+          throw new VmPanelError(
+            'NOT_READY',
+            'modul secret belum aktif — token konfirmasi dua-fase tidak bisa diterbitkan',
+          );
+        }
+        const res = sm.issueConfirmToken('secret', name);
+        return {
+          confirmToken: res.confirmToken,
+          expiresAt: res.expiresAt,
+          name,
+          projectScope,
+        };
+      },
+    },
+    // Fase 2: token dikonsumsi NYATA (gagal = PERMISSION_DENIED/403), baru hapus.
+    {
+      method: 'POST',
+      pattern: '/secrets/:name/remove',
+      permission: 'secret.manage',
+      handler: ({ params, body }) => {
+        const sm = requireMod(manager.secretManager);
+        const name = assertSecretName(params.name);
+        const projectScope = assertSecretScope(body?.projectScope);
+        if (!body?.confirmToken) {
+          throw new VmPanelError(
+            PERMISSION_DENIED,
+            'confirmToken wajib diisi (fase 1 remove-request dulu)',
+          );
+        }
+        if (typeof sm.consumeConfirmToken !== 'function') {
+          throw new VmPanelError(
+            'NOT_READY',
+            'modul secret belum aktif — konfirmasi dua-fase tidak bisa diverifikasi',
+          );
+        }
+        try {
+          sm.consumeConfirmToken(body.confirmToken, 'secret', name);
+        } catch (e) {
+          throw new VmPanelError(
+            PERMISSION_DENIED,
+            `konfirmasi dua-fase gagal: ${String(e?.message ?? 'token tidak valid')}`,
+            { name },
+          );
+        }
+        if (!findSecretMeta(sm, name, projectScope)) {
+          throw new VmPanelError(NOT_FOUND, `secret "${name}" tidak ditemukan untuk scope ini`);
+        }
+        sm.removeSecret(name, projectScope ? { projectScope } : {});
+        return { removed: true, name, projectScope };
       },
     },
 

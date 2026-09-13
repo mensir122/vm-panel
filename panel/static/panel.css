@@ -3301,7 +3301,11 @@ body.auth {
 /* Structural & Topbar Utilities */
 .panel-section {
   margin-bottom: 24px;
-  /* jump anchor tab tidak tertutup topbar sticky (+titlebar desktop) */
+}
+/* jump anchor tab tidak tertutup topbar sticky (+titlebar desktop);
+   .card[id] = kartu yang jadi target anchor langsung (mis. #cloud-247) */
+.panel-section,
+.card[id] {
   scroll-margin-top: calc(var(--desktop-titlebar-h, 0px) + 72px);
 }
 .topbar__user {
@@ -3630,6 +3634,45 @@ body:has(.deploy-modal[style*="display: flex"]) .assistant-trigger {
   border-color: #FFFFFF;
 }
 
+/* ---------- Cloud 24/7: baris langkah (panel.js renderCloud247Steps) ---------- */
+/* p.field__hint[data-cloud-step] → pill status list, bukan paragrah melayang */
+[data-cloud-step] {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 6px 10px;
+  background: var(--glass-input);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+}
+[data-cloud-step] .mono {
+  color: #E5E7EB;
+  font-weight: 600;
+}
+[data-cloud-step] .badge {
+  flex-shrink: 0;
+}
+/* ritme list lebih rapat dari .stack umum (18px) */
+#cloud247-steps {
+  gap: 10px;
+}
+
+/* chip badge cloud: lebar minimum stabil → kolom list tidak bergeser
+   saat status berubah label (belum cloud → belum ter-push → aktif) */
+.badge[data-cloud-state] {
+  min-width: 96px;
+  justify-content: center;
+  white-space: nowrap;
+}
+
+/* ---------- Multi-baris detail pada halaman konfirmasi destruktif ---------- */
+/* controller join '\n' (publish-state); mono + pre-line = blok risiko terbaca */
+.auth__card .field__hint.mono {
+  white-space: pre-line;
+}
+
 /* ---------- Terminal pipeline: level event terlihat beda ---------- */
 .terminal-line {
   overflow-wrap: anywhere;
@@ -3661,7 +3704,8 @@ body:has(.deploy-modal[style*="display: flex"]) .assistant-trigger {
 .panel-section > .card {
   transition: border-color var(--speed) var(--ease), box-shadow var(--speed) var(--ease);
 }
-.panel-section:target > .card {
+.panel-section:target > .card,
+.card:target {
   border-color: var(--border-glass-hover);
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08), var(--card-shadow);
 }

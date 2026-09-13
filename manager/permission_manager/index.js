@@ -40,6 +40,7 @@ const ACTION_ROLES = Object.freeze({
   'backup.restore': new Set(['owner']),
   'deployment.rollback': new Set(['owner']),
   'secret.view': new Set(['owner']),
+  'secret.manage': new Set(['owner']),
   'permission.manage': new Set(['owner']),
   'user.manage': new Set(['owner']),
   'audit.view': new Set(['owner', 'operator']),

@@ -92,7 +92,9 @@ jobs:
           RUNNER_DRAIN_MINUTES: ${{ inputs.drill_drain_minutes || '15' }}
 
       - name: Final backup sebelum shutdown
-        if: always()
+        # Guard D2: JANGAN pernah timpa state cloud dengan pack dari run yang
+        # restore-nya dinyatakan salah-kunci (state_ok=false).
+        if: always() && steps.restore.outputs.state_ok != 'false'
         run: bash scripts/backup_final.sh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -103,7 +105,7 @@ jobs:
         run: bash scripts/stop_all.sh
 
       - name: Upload state TERENKRIPSI (untuk chain berikutnya & restore data)
-        if: always()
+        if: always() && steps.restore.outputs.state_ok != 'false'
         uses: actions/upload-artifact@v4
         with:
           name: vm-state

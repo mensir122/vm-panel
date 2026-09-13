@@ -16,6 +16,13 @@
 //            → redirect sukses + manifest ter-commit di bare repo + alert hijau
 //   (6)      viewer/operator → 403 (khusus owner)
 //   (7)      POST tanpa CSRF → 403
+//   (8)      sync-all-cloud → HANYA project dengan repo_url masuk manifest;
+//            project lokal tanpa repo_url DITOLAK silent (fix-19#2), dilaporkan
+//   (9)      sync-cloud project tanpa repo_url → 400 VALIDATION + manifest
+//            tidak berisi entry itu (fix-19#2)
+//   (10)     sync-cloud project dengan repo_url → 302 sukses (regresi)
+//   (11)     push gagal (remote origin dihapus) pada sync-cloud → 502 dengan
+//            pesan error nyata, BUKAN redirect sukses (fix-19#1)
 //
 // Git availability guard (pola projects-ui.test.js): test yang butuh git
 // di-skip bila git tidak tersedia; sisanya tetap jalan.
@@ -331,24 +338,30 @@ describe('github-sync (panel → GitHub Actions runner)', () => {
     assert.equal(res.status, 403);
   });
 
-  test('(8) POST /projects/sync-all-cloud → daftarkan semua project (termasuk lokal) ke manifest + commit', { skip: !gitAvailable }, async () => {
+  test('(8) POST /projects/sync-all-cloud → hanya project dengan repo_url masuk manifest', { skip: !gitAvailable }, async () => {
     const res = await req(ctx.port, 'POST', '/projects/sync-all-cloud', {
       jar: ctx.ownerJar,
       headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
       body: form({}),
     });
-    assert.equal(res.status, 302, 'redirect setelah sync all sukses');
-    assert.equal(res.headers.get('location'), '/projects');
+    // Ada project tanpa repo_url yang dilewati → halaman /projects dengan
+    // banner peringatan (bukan redirect bisu), TETAP 2xx (bukan error).
+    const text = await res.text();
+    assert.ok([200, 302].includes(res.status), `sync all sukses parsial → 2xx (dapat ${res.status}): ${text.match(/role="alert">([^<]*)/)?.[1] ?? ''}`);
+    if (res.status === 200) {
+      assert.ok(text.includes('alert--warn'), 'banner peringatan dilewati tampil');
+      assert.ok(text.includes('repo_url'), 'pesan menyebut alasan repo_url');
+    }
 
     const statusRes = await req(ctx.port, 'GET', '/projects/sync-status', { jar: ctx.ownerJar });
     assert.equal(statusRes.status, 200);
     const body = await statusRes.json();
     assert.equal(body.exists, true);
-    assert.ok(body.content.length >= 2, 'semua project masuk manifest');
-    assert.ok(body.content.some((e) => e.name === 'sync-local-only'), 'local project otomatis masuk manifest');
+    assert.ok(!body.content.some((e) => e.name === 'sync-local-only'), 'project tanpa repo_url TIDAK masuk manifest (fix-19#2)');
+    assert.ok(body.content.some((e) => e.name === 'sync-with-repo' && typeof e.repo_url === 'string' && e.repo_url !== ''), 'project dengan repo_url tetap ter-daftar');
   });
 
-  test('(9) POST /projects/:id/sync-cloud → daftarkan project individual ke Cloud 24/7', { skip: !gitAvailable }, async () => {
+  test('(9) POST /projects/:id/sync-cloud TANPA repo_url → 400 VALIDATION + manifest tidak berisi entry', { skip: !gitAvailable }, async () => {
     const listRes = await ctx.managerClient.request('GET', '/projects');
     const localProj = listRes.find((p) => p.name === 'sync-local-only');
     assert.ok(localProj, 'project local ditemukan');
@@ -358,7 +371,55 @@ describe('github-sync (panel → GitHub Actions runner)', () => {
       headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
       body: form({}),
     });
-    assert.equal(res.status, 302, 'redirect setelah sync individual sukses');
+    assert.equal(res.status, 400, 'tanpa repo_url → 4xx VALIDATION, bukan redirect sukses');
+    const text = await res.text();
+    assert.ok(text.includes('alert--error'), 'banner error tampil');
+    assert.ok(text.includes('repo git') && text.includes('repo_url'), 'pesan Indonesian jelas: butuh repo git / tambahkan repo_url');
+
+    const statusRes = await req(ctx.port, 'GET', '/projects/sync-status', { jar: ctx.ownerJar });
+    const body = await statusRes.json();
+    assert.ok(!body.content.some((e) => e.name === 'sync-local-only'), 'manifest TIDAK berisi entry project tanpa repo_url');
+  });
+
+  test('(10) POST /projects/:id/sync-cloud DENGAN repo_url → 302 sukses (regresi happy-path)', { skip: !gitAvailable }, async () => {
+    const listRes = await ctx.managerClient.request('GET', '/projects');
+    const repoProj = listRes.find((p) => p.name === 'sync-with-repo');
+    assert.ok(repoProj, 'project dengan repo_url ditemukan');
+
+    const res = await req(ctx.port, 'POST', `/projects/${encodeURIComponent(repoProj.id)}/sync-cloud`, {
+      jar: ctx.ownerJar,
+      headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
+      body: form({}),
+    });
+    assert.equal(res.status, 302, 'sync individual dengan repo_url → redirect sukses');
     assert.equal(res.headers.get('location'), '/projects');
+
+    const statusRes = await req(ctx.port, 'GET', '/projects/sync-status', { jar: ctx.ownerJar });
+    const body = await statusRes.json();
+    const entry = body.content.find((e) => e.name === 'sync-with-repo');
+    assert.ok(entry && typeof entry.repo_url === 'string' && entry.repo_url.includes('fixture-repo'), 'entry repo_url valid di manifest');
+  });
+
+  test('(11) push gagal (origin dihapus) pada sync-cloud → 502 pesan error nyata, bukan sukses (fix-19#1)', { skip: !gitAvailable }, async () => {
+    // Stimulasi push gagal dengan git CLI nyata: hapus remote origin di
+    // sandbox. Tanpa origin, `git push origin main` selalu gagal (exit != 0)
+    // — "nothing to commit" pada tahap commit ditoleransi, push tetap jalan.
+    const opts = { cwd: ctx.dir, timeout: 30000 };
+    await execFileP('git', ['remote', 'remove', 'origin'], opts);
+
+    const listRes = await ctx.managerClient.request('GET', '/projects');
+    const repoProj = listRes.find((p) => p.name === 'sync-with-repo');
+    assert.ok(repoProj, 'project dengan repo_url ditemukan');
+
+    const res = await req(ctx.port, 'POST', `/projects/${encodeURIComponent(repoProj.id)}/sync-cloud`, {
+      jar: ctx.ownerJar,
+      headers: { 'x-csrf-token': ctx.ownerJar.get('vpanel_csrf') },
+      body: form({}),
+    });
+    assert.notEqual(res.status, 302, 'push GAGAL → bukan redirect sukses (catch kosong lama)');
+    assert.equal(res.status, 502, 'gagal git push → 502 dengan pesan jelas');
+    const text = await res.text();
+    assert.ok(text.includes('alert--error'), 'banner error tampil');
+    assert.ok(/git push gagal/.test(text), 'pesan menyebut langkah git push yang gagal');
   });
 });

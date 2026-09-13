@@ -195,3 +195,116 @@ test('smoke: verify_state.sh di sandbox (POSIX only)', { skip: !isPosix }, async
   // Script exit 0 walau tidak ada DB (semua di-skip).
   assert.equal(r.status, 0, (r.stderr || '') + (r.stdout || ''));
 });
+
+// --- D2: guard fingerprint master key (VPKEY_MISMATCH) ---
+test('vm.yml D2: gate state_ok HANYA di Final backup + Upload state; urutan step utuh', () => {
+  const s = read(path.join(WF, 'vm.yml'));
+  const gates = [...s.matchAll(/if:\s*always\(\)\s*&&\s*steps\.restore\.outputs\.state_ok\s*!=\s*'false'/g)];
+  assert.equal(gates.length, 2, 'tepat 2 step ber-gate state_ok (final backup + upload state)');
+  assert.match(s, /id:\s*restore/, 'step restore wajib punya id utk konteks output');
+  // urutan tidak berubah: restore → final backup → upload state
+  const iRestore = s.indexOf('- name: Restore state');
+  const iFinal = s.indexOf('- name: Final backup');
+  const iUpload = s.indexOf('- name: Upload state TERENKRIPSI');
+  assert.ok(iRestore >= 0 && iRestore < iFinal && iFinal < iUpload, 'urutan step restore < final < upload');
+  // step lain TIDAK boleh ikut ber-gate: shutdown + chain-lock tetap always() polos
+  const shutdown = s.slice(s.indexOf('- name: Graceful shutdown'));
+  assert.match(shutdown, /if:\s*always\(\)\n\s*run:\s*bash scripts\/stop_all\.sh/, 'Graceful shutdown tetap always() polos');
+  assert.match(s, /if:\s*always\(\)\n\s*uses:\s*actions\/upload-artifact@v4\n\s*with:\n\s*name:\s*vm-chain-lock/, 'Upload chain lock tetap always() polos');
+});
+
+test('restore_state.sh D2: guard fp SEBELUM decrypt + state_ok=false + tanpa fresh-start saat mismatch', () => {
+  const s = read(path.join(SCRIPTS, 'restore_state.sh'));
+  assert.match(s, /::error::VPKEY_MISMATCH/, 'marker error GitHub ::error::VPKEY_MISMATCH');
+  assert.match(s, /state_ok=false/, 'output state_ok=false saat mismatch');
+  assert.match(s, /vpkhint:/, 'formula fingerprint sha256(vpkhint:+kunci) — konsisten dgn state-container');
+  assert.ok(s.indexOf('VPKEY_MISMATCH') < s.indexOf('state-container.mjs decrypt'), 'guard WAJIB sebelum decrypt');
+  assert.match(s, /node --input-type=module/, 'guard pakai node -e, bukan python');
+  // fallback sah (artifact/branch belum ada) tetap ada:
+  assert.match(s, /FRESH START/, 'fresh-start sah tetap ada');
+});
+
+test('restore_state.sh R1 (Gate-3): RESTORE GAGAL pasca-decrypt = FAIL LOUD state_ok=false + exit 1, tanpa fresh-start senyap', () => {
+  const s = read(path.join(SCRIPTS, 'restore_state.sh'));
+  const i = s.indexOf('RESTORE GAGAL');
+  assert.ok(i >= 0, 'cabang RESTORE GAGAL ada');
+  const branch = s.slice(i, i + 400);
+  assert.match(branch, /state_ok=false/, 'fallback pasca-decrypt WAJIB state_ok=false (vm.yml skip final-backup+upload)');
+  assert.match(branch, /exit 1/, 'cabang ini WAJIB exit 1 (bukan 0)');
+  assert.doesNotMatch(branch, /restored_from=fresh/, 'tanpa pelabelan fresh-start setelah decrypt sah');
+});
+
+test('restore_state.sh + backup_final.sh D1: secretsroot tersambung', () => {
+  const r = read(path.join(SCRIPTS, 'restore_state.sh'));
+  const b = read(path.join(SCRIPTS, 'backup_final.sh'));
+  assert.match(b, /encrypt[^\n]*--secretsroot \./, 'backup_final: pack menyertakan ./secrets');
+  assert.match(r, /decrypt[^\n]*--secretsroot \./, 'restore_state: secrets ditulis ke root repo runner');
+});
+
+// (c) POSIX-only: eksekusi nyata guard via sandbox — fake gh serve container
+// vault-branch; dua fixture: fp beda (exit 1) dan fp sama (lanjut decrypt).
+test('restore_state.sh guard (POSIX only): fp mismatch -> exit1+state_ok=false TANPA fresh-start; fp match -> decrypt jalan', { skip: !isPosix }, async () => {
+  const os = await import('node:os');
+  const { spawnSync } = await import('node:child_process');
+  const SCRIPT = path.join(SCRIPTS, 'state-container.mjs');
+  const KEY_LAPTOP = 'dummy-' + ['laptop', 'key'].join('-') + '-A-not-real';
+  const KEY_RUNNER = 'dummy-' + ['runner', 'key'].join('-') + '-B-not-real';
+  const mk = (p) => fs.mkdtempSync(path.join(os.tmpdir(), p));
+
+  function buildFixture(dir, key) {
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'a.db'), 'dummy-db');
+    fs.mkdirSync(path.join(dir, 'sk', 'secrets'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'sk', 'secrets', 'vault.enc'), 'tok:' + 'x'.repeat(32));
+    const enc = path.join(dir, 'vm-state.enc');
+    const e = spawnSync(process.execPath, [SCRIPT, 'encrypt', path.join(dir, 'src'), enc, key, '--secretsroot', path.join(dir, 'sk')], { encoding: 'utf8', timeout: 60_000 });
+    assert.equal(e.status, 0, e.stderr);
+    return enc;
+  }
+
+  function sandbox(encFile, runnerKey) {
+    const root = mk('wf-restore-');
+    fs.mkdirSync(path.join(root, 'bin'), { recursive: true });
+    // shim gh: tanpa artifact -> branch 'state' .sha -> deadbeef; .content -> base64 fixture.
+    fs.writeFileSync(path.join(root, 'bin', 'gh'),
+      '#!/usr/bin/env bash\nfor a in "$@"; do\n  case "$a" in\n    *".sha"*) echo deadbeef; exit 0;;\n    *".content"*) base64 -w0 "$VP_FIX_ENC"; exit 0;;\n  esac\ndone\nexit 0\n',
+      { mode: 0o755 });
+    fs.symlinkSync(SCRIPTS, path.join(root, 'scripts'), 'dir');
+    const out = path.join(root, 'gh_output.txt');
+    const r = spawnSync('bash', [path.join(SCRIPTS, 'restore_state.sh')], {
+      encoding: 'utf8', cwd: root, timeout: 120_000,
+      env: {
+        ...process.env,
+        PATH: path.join(root, 'bin') + path.delimiter + process.env.PATH,
+        VP_FIX_ENC: encFile,
+        GITHUB_REPOSITORY: 'octo/dummy-public-repo',
+        GH_TOKEN: 'dummy-' + 'gh-token' + '-not-real',
+        VPANEL_MASTER_KEY: runnerKey,
+        GITHUB_OUTPUT: out,
+        GITHUB_RUN_ID: '424242',
+      },
+    });
+    const output = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '';
+    return { root, r, output };
+  }
+
+  // --- MISMATCH: container dipack dgn kunci laptop, runner pegang kunci lain ---
+  const fx = mk('wf-fix-mis-');
+  const bad = sandbox(buildFixture(fx, KEY_LAPTOP), KEY_RUNNER);
+  assert.equal(bad.r.status, 1, `mismatch harus exit 1\nout:\n${bad.r.stdout}\n${bad.r.stderr}`);
+  assert.match(bad.r.stdout, /::error::VPKEY_MISMATCH/, 'menyebutkan VPKEY_MISMATCH');
+  assert.match(bad.output, /state_ok=false/, 'output langkah state_ok=false');
+  assert.ok(!/restored_from=fresh/.test(bad.output), 'TIDAK boleh ada fresh-start saat mismatch');
+  assert.ok(!fs.existsSync(path.join(bad.root, 'backups', 'a.db')), 'decrypt tidak berjalan');
+  assert.ok(!fs.existsSync(path.join(bad.root, 'secrets')), 'secrets runner tidak tersentuh');
+
+  // --- MATCH: kunci sama -> guard lolos, decrypt merutekan backup + secrets ---
+  const fx2 = mk('wf-fix-ok-');
+  const good = sandbox(buildFixture(fx2, KEY_RUNNER), KEY_RUNNER);
+  assert.equal(good.r.status, 0, `match harus lanjut\nout:\n${good.r.stdout}\n${good.r.stderr}`);
+  assert.ok(!/VPKEY_MISMATCH/.test(good.r.stdout), 'tanpa error mismatch');
+  assert.match(good.r.stdout, /\[state-container\] decrypted/, 'decrypt benar-benar jalan');
+  assert.ok(good.output.includes('state_ok=true'), 'state_ok=true di jalur sah');
+  assert.equal(fs.readFileSync(path.join(good.root, 'backups', 'a.db'), 'utf8'), 'dummy-db');
+  assert.match(fs.readFileSync(path.join(good.root, 'secrets', 'vault.enc'), 'utf8'), /^tok:x+$/);
+});

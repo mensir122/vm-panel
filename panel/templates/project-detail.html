@@ -37,6 +37,27 @@
                              </dl>
                            </div>
                          </section>
+                         L3 appends a SECOND section to this same fragment
+                         (kept inside an existing |raw key on purpose so no
+                         new template tag exists to go un-filled). Anchors the
+                         designer lane must keep (attribute names written
+                         without quotes here so this comment never collides
+                         with the real markup in tests):
+                         section.card id=cloud-247
+                           header  .card__title "Cloud 24/7" + chip
+                                   span.badge with data-cloud-state attribute
+                           body
+                             form#cloud247-form method=post
+                               action=/projects/&lt;id&gt;/deploy-cloud-247
+                               data-cloud247 + data-cloud247-target
+                               hidden _csrf, checkbox name=auto_publish,
+                               button[data-confirm]
+                             div#cloud247-steps hidden aria-live=polite
+                             div[data-publish-state] two-phase form
+                               action=/projects/publish-state (fase 1 =
+                               halaman konfirmasi server, bukan eksekusi)
+                         Chip states: belum-cloud | belum-terpush | queued |
+                         active | gagal | aktif.
     [deploymentsTable|raw] table (div.table-wrap > table.table; th: ID,
                          Revision, Status, Actor, Started UTC, Finished UTC)
                          or div.empty with "No deployments yet."
@@ -212,6 +233,7 @@
 
         <nav class="tabs" aria-label="Project sections">
           <a class="tab" href="#overview" role="tab" aria-controls="overview">Overview</a>
+          <a class="tab" href="#cloud-247" role="tab" aria-controls="cloud-247">Cloud 24/7</a>
           <a class="tab" href="#deployments" role="tab" aria-controls="deployments">Deployments</a>
           <a class="tab" href="#health" role="tab" aria-controls="health">Health</a>
           <a class="tab" href="#logs" role="tab" aria-controls="logs">Logs</a>
@@ -229,6 +251,10 @@
             <h2 class="sr-only" id="h-overview">Overview</h2>
             {{overviewGrid|raw}}
           </section>
+
+          <!-- Kartu Cloud 24/7: section#cloud-247 dibawa dari controller;
+               kosong (project tak ada) dirender '' tanpa jejak layout. -->
+          {{cloudSection|raw}}
 
           <section class="panel-section" id="deployments" aria-labelledby="h-deployments">
             <h2 class="sr-only" id="h-deployments">Deployments</h2>

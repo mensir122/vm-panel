@@ -256,4 +256,210 @@ describe('Manager API — Config & Brankas Endpoints', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // ── L5b: jalur input NILAI secret (POST/PUT + hapus dua-fase) ─────────────
+  const SEKRET = 'SEKRITPALSUxyz-uji-4096';
+
+  test('19. POST /secrets/:name membuat secret — respons metadata TANPA nilai', async () => {
+    const res = await client.request('POST', '/secrets/OPENAI_KEY', {
+      body: { value: SEKRET, projectScope: null },
+    });
+    assert.equal(res.name, 'OPENAI_KEY');
+    assert.equal(res.projectScope, '');
+    assert.equal(typeof res.updatedAt, 'string');
+    assert.ok(!JSON.stringify(res).includes(SEKRET), 'nilai haram muncul di respons');
+
+    const listed = await client.request('GET', '/secrets');
+    assert.ok(!JSON.stringify(listed).includes(SEKRET), 'nilai haram muncul di daftar metadata');
+    const row = listed.secrets.find((s) => s.name === 'OPENAI_KEY');
+    assert.ok(row, 'secret harus terlihat di daftar metadata');
+
+    // nilai baru terdaftar di redactor SHARED → string mentah ter-redaksi
+    assert.ok(!String(manager.redactor(`header: Bearer ${SEKRET}`)).includes(SEKRET));
+  });
+
+  test('20. POST /secrets/:name menolak nama non-identifier (400)', async () => {
+    for (const bad of ['1BAD_NAME', 'BAD-DASH', 'bad dash', `A${'B'.repeat(64)}`]) {
+      await assert.rejects(
+        () => client.request('POST', `/secrets/${encodeURIComponent(bad)}`, { body: { value: SEKRET } }),
+        (e) => e?.code === 'VALIDATION',
+        `nama '${bad}' harus VALIDATION`,
+      );
+    }
+  });
+
+  test('21. POST /secrets/:name menolak nilai kosong dan >4096 byte (400)', async () => {
+    await assert.rejects(
+      () => client.request('POST', '/secrets/EMPTY_VAL', { body: { value: '' } }),
+      (e) => e?.code === 'VALIDATION',
+    );
+    await assert.rejects(
+      () => client.request('POST', '/secrets/NO_VALUE', { body: {} }),
+      (e) => e?.code === 'VALIDATION',
+    );
+    await assert.rejects(
+      () => client.request('POST', '/secrets/BIG_VAL', { body: { value: 'A'.repeat(4097) } }),
+      (e) => e?.code === 'VALIDATION',
+    );
+    // tepat 4096 byte masih diterima
+    const ok = await client.request('POST', '/secrets/EDGE_4096', {
+      body: { value: 'A'.repeat(4096) },
+    });
+    assert.equal(ok.name, 'EDGE_4096');
+  });
+
+  test('22. rotate: POST upsert + PUT pada nama yang ada → tetap 1 entri, tanpa nilai', async () => {
+    const before = (await client.request('GET', '/secrets')).secrets.filter(
+      (s) => s.name === 'OPENAI_KEY',
+    );
+    assert.equal(before.length, 1);
+
+    const upsert = await client.request('POST', '/secrets/OPENAI_KEY', {
+      body: { value: `${SEKRET}-v2` },
+    });
+    assert.equal(upsert.name, 'OPENAI_KEY');
+
+    const rotated = await client.request('PUT', '/secrets/OPENAI_KEY', {
+      body: { value: `${SEKRET}-v3` },
+    });
+    assert.equal(rotated.name, 'OPENAI_KEY');
+    assert.equal(typeof rotated.updatedAt, 'string');
+    assert.ok(!JSON.stringify(rotated).includes(SEKRET));
+
+    const after = (await client.request('GET', '/secrets')).secrets.filter(
+      (s) => s.name === 'OPENAI_KEY',
+    );
+    assert.equal(after.length, 1, 'upsert/rotate tidak boleh membuat entri ganda');
+  });
+
+  test('23. PUT pada nama tak dikenal → 404; POST pada nama sama = create', async () => {
+    await assert.rejects(
+      () => client.request('PUT', '/secrets/NEVER_CREATED', { body: { value: SEKRET } }),
+      (e) => e?.code === 'NOT_FOUND',
+      'rotate nama asing harus NOT_FOUND (404)',
+    );
+    const created = await client.request('POST', '/secrets/NEVER_CREATED', {
+      body: { value: SEKRET, projectScope: PID },
+    });
+    assert.equal(created.name, 'NEVER_CREATED');
+    assert.equal(created.projectScope, PID);
+    // scope berbeda tetap dianggap belum ada → PUT 404
+    await assert.rejects(
+      () => client.request('PUT', '/secrets/NEVER_CREATED', { body: { value: SEKRET } }),
+      (e) => e?.code === 'NOT_FOUND',
+      'PUT global pada secret ber-scope proyek harus NOT_FOUND',
+    );
+    await assert.rejects(
+      () => client.request('POST', '/secrets/BAD_SCOPE', { body: { value: 'v', projectScope: 'a b/c' } }),
+      (e) => e?.code === 'VALIDATION',
+    );
+  });
+
+  test('24. hapus dua-fase: token salah → 403, token benar → removed', async () => {
+    const req1 = await client.request('POST', '/secrets/NEVER_CREATED/remove-request', {
+      body: { projectScope: PID },
+    });
+    assert.ok(req1.confirmToken, 'fase 1 wajib mengembalikan confirmToken');
+    assert.equal(req1.name, 'NEVER_CREATED');
+
+    await assert.rejects(
+      () =>
+        client.request('POST', '/secrets/NEVER_CREATED/remove', {
+          body: { confirmToken: 'token-palsu-sekali', projectScope: PID },
+        }),
+      (e) => e?.code === 'PERMISSION_DENIED',
+      'token salah harus PERMISSION_DENIED (403)',
+    );
+    await assert.rejects(
+      () => client.request('POST', '/secrets/NEVER_CREATED/remove', { body: { projectScope: PID } }),
+      (e) => e?.code === 'PERMISSION_DENIED',
+      'tanpa confirmToken wajib ditolak',
+    );
+
+    const done = await client.request('POST', '/secrets/NEVER_CREATED/remove', {
+      body: { confirmToken: req1.confirmToken, projectScope: PID },
+    });
+    assert.equal(done.removed, true);
+    const listed = await client.request('GET', '/secrets');
+    assert.equal(
+      listed.secrets.filter((s) => s.name === 'NEVER_CREATED').length,
+      0,
+      'secret terhapus masih muncul di daftar',
+    );
+  });
+
+  test('25. role viewer → 403 pada secret.manage (owner-only)', async () => {
+    const pm = manager.permissionManager;
+    assert.ok(pm, 'permissionManager aktif');
+    const viewer = pm.createUser({ username: 'viewer-l5b', role: 'viewer', status: 'active' });
+    const savedActor = manager.systemUserId;
+    try {
+      manager.systemUserId = viewer.userId;
+      await assert.rejects(
+        () => client.request('POST', '/secrets/FORBIDDEN_FOR_VIEWER', { body: { value: SEKRET } }),
+        (e) => e?.code === 'PERMISSION_DENIED',
+        'viewer haram menulis secret',
+      );
+    } finally {
+      manager.systemUserId = savedActor;
+    }
+    const ok = await client.request('POST', '/secrets/BACK_TO_OWNER', { body: { value: SEKRET } });
+    assert.equal(ok.name, 'BACK_TO_OWNER');
+  });
+});
+
+// ── Gate-3 R2: preload nilai vault ke redactor SHARED saat boot ─────────────
+describe('R2: vault preload redactor lintas-boot', () => {
+  let rootDir2;
+  const KUNCI = 'kunci-r2-uji-preload-42';
+  const NILAI = 'RAHASIA-R2-bukti-preload-42';
+
+  before(async () => {
+    rootDir2 = mkdtempSync(join(tmpdir(), 'vmpanel-r2-'));
+    for (const d of ['data', 'workspaces', 'runtime/pid', 'runtime/sockets', 'secrets']) {
+      mkdirSync(join(rootDir2, d), { recursive: true });
+    }
+    process.env.VPANEL_MASTER_KEY = KUNCI;
+    const portA = randomHighPort();
+    const mA = new Manager({ rootDir: rootDir2, token: 't-r2', config: { manager: { apiPort: portA, hostMode: 'dev' } } });
+    await mA.start();
+    try {
+      const cA = new ManagerClient({ port: portA, token: 't-r2' });
+      await cA.request('POST', '/secrets/init', { body: {} });
+      await cA.request('POST', '/secrets/R2_PRELOAD', { body: { value: NILAI, projectScope: null } });
+    } finally {
+      await mA.stop();
+    }
+  });
+
+  after(() => {
+    delete process.env.VPANEL_MASTER_KEY;
+    if (rootDir2) rmSync(rootDir2, { recursive: true, force: true });
+  });
+
+  test('R2.1 boot kedua: nilai vault terdahulu ter-redaksi SEBELUM ada startService', async () => {
+    const portB = randomHighPort();
+    const mB = new Manager({ rootDir: rootDir2, token: 't-r2', config: { manager: { apiPort: portB, hostMode: 'dev' } } });
+    await mB.start();
+    try {
+      assert.equal(mB.redactor.hasExtraValue(NILAI), true, 'preload mendaftarkan nilai ke redactor shared');
+      assert.ok(!String(mB.redactor(`sampel ${NILAI} harus hilang`)).includes(NILAI), 'redaksi praktis menyembunyikan nilai');
+    } finally {
+      await mB.stop();
+    }
+  });
+
+  test('R2.2 boot mencatat manager.secrets_preredacted tanpa pernah memuat nilai', async () => {
+    const portC = randomHighPort();
+    const mC = new Manager({ rootDir: rootDir2, token: 't-r2', config: { manager: { apiPort: portC, hostMode: 'dev' } } });
+    await mC.start();
+    try {
+      const fsMod = await import('node:fs');
+      const log = fsMod.readFileSync(join(rootDir2, 'logs', 'manager', 'manager.log'), 'utf8');
+      assert.match(log, /manager\.secrets_preredacted/, 'event preload tercatat');
+      assert.ok(!log.includes(NILAI), 'log tidak memuat nilai secret');
+    } finally {
+      await mC.stop();
+    }
+  });
 });

@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # restore_state.sh - unduh artifact 'vm-state' (TERENKRIPSI) dari run vm.yml
 # sebelumnya, dekripsi, katalogkan backup, siap dipakai manager.
-# Fallback: fresh start. Desain: docs/DESIGN.md S15.2, S16.2, S9.5.
+# Fallback: fresh start HANYA untuk kondisi sah (artifact/branch/key belum ada).
+# Guard D2: fingerprint master key di header container — mismatch = VPKEY_MISMATCH
+# (exit 1 TANPA fresh-start, agar chain salah-kunci tidak menimpa state cloud
+# dengan pack kosong). Secrets dalam pack (D1) ditulis ke ./secrets/ di runner
+# ephemeral ini ("laptop menang" by design).
+# Desain: docs/DESIGN.md S15.2, S16.2, S9.5.
 # Repo PUBLIC: artifact plaintext TIDAK PERNAH di-upload - hanya vm-state.enc.
 set -euo pipefail
 
@@ -11,9 +16,12 @@ REPO="${GITHUB_REPOSITORY:-}"
 GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 MASTER_KEY="${VPANEL_MASTER_KEY:-}"
 
+ghout() { echo "$1" >> "${GITHUB_OUTPUT:-/dev/null}"; }
+
 if [ -z "$REPO" ] || [ -z "$GH_TOKEN" ]; then
   echo "[restore_state] GITHUB_REPOSITORY/GH_TOKEN tidak ada - fallback FRESH START (dev)"
   echo "restored_from=fresh" >> "${GITHUB_OUTPUT:-/dev/null}"
+  ghout "state_ok=true"
   exit 0
 fi
 
@@ -24,6 +32,7 @@ ART_ID=$(gh api "repos/${REPO}/actions/artifacts?name=vm-state" \
 
 mkdir -p .state-download
 ENC_FILE=""
+RUN_OF_ART=""
 
 if [ -n "$ART_ID" ]; then
   RUN_OF_ART=$(gh api "repos/${REPO}/actions/artifacts/${ART_ID}" --jq '.run_id')
@@ -59,6 +68,7 @@ else
   else
     echo "[restore_state] tidak ada artifact DAN tidak ada vault branch 'state' - FRESH START"
     echo "restored_from=fresh" >> "${GITHUB_OUTPUT:-/dev/null}"
+    ghout "state_ok=true"
     exit 0
   fi
 fi
@@ -68,15 +78,48 @@ fi
 if [ -z "$MASTER_KEY" ]; then
   echo "[restore_state] VPANEL_MASTER_KEY tidak ada - TIDAK BISA dekripsi (aman: data tidak bocor ke log). Fallback FRESH START."
   echo "restored_from=fresh" >> "${GITHUB_OUTPUT:-/dev/null}"
+  ghout "state_ok=true"
   exit 0
 fi
-node scripts/state-container.mjs decrypt "$ENC_FILE" backups "$MASTER_KEY"
+
+# --- GUARD D2: fingerprint master key SEBELUM decrypt -----------------------
+# Header container plaintext berisi fp = sha256hex('vpkhint:'+kunci)[:12].
+# Cocok -> lanjut. Tidak cocok -> VPKEY_MISMATCH: exit 1 TANPA fresh-start
+# (fresh-start senyap + chain backup berikutnya = penimpaan state cloud dengan
+# pack kosong saat kunci runner beda). Container gen-1 tanpa fp = legacy ->
+# lanjut (dekripsi itu sendiri yg akan membuktikan kunci).
+# env var (bukan argv) utk kunci: tidak masuk daftar proses/log.
+FP_STATE=$(
+  export VP_FP_FILE="$ENC_FILE" VP_FP_KEY="$MASTER_KEY"
+  node --input-type=module -e "
+    import fs from 'node:fs';
+    import crypto from 'node:crypto';
+    const j = JSON.parse(fs.readFileSync(process.env.VP_FP_FILE, 'utf8'));
+    if (!j.fp) { console.log('legacy'); process.exit(0); }
+    const want = crypto.createHash('sha256')
+      .update('vpkhint:' + process.env.VP_FP_KEY, 'utf8').digest('hex').slice(0, 12);
+    console.log(String(j.fp) === want ? 'match' : 'mismatch');
+  "
+)
+if [ "$FP_STATE" = "mismatch" ]; then
+  echo "::error::VPKEY_MISMATCH VPANEL_MASTER_KEY runner tidak cocok dengan fingerprint container state ($STATE_SOURCE) - STOP tanpa fresh-start (state cloud dilindungi dari penimpaan pack kosong)"
+  ghout "state_ok=false"
+  exit 1
+fi
+if [ "$FP_STATE" = "legacy" ]; then
+  echo "[restore_state] container gen-1 tanpa fp (legacy) - guard dilewati, dekripsi tetap membuktikan kunci"
+fi
+
+# entri 'backup/*' -> backups/ ; entri 'secrets/*' -> ./secrets/ (root repo di
+# runner ephemeral; overwrite senyap = "laptop menang" by design).
+node scripts/state-container.mjs decrypt "$ENC_FILE" backups "$MASTER_KEY" --secretsroot .
 
 # Pilih manifest backup terbaru yang baru diekstrak -> katalogkan -> restore.
 LATEST_MANIFEST=$(find backups -name 'manifest.json' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)
 if [ -z "$LATEST_MANIFEST" ]; then
   echo "[restore_state] tidak ada manifest di container - FRESH START"
-  echo "restored_from=fresh" >> "${GITHUB_OUTPUT:-/dev/null}"
+  ghout "restored_from=fresh"
+  ghout "state_ok=true"
   exit 0
 fi
 BACKUP_DIR=$(dirname "$LATEST_MANIFEST")
@@ -94,11 +137,12 @@ bm.catalogExternal({ backupId: '${BACKUP_ID}', dir: '${BACKUP_DIR}', trigger: 'e
 const rm = new RestoreManager({ dataDir: 'data', backupsRoot: 'backups', backupManager: bm });
 const report = rm.restoreBackup('${BACKUP_ID}', { dryRun: false });
 console.log('[restore_state] restored:', report.restored.join(','), '| warnings:', report.warnings.length);
-" || { echo "[restore_state] RESTORE GAGAL - fallback FRESH START"; echo "restored_from=fresh" >> "${GITHUB_OUTPUT:-/dev/null}"; exit 0; }
+" || { echo "[restore_state] RESTORE GAGAL setelah decrypt SUKSES (pack sah tapi gagal dipulihkan) - FAIL LOUD; JANGAN fresh-start: vm.yml akan skip final-backup+upload sehingga siklus rusak ini TIDAK menimpa state cloud dengan pack kosong"; ghout "state_ok=false"; exit 1; }
 
 # Bersihkan plaintext di runner ini setelah restore (tidak dibutuhkan lagi;
 # sumber kebenaran tetap artifact terenkripsi).
 rm -f "$ENC_FILE"
 rm -rf .state-download
-echo "restored_from=${BACKUP_DIR}" >> "${GITHUB_OUTPUT:-/dev/null}"
+ghout "restored_from=${BACKUP_DIR}"
+ghout "state_ok=true"
 echo "[restore_state] selesai"

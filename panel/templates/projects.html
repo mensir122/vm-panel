@@ -19,6 +19,12 @@
                         (POST /projects/sync-to-github, CSRF hidden input,
                         data-confirm="Commit projects.auto.json ke GitHub?")
                         plus a green success alert with repo link after sync.
+                        L3 "One-Click 24/7" adds inside this same card:
+                        div#publish-state-actions with a two-phase form
+                        (POST /projects/publish-state, CSRF hidden input,
+                        data-confirm on the button — fase 1 renders the server
+                        confirmation page, it never executes in one POST) and
+                        a green alert after a successful publish.
     [projectsTable|raw] either the registry table:
                         <div class="table-wrap">
                           <table class="table">
@@ -28,6 +34,7 @@
                               <th scope="col">Type</th>
                               <th scope="col">Status</th>
                               <th scope="col">Sync</th>
+                              <th scope="col">Cloud 24/7</th>
                               <th scope="col">Port</th>
                               <th scope="col">Last deploy</th>
                             </tr></thead>
@@ -40,6 +47,10 @@
                                   <span class="dot dot--healthy"
                                     role="img" aria-label="status: healthy"></span>
                                   healthy</span></td>
+                                <td><span class="badge badge--ok">[synced]</span></td>
+                                <td><span class="badge badge--warn"
+                                  data-cloud-state-attr="belum-terpush">belum
+                                  ter-push</span></td>
                                 <td class="mono">10001</td>
                                 <td class="mono">2026-09-04 12:00 UTC</td>
                               </tr>
@@ -61,6 +72,11 @@
     - Status dot variants: dot--healthy | dot--degraded |
       dot--unhealthy | dot--crash_loop | dot--stopped |
       dot--disabled | dot--unknown (see docs/DESIGN.md Lampiran B).
+    - CLOUD 24/7 CHIP (honest badge, L3) — markup contract for the designer
+      lane; anchor on the attribute name, never on the label text:
+        span.badge[data-cloud-state]
+      attribute value ∈ belum-cloud | belum-terpush | queued | active
+      | gagal | aktif.
 -->
 <html lang="en">
 <head>
