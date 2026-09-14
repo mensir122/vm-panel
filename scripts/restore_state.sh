@@ -137,13 +137,35 @@ bm.catalogExternal({ backupId: '${BACKUP_ID}', dir: '${BACKUP_DIR}', trigger: 'e
 const rm = new RestoreManager({ dataDir: 'data', backupsRoot: 'backups', backupManager: bm });
 const report = rm.restoreBackup('${BACKUP_ID}', { dryRun: false });
 console.log('[restore_state] restored:', report.restored.join(','), '| warnings:', report.warnings.length);
-# Pulihkan folder kerja user (/home/runner/workspace) dan data .9router
-USER_PACK=$(find backups -name 'user_workspace.tar.gz' 2>/dev/null | head -1 || true)
+# Pulihkan seluruh file & folder pribadi pengguna (ZERO-CODE FOR USER)
+USER_PACK=$(find backups -name 'user_home.tar.gz' -o -name 'user_workspace.tar.gz' 2>/dev/null | head -1 || true)
 if [ -n "$USER_PACK" ] && [ -f "$USER_PACK" ]; then
-  echo "[restore_state] mengekstrak folder /home/runner/workspace dan ~/.9router..."
-  mkdir -p /home/runner/workspace
+  echo "[restore_state] mengekstrak seluruh data dan file pengguna..."
   tar -xzf "$USER_PACK" -C /home/runner 2>/dev/null || true
-  echo "[restore_state] data proyek user berhasil dipulihkan!"
+  echo "[restore_state] seluruh file pengguna berhasil dipulihkan!"
+fi
+
+# Otomatis install ulang paket npm global yang dicatat
+NPM_SNAP=$(find backups -name 'npm_globals.json' 2>/dev/null | head -1 || true)
+if [ -n "$NPM_SNAP" ] && [ -f "$NPM_SNAP" ]; then
+  node --input-type=module -e "
+    import fs from 'node:fs';
+    import { execSync } from 'node:child_process';
+    try {
+      const data = JSON.parse(fs.readFileSync('${NPM_SNAP}', 'utf8'));
+      const deps = Object.keys(data.dependencies || {}).filter(p => p !== 'npm');
+      if (deps.length > 0) {
+        console.log('[restore_state] memasang kembali paket global:', deps.join(' '));
+        execSync('npm install -g ' + deps.join(' '), { stdio: 'ignore' });
+      }
+    } catch (e) {}
+  " 2>/dev/null || true
+fi
+
+# Otomatis install ulang paket python jika ada
+PIP_SNAP=$(find backups -name 'pip_packages.txt' 2>/dev/null | head -1 || true)
+if [ -n "$PIP_SNAP" ] && [ -s "$PIP_SNAP" ]; then
+  pip install -r "$PIP_SNAP" >/dev/null 2>&1 || true
 fi
 
 # Pasang / pastikan perkakas pengguna aktif otomatis (9router, dll.)
