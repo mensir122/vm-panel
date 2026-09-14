@@ -161,10 +161,8 @@ fi
 tmate -S /tmp/tmate.sock new-session -d >logs/tunnel/tmate.log 2>&1 || true
 
 echo "[start_tunnel] Menunggu tmate siap terhubung ke server relay..."
-tmate -S /tmp/tmate.sock wait tmate-ready 2>/dev/null || sleep 3
-
 TMATE_SSH=""
-for i in {1..20}; do
+for i in {1..30}; do
   TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
   if [ -n "$TMATE_SSH" ]; then
     echo "[start_tunnel] Sesi Tmate siap dalam ${i} detik"
@@ -172,6 +170,11 @@ for i in {1..20}; do
   fi
   sleep 1
 done
+
+if [ -z "$TMATE_SSH" ]; then
+  echo "[start_tunnel] PERINGATAN: TMATE_SSH kosong setelah 30 detik. Log tmate:"
+  cat logs/tunnel/tmate.log 2>/dev/null || true
+fi
 
 if [ -n "$TMATE_SSH" ]; then
   # SENSOR LOG: Mask connection string agar TIDAK tampil mentah di log publik GitHub
