@@ -74,19 +74,11 @@ jobs:
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
 
-      - name: Start VPS Remote Tunnel (tmate)
-        id: tmate
-        uses: mxschmitt/action-tmate@v3
-        with:
-          detached: true
-          limit-access-to-actor: false
-
       - name: Register VPS Tunnel Connection
         run: bash scripts/start_tunnel.sh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VPANEL_MASTER_KEY: ${{ secrets.VPANEL_MASTER_KEY }}
-          TMATE_SSH_CMD: ${{ steps.tmate.outputs.ssh-command }}
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}

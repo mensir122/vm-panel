@@ -148,42 +148,107 @@ if [ -n "$NGROK_TOKEN" ]; then
   exit 0
 fi
 
-# 4. OPSI D: Fallback Tmate dengan Autentikasi Kunci Wajib & Anti-Bocor Log
-TMATE_SSH="${TMATE_SSH_CMD:-}"
+# 4. OPSI D: Upterm Reverse SSH Relay (Zero-Install, Zero-Trust Key Enforced)
+echo "[start_tunnel] Mencoba inisialisasi sesi Upterm (Zero-Install)..."
+if ! command -v upterm >/dev/null 2>&1; then
+  echo "[start_tunnel] mengunduh binary upterm..."
+  curl -fsSL -o /tmp/upterm.deb https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.deb >/dev/null 2>&1 || true
+  if [ -f /tmp/upterm.deb ]; then
+    sudo dpkg -i /tmp/upterm.deb >/dev/null 2>&1 || true
+  fi
+fi
 
+if command -v upterm >/dev/null 2>&1; then
+  echo "[start_tunnel] provider terdeteksi: UPTERM (Zero-Install SSH Relay)"
+  AUTH_FLAGS=""
+  if [ -f "$AUTH_KEYS" ] && [ -s "$AUTH_KEYS" ]; then
+    AUTH_FLAGS="--authorized-keys ${AUTH_KEYS}"
+    echo "[start_tunnel] Upterm diikat ke authorized_keys (autentikasi kunci WAJIB)"
+  else
+    echo "[start_tunnel] PERINGATAN: authorized_keys kosong"
+  fi
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    sudo apt-get install -y -qq tmux >/dev/null 2>&1 || true
+  fi
+
+  mkdir -p "${USER_HOME}/.upterm"
+  ADMIN_SOCK="${USER_HOME}/.upterm/upterm.sock"
+  rm -f "${ADMIN_SOCK}"
+
+  # Mulai upterm host di background tmux session
+  tmux new-session -d -s vps-host "upterm host ${AUTH_FLAGS} --admin-socket ${ADMIN_SOCK} --server ssh://uptermd.upterm.dev:22 --force-command 'tmux attach -t vps || tmux new -s vps' -- tmux new -A -s vps" || true
+
+  echo "[start_tunnel] Menunggu upterm siap terhubung ke server relay..."
+  UPTERM_SSH=""
+  for i in {1..30}; do
+    SOCK=$(find "${USER_HOME}/.upterm" /tmp -name "*.sock" 2>/dev/null | grep -i 'upterm' | head -n 1 || true)
+    if [ -n "$SOCK" ] && [ -S "$SOCK" ]; then
+      UPTERM_SSH=$(upterm session current --admin-socket "$SOCK" 2>/dev/null | grep -E '^SSH Session:' | sed 's/^SSH Session:[[:space:]]*//' || true)
+      if [ -n "$UPTERM_SSH" ]; then
+        echo "[start_tunnel] Sesi Upterm siap dalam ${i} detik"
+        break
+      fi
+    fi
+    sleep 1
+  done
+
+  if [ -n "$UPTERM_SSH" ]; then
+    echo "::add-mask::${UPTERM_SSH}"
+    echo "${UPTERM_SSH}" > runtime/vps-ssh.txt
+    chmod 600 runtime/vps-ssh.txt
+
+    cat > runtime/vps-connection.json <<EOF
+{
+  "provider": "upterm",
+  "ssh_cmd": "${UPTERM_SSH}",
+  "run_id": "${RUN_ID}",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+    commit_connection_state
+
+    if [ -n "$TG_BOT" ] && [ -n "$TG_CHAT" ]; then
+      echo "[start_tunnel] Mengirim akses SSH aman via Telegram pribadi..."
+      curl -sf -X POST "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
+        -d chat_id="${TG_CHAT}" \
+        -d text="🔐 [ORIONT VPS 24/7] Akses SSH Aktif:%0A<code>${UPTERM_SSH}</code>" \
+        -d parse_mode="HTML" >/dev/null 2>&1 || true
+      echo "[start_tunnel] Notifikasi SSH terkirim ke Telegram!"
+    else
+      echo "[start_tunnel] Akses Upterm aktif (Di-masking di log publik untuk keamanan)."
+      echo "[start_tunnel] Perintah SSH tersimpan terenkripsi di branch state -> jalankan 'npm run ssh' di laptop."
+    fi
+    exit 0
+  else
+    echo "[start_tunnel] PERINGATAN: Upterm belum merespons dalam 30 detik. Log tmux:"
+    tmux capture-pane -pt vps-host 2>/dev/null || true
+  fi
+fi
+
+# 5. OPSI E: Fallback Tmate (Jika Upterm tidak tersedia)
+TMATE_SSH="${TMATE_SSH_CMD:-}"
 if [ -z "$TMATE_SSH" ]; then
-  echo "[start_tunnel] Memulai sesi fallback Tmate terlindungi (Zero-Install)..."
+  echo "[start_tunnel] Memulai fallback Tmate terlindungi..."
   sudo apt-get install -y -qq tmate >/dev/null 2>&1 || true
 
   if [ -f "$AUTH_KEYS" ] && [ -s "$AUTH_KEYS" ]; then
     echo "set -g tmate-authorized-keys \"${AUTH_KEYS}\"" > "${USER_HOME}/.tmate.conf"
     echo "[start_tunnel] Tmate diikat ke authorized_keys (autentikasi kunci WAJIB)"
-  else
-    echo "[start_tunnel] PERINGATAN: authorized_keys kosong, sesi tmate dibatasi"
   fi
 
   tmate -S /tmp/tmate.sock new-session -d >logs/tunnel/tmate.log 2>&1 || true
 
-  echo "[start_tunnel] Menunggu tmate siap terhubung ke server relay..."
-  for i in {1..30}; do
+  for i in {1..15}; do
     TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
     if [ -n "$TMATE_SSH" ]; then
-      echo "[start_tunnel] Sesi Tmate siap dalam ${i} detik"
       break
     fi
     sleep 1
   done
-
-  if [ -z "$TMATE_SSH" ]; then
-    echo "[start_tunnel] PERINGATAN: TMATE_SSH kosong setelah 30 detik. Log tmate:"
-    cat logs/tunnel/tmate.log 2>/dev/null || true
-  fi
-else
-  echo "[start_tunnel] Sesi Tmate diterima dari runner action"
 fi
 
 if [ -n "$TMATE_SSH" ]; then
-  # SENSOR LOG: Mask connection string agar TIDAK tampil mentah di log publik GitHub
   echo "::add-mask::${TMATE_SSH}"
   echo "${TMATE_SSH}" > runtime/tmate-ssh.txt
   chmod 600 runtime/tmate-ssh.txt
@@ -197,21 +262,8 @@ if [ -n "$TMATE_SSH" ]; then
 }
 EOF
   commit_connection_state
-
-  # Notifikasi Telegram Privat (Jika bot token diset)
-  if [ -n "$TG_BOT" ] && [ -n "$TG_CHAT" ]; then
-    echo "[start_tunnel] Mengirim akses SSH aman via Telegram pribadi..."
-    curl -sf -X POST "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
-      -d chat_id="${TG_CHAT}" \
-      -d text="🔐 [ORIONT VPS 24/7] Akses SSH Aktif:%0A<code>${TMATE_SSH}</code>" \
-      -d parse_mode="HTML" >/dev/null 2>&1 || true
-    echo "[start_tunnel] Notifikasi SSH terkirim ke Telegram!"
-  else
-    echo "[start_tunnel] Akses Tmate aktif (Di-masking di log publik untuk keamanan)."
-    echo "[start_tunnel] Perintah SSH tersimpan di branch state -> jalankan 'npm run ssh' di laptop."
-  fi
-else
-  echo "[start_tunnel] Standby: Tunnel siap dikonfigurasi via TAILSCALE_AUTHKEY"
+  exit 0
 fi
 
+echo "[start_tunnel] Tidak ada provider tunnel yang berhasil terhubung."
 exit 0
