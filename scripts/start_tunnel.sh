@@ -172,19 +172,18 @@ if command -v upterm >/dev/null 2>&1; then
     sudo apt-get install -y -qq tmux >/dev/null 2>&1 || true
   fi
 
-  mkdir -p "${USER_HOME}/.upterm"
-  ADMIN_SOCK="${USER_HOME}/.upterm/upterm.sock"
-  rm -f "${ADMIN_SOCK}"
+  mkdir -p "${USER_HOME}/.upterm" logs/tunnel
+  rm -f "${USER_HOME}/.upterm/"*.sock
 
-  # Mulai upterm host di background tmux session
-  tmux new-session -d -s vps-host "upterm host ${AUTH_FLAGS} --admin-socket ${ADMIN_SOCK} --server ssh://uptermd.upterm.dev:22 --force-command 'tmux attach -t vps || tmux new -s vps' -- tmux new -A -s vps" || true
+  # Mulai upterm host di background tmux session (window ber-PTY)
+  tmux new-session -d -s vps-host "bash -c 'upterm host ${AUTH_FLAGS} --server ssh://uptermd.upterm.dev:22 --force-command \"tmux attach -t vps || tmux new -s vps\" -- tmux new -A -s vps > logs/tunnel/upterm.log 2>&1'" || true
 
   echo "[start_tunnel] Menunggu upterm siap terhubung ke server relay..."
   UPTERM_SSH=""
   for i in {1..30}; do
-    SOCK=$(find "${USER_HOME}/.upterm" /tmp -name "*.sock" 2>/dev/null | grep -i 'upterm' | head -n 1 || true)
+    SOCK=$(find "${USER_HOME}/.upterm" /run/user /tmp -name "*.sock" 2>/dev/null | head -n 1 || true)
     if [ -n "$SOCK" ] && [ -S "$SOCK" ]; then
-      UPTERM_SSH=$(upterm session current --admin-socket "$SOCK" 2>/dev/null | grep -E '^SSH Session:' | sed 's/^SSH Session:[[:space:]]*//' || true)
+      UPTERM_SSH=$(UPTERM_ADMIN_SOCKET="$SOCK" upterm session current --admin-socket "$SOCK" 2>/dev/null | grep -E '^SSH Session:' | sed 's/^SSH Session:[[:space:]]*//' || true)
       if [ -n "$UPTERM_SSH" ]; then
         echo "[start_tunnel] Sesi Upterm siap dalam ${i} detik"
         break
