@@ -137,6 +137,8 @@ bm.catalogExternal({ backupId: '${BACKUP_ID}', dir: '${BACKUP_DIR}', trigger: 'e
 const rm = new RestoreManager({ dataDir: 'data', backupsRoot: 'backups', backupManager: bm });
 const report = rm.restoreBackup('${BACKUP_ID}', { dryRun: false });
 console.log('[restore_state] restored:', report.restored.join(','), '| warnings:', report.warnings.length);
+" || { echo "[restore_state] RESTORE GAGAL setelah decrypt SUKSES (pack sah tapi gagal dipulihkan) - FAIL LOUD; JANGAN fresh-start: vm.yml akan skip final-backup+upload sehingga siklus rusak ini TIDAK menimpa state cloud dengan pack kosong"; ghout "state_ok=false"; exit 1; }
+
 # Pulihkan seluruh file & folder pribadi pengguna (ZERO-CODE FOR USER)
 USER_PACK=$(find backups -name 'user_home.tar.gz' -o -name 'user_workspace.tar.gz' 2>/dev/null | head -1 || true)
 if [ -n "$USER_PACK" ] && [ -f "$USER_PACK" ]; then

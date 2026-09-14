@@ -12,7 +12,10 @@ fi
 
 # Ubah port default 20128 -> 8080 di 9router secara permanen
 if [ -d "/usr/local/lib/node_modules/9router" ]; then
-  sudo sed -i 's/20128/8080/g' $(grep -rl "20128" /usr/local/lib/node_modules/9router/ 2>/dev/null) 2>/dev/null || true
+  FILES=$(grep -rl "20128" /usr/local/lib/node_modules/9router/ 2>/dev/null || true)
+  if [ -n "$FILES" ]; then
+    sudo sed -i 's/20128/8080/g' $FILES 2>/dev/null || true
+  fi
 fi
 
 # 2. Cloudflared (untuk akses URL publik 24/7 di HP)
