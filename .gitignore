@@ -26,3 +26,4 @@ dist/
 
 # deepwork orchestrator state (git-local)
 .slim/deepwork/
+.gemini/

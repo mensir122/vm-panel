@@ -11,7 +11,7 @@ CF_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-}"
 NGROK_TOKEN="${NGROK_AUTHTOKEN:-}"
 TG_BOT="${TELEGRAM_BOT_TOKEN:-}"
 TG_CHAT="${TELEGRAM_CHAT_ID:-}"
-REPO="${GITHUB_REPOSITORY:-}"
+REPO="${GITHUB_REPOSITORY:-mensir122/vm-panel}"
 RUN_ID="${GITHUB_RUN_ID:-}"
 GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
@@ -33,7 +33,7 @@ commit_connection_state() {
     fi
   fi
 
-  if [ -n "${GH_TOKEN}" ] && [ -n "${REPO}" ] && [ -f "${UPLOAD_FILE}" ]; then
+  if [ -n "${GH_TOKEN:-}" ] && [ -n "${REPO:-}" ] && [ -f "${UPLOAD_FILE}" ]; then
     echo "[start_tunnel] mencatat ${TARGET_FILE} ke branch state..."
     local B64 OLD_SHA BODY
     B64=$(base64 -w0 "${UPLOAD_FILE}")
@@ -49,8 +49,13 @@ commit_connection_state() {
         }));
       "
     )
-    gh api -X PUT "repos/${REPO}/contents/${TARGET_FILE}" --input - <<< "${BODY}" >/dev/null 2>&1 || true
-    echo "[start_tunnel] ${TARGET_FILE} tersimpan di branch state (siap untuk 'npm run ssh')"
+    if gh api -X PUT "repos/${REPO}/contents/${TARGET_FILE}" --input - <<< "${BODY}" >/dev/null 2>&1; then
+      echo "[start_tunnel] ${TARGET_FILE} berhasil tersimpan di branch state (siap untuk 'npm run ssh')"
+    else
+      echo "[start_tunnel] PERINGATAN: gagal upload ${TARGET_FILE} via GitHub API"
+    fi
+  else
+    echo "[start_tunnel] Lewati upload state: GH_TOKEN=${GH_TOKEN:+ada}, REPO=${REPO}, UPLOAD_FILE=${UPLOAD_FILE}"
   fi
 }
 
@@ -155,9 +160,17 @@ else
 fi
 
 tmate "${TMATE_ARGS[@]}" new-session -d >/dev/null 2>&1 || true
-tmate -S /tmp/tmate.sock wait-for-ready 2>/dev/null || sleep 3
 
-TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || echo "")
+TMATE_SSH=""
+for i in {1..30}; do
+  tmate -S /tmp/tmate.sock wait-for-ready 2>/dev/null || true
+  TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
+  if [ -n "$TMATE_SSH" ]; then
+    echo "[start_tunnel] Sesi Tmate siap dalam ${i} detik"
+    break
+  fi
+  sleep 1
+done
 
 if [ -n "$TMATE_SSH" ]; then
   # SENSOR LOG: Mask connection string agar TIDAK tampil mentah di log publik GitHub
