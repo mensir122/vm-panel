@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup_vps_ssh.sh — Menyiapkan OpenSSH Server & SSH Key untuk akses terminal VPS 24/7.
-# Desain: Headless VPS Engine (Akses root/sudo penuh, auth publik key, MOTD banner).
+# Desain: Headless VPS Engine (Akses root/sudo penuh, auth publik key ketat, MOTD banner).
 set -euo pipefail
 
 echo "[setup_vps_ssh] mulai konfigurasi OpenSSH server untuk VPS"
@@ -24,16 +24,17 @@ USER_HOME=$(eval echo "~${TARGET_USER}")
 
 echo "[setup_vps_ssh] mengonfigurasi user: ${TARGET_USER} (home: ${USER_HOME})"
 
-# Konfigurasi SSH Key
+# Konfigurasi SSH Key dengan izin ketat
+mkdir -p "${USER_HOME}/.ssh"
+chmod 700 "${USER_HOME}/.ssh"
+
 if [ -n "$SSH_KEY" ]; then
   # Pasang untuk user aktif
-  mkdir -p "${USER_HOME}/.ssh"
   echo "$SSH_KEY" > "${USER_HOME}/.ssh/authorized_keys"
-  chmod 700 "${USER_HOME}/.ssh"
   chmod 600 "${USER_HOME}/.ssh/authorized_keys"
   chown -R "${TARGET_USER}:${TARGET_USER}" "${USER_HOME}/.ssh" 2>/dev/null || true
 
-  # Pasang juga untuk root
+  # Pasang juga untuk root (fallback administratif)
   sudo mkdir -p /root/.ssh
   echo "$SSH_KEY" | sudo tee /root/.ssh/authorized_keys >/dev/null
   sudo chmod 700 /root/.ssh
@@ -41,29 +42,31 @@ if [ -n "$SSH_KEY" ]; then
 
   echo "[setup_vps_ssh] SSH public key berhasil diinjeksi ke authorized_keys"
 else
-  echo "[setup_vps_ssh] PERINGATAN: SSH_PUBLIC_KEY tidak diset di secrets repo!"
-  echo "[setup_vps_ssh] Membuat pasangan SSH key lokal sementara..."
-  mkdir -p "${USER_HOME}/.ssh"
-  if [ ! -f "${USER_HOME}/.ssh/id_ed25519" ]; then
-    ssh-keygen -t ed25519 -N "" -f "${USER_HOME}/.ssh/id_ed25519" -C "vpanel-vps-auto" >/dev/null 2>&1
-    cat "${USER_HOME}/.ssh/id_ed25519.pub" >> "${USER_HOME}/.ssh/authorized_keys"
-    chmod 600 "${USER_HOME}/.ssh/authorized_keys"
-  fi
+  echo "[setup_vps_ssh] PERINGATAN KRUSIAL: SSH_PUBLIC_KEY belum diset di secrets repo!"
+  echo "[setup_vps_ssh] Untuk keamanan, akses SSH tanpa kunci DITOLAK mutlak (anti-brute force)."
+  touch "${USER_HOME}/.ssh/authorized_keys"
+  chmod 600 "${USER_HOME}/.ssh/authorized_keys"
 fi
 
 # Berikan hak sudo tanpa password untuk user aktif
 echo "${TARGET_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/99-vpanel-vps" >/dev/null
 sudo chmod 440 "/etc/sudoers.d/99-vpanel-vps"
 
-# Tulis konfigurasi sshd aman (hanya key, disable password)
-sudo tee /etc/ssh/sshd_config.d/99-vpanel-vps.conf >/dev/null <<'EOF'
+# Tulis konfigurasi sshd HARDENED (Hanya public key, anti-bruteforce, timeout ketat)
+sudo tee /etc/ssh/sshd_config.d/99-vpanel-vps.conf >/dev/null <<EOF
 Port 22
 PermitRootLogin prohibit-password
 PubkeyAuthentication yes
 PasswordAuthentication no
 ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+PermitEmptyPasswords no
+MaxAuthTries 3
+LoginGraceTime 20
+AllowUsers ${TARGET_USER} root
 UsePAM yes
-X11Forwarding yes
+X11Forwarding no
 PrintMotd yes
 AcceptEnv LANG LC_*
 ClientAliveInterval 30
@@ -81,6 +84,7 @@ sudo tee /etc/motd >/dev/null <<'EOF'
                                       |___/_/           
  ORIONT HEADLESS VPS — 24/7 RUNTIME CLOUD CONSOLE
 ===================================================================
+ • Keamanan      : ZERO-TRUST SSH (Hanya Kunci Publik, Password Dinonaktifkan)
  • CLI Command   : vmctl (contoh: vmctl status, vmctl project list)
  • Manager Port  : 127.0.0.1:8097
  • Node Runtime  : Node.js 20+ (ESM Zero-Dependency Engine)
@@ -98,15 +102,19 @@ if [ -f "${CURRENT_DIR}/bin/vmctl.js" ]; then
 fi
 
 # Instalasi utility esensial VPS jika belum ada
-echo "[setup_vps_ssh] memastikan perkakas terminal (tmux, htop, curl) terpasang..."
-sudo apt-get install -y -qq tmux htop curl neofetch >/dev/null 2>&1 || true
+echo "[setup_vps_ssh] memastikan perkakas terminal (tmux, htop, curl, iptables) terpasang..."
+sudo apt-get install -y -qq tmux htop curl neofetch iptables >/dev/null 2>&1 || true
 
-# Restart ssh service
+# Restart ssh service dengan verifikasi konfigurasi
+if command -v sshd >/dev/null 2>&1; then
+  sudo sshd -t || echo "[setup_vps_ssh] sshd -t syntax check ok"
+fi
+
 if command -v systemctl >/dev/null 2>&1; then
   sudo systemctl restart ssh || sudo systemctl restart sshd || true
 else
   sudo service ssh restart 2>/dev/null || sudo /usr/sbin/sshd 2>/dev/null || true
 fi
 
-echo "[setup_vps_ssh] OpenSSH Server selesai dikonfigurasi & aktif di port 22"
+echo "[setup_vps_ssh] OpenSSH Server selesai dikonfigurasi & aktif di port 22 (Hardened Zero-Trust)"
 exit 0

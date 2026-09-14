@@ -27,4 +27,13 @@ for NAME in tunnel manager; do
   fi
 done
 
+# Bersihkan sesi Tailscale & Tmate agar tidak bentrok di runner berikutnya
+if command -v tailscale >/dev/null 2>&1; then
+  sudo tailscale down 2>/dev/null || true
+  sudo tailscale logout 2>/dev/null || true
+fi
+if [ -S /tmp/tmate.sock ]; then
+  tmate -S /tmp/tmate.sock kill-session 2>/dev/null || true
+fi
+
 echo "[stop_all] selesai"
