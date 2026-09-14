@@ -77,9 +77,13 @@ jobs:
       - name: Start VPS Remote Tunnel
         run: bash scripts/start_tunnel.sh
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VPANEL_MASTER_KEY: ${{ secrets.VPANEL_MASTER_KEY }}
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: Start manager daemon
         run: bash scripts/start_manager.sh

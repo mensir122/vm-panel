@@ -10,9 +10,11 @@
     },
     "main": "manager/index.js",
     "bin": {
-        "vmctl": "./bin/vmctl.js"
+        "vmctl": "./bin/vmctl.js",
+        "connect-vps": "./bin/connect-vps.js"
     },
     "scripts": {
+        "ssh": "node bin/connect-vps.js",
         "test": "node --test tests/unit/*.test.js",
         "test:unit": "node --test tests/unit/*.test.js",
         "test:integration": "node --test tests/integration/*.test.js",

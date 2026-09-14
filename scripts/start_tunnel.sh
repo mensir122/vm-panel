@@ -11,10 +11,48 @@ CF_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-}"
 NGROK_TOKEN="${NGROK_AUTHTOKEN:-}"
 TG_BOT="${TELEGRAM_BOT_TOKEN:-}"
 TG_CHAT="${TELEGRAM_CHAT_ID:-}"
+REPO="${GITHUB_REPOSITORY:-}"
+RUN_ID="${GITHUB_RUN_ID:-}"
+GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
 TARGET_USER="${USER:-runner}"
 USER_HOME=$(eval echo "~${TARGET_USER}")
 AUTH_KEYS="${USER_HOME}/.ssh/authorized_keys"
+
+commit_connection_state() {
+  local CONN_FILE="runtime/vps-connection.json"
+  local TARGET_FILE="vps-connection.json"
+  local UPLOAD_FILE="${CONN_FILE}"
+
+  if [ -n "${VPANEL_MASTER_KEY:-}" ] && [ -f "${CONN_FILE}" ]; then
+    echo "[start_tunnel] mengenkripsi data koneksi dengan VPANEL_MASTER_KEY (AES-256-GCM)..."
+    node scripts/vps-connection.mjs encrypt "${CONN_FILE}" "runtime/vps-connection.enc" || true
+    if [ -f "runtime/vps-connection.enc" ]; then
+      TARGET_FILE="vps-connection.enc"
+      UPLOAD_FILE="runtime/vps-connection.enc"
+    fi
+  fi
+
+  if [ -n "${GH_TOKEN}" ] && [ -n "${REPO}" ] && [ -f "${UPLOAD_FILE}" ]; then
+    echo "[start_tunnel] mencatat ${TARGET_FILE} ke branch state..."
+    local B64 OLD_SHA BODY
+    B64=$(base64 -w0 "${UPLOAD_FILE}")
+    OLD_SHA=$(gh api "repos/${REPO}/contents/${TARGET_FILE}?ref=state" --jq '.sha // empty' 2>/dev/null || true)
+    BODY=$(
+      export RUN_ID B64 OLD_SHA TARGET_FILE
+      node --input-type=module -e "
+        console.log(JSON.stringify({
+          message: 'vps: ' + process.env.TARGET_FILE + ' run ' + (process.env.RUN_ID || 'unknown') + ' (auto)',
+          branch: 'state',
+          content: process.env.B64,
+          sha: process.env.OLD_SHA || undefined,
+        }));
+      "
+    )
+    gh api -X PUT "repos/${REPO}/contents/${TARGET_FILE}" --input - <<< "${BODY}" >/dev/null 2>&1 || true
+    echo "[start_tunnel] ${TARGET_FILE} tersimpan di branch state (siap untuk 'npm run ssh')"
+  fi
+}
 
 # 1. OPSI A: Tailscale Mesh VPN (Sangat Direkomendasikan & Privat Total)
 if [ -n "$TS_KEY" ]; then
@@ -45,14 +83,22 @@ if [ -n "$TS_KEY" ]; then
       sudo iptables -F INPUT 2>/dev/null || true
       sudo iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
       sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-      # Izinkan interface tailscale bila ada (userspace-networking / tun)
       sudo iptables -A INPUT -i tailscale0 -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
-      # Tolak seluruh koneksi SSH dari interface publik luar
       sudo iptables -A INPUT -p tcp --dport 22 -s 127.0.0.1 -j ACCEPT 2>/dev/null || true
       sudo iptables -A INPUT -p tcp --dport 22 -j DROP 2>/dev/null || true
       echo "[start_tunnel] Firewall aktif: Port 22 terkunci total dari jaringan publik"
     fi
 
+    cat > runtime/vps-connection.json <<EOF
+{
+  "provider": "tailscale",
+  "ssh_cmd": "ssh ${TARGET_USER}@vpanel-vps",
+  "ip": "${TS_IP}",
+  "run_id": "${RUN_ID}",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+    commit_connection_state
     echo "[start_tunnel] Akses SSH privat: ssh ${TARGET_USER}@vpanel-vps"
     exit 0
   else
@@ -96,11 +142,10 @@ if [ -n "$NGROK_TOKEN" ]; then
 fi
 
 # 4. OPSI D: Fallback Tmate dengan Autentikasi Kunci Wajib & Anti-Bocor Log
-echo "[start_tunnel] Memulai sesi fallback Tmate terlindungi..."
+echo "[start_tunnel] Memulai sesi fallback Tmate terlindungi (Zero-Install)..."
 sudo apt-get install -y -qq tmate >/dev/null 2>&1 || true
 
 # KEAMANAN KRUSIAL: -a memastikan HANYA klien dengan SSH key sah yang bisa terhubung!
-# Orang luar yang melihat URL tmate TIDAK BISA login tanpa private key Anda.
 TMATE_ARGS=(-S /tmp/tmate.sock)
 if [ -f "$AUTH_KEYS" ] && [ -s "$AUTH_KEYS" ]; then
   TMATE_ARGS+=(-a "$AUTH_KEYS")
@@ -120,6 +165,16 @@ if [ -n "$TMATE_SSH" ]; then
   echo "${TMATE_SSH}" > runtime/tmate-ssh.txt
   chmod 600 runtime/tmate-ssh.txt
 
+  cat > runtime/vps-connection.json <<EOF
+{
+  "provider": "tmate",
+  "ssh_cmd": "${TMATE_SSH}",
+  "run_id": "${RUN_ID}",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+  commit_connection_state
+
   # Notifikasi Telegram Privat (Jika bot token diset)
   if [ -n "$TG_BOT" ] && [ -n "$TG_CHAT" ]; then
     echo "[start_tunnel] Mengirim akses SSH aman via Telegram pribadi..."
@@ -129,9 +184,8 @@ if [ -n "$TMATE_SSH" ]; then
       -d parse_mode="HTML" >/dev/null 2>&1 || true
     echo "[start_tunnel] Notifikasi SSH terkirim ke Telegram!"
   else
-    # Jika tanpa Telegram, tampilkan petunjuk koneksi yang aman
     echo "[start_tunnel] Akses Tmate aktif (Di-masking di log publik untuk keamanan)."
-    echo "[start_tunnel] Perintah SSH telah tersimpan aman di runtime/tmate-ssh.txt"
+    echo "[start_tunnel] Perintah SSH tersimpan di branch state -> jalankan 'npm run ssh' di laptop."
   fi
 else
   echo "[start_tunnel] Standby: Tunnel siap dikonfigurasi via TAILSCALE_AUTHKEY"
