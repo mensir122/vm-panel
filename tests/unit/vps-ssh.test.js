@@ -45,8 +45,7 @@ test('start_tunnel.sh: provider Tailscale vpanel-vps, firewall iptables, log mas
   assert.match(s, /iptables.*dport 22.*DROP/, 'firewall memblokir port 22 dari publik');
   assert.match(s, /CLOUDFLARE_TUNNEL_TOKEN/, 'mendukung Cloudflare Tunnel');
   assert.match(s, /NGROK_AUTHTOKEN/, 'mendukung Ngrok TCP');
-  assert.match(s, /tmate/, 'mendukung fallback Tmate');
-  assert.match(s, /-a\s*"\$AUTH_KEYS"/, 'tmate diikat ke authorized_keys (autentikasi kunci wajib)');
+  assert.match(s, /tmate-authorized-keys|-a\s*"\$AUTH_KEYS"/, 'tmate diikat ke authorized_keys (autentikasi kunci wajib)');
   assert.match(s, /::add-mask::/, 'masking koneksi di log GitHub Actions');
 
   // Tanpa secret literal atau PAT

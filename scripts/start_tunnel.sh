@@ -49,10 +49,11 @@ commit_connection_state() {
         }));
       "
     )
-    if gh api -X PUT "repos/${REPO}/contents/${TARGET_FILE}" --input - <<< "${BODY}" >/dev/null 2>&1; then
+    local API_ERR
+    if API_ERR=$(gh api -X PUT "repos/${REPO}/contents/${TARGET_FILE}" --input - <<< "${BODY}" 2>&1); then
       echo "[start_tunnel] ${TARGET_FILE} berhasil tersimpan di branch state (siap untuk 'npm run ssh')"
     else
-      echo "[start_tunnel] PERINGATAN: gagal upload ${TARGET_FILE} via GitHub API"
+      echo "[start_tunnel] PERINGATAN: gagal upload ${TARGET_FILE} via GitHub API: ${API_ERR}"
     fi
   else
     echo "[start_tunnel] Lewati upload state: GH_TOKEN=${GH_TOKEN:+ada}, REPO=${REPO}, UPLOAD_FILE=${UPLOAD_FILE}"
@@ -150,20 +151,20 @@ fi
 echo "[start_tunnel] Memulai sesi fallback Tmate terlindungi (Zero-Install)..."
 sudo apt-get install -y -qq tmate >/dev/null 2>&1 || true
 
-# KEAMANAN KRUSIAL: -a memastikan HANYA klien dengan SSH key sah yang bisa terhubung!
-TMATE_ARGS=(-S /tmp/tmate.sock)
 if [ -f "$AUTH_KEYS" ] && [ -s "$AUTH_KEYS" ]; then
-  TMATE_ARGS+=(-a "$AUTH_KEYS")
+  echo "set -g tmate-authorized-keys \"${AUTH_KEYS}\"" > "${USER_HOME}/.tmate.conf"
   echo "[start_tunnel] Tmate diikat ke authorized_keys (autentikasi kunci WAJIB)"
 else
   echo "[start_tunnel] PERINGATAN: authorized_keys kosong, sesi tmate dibatasi"
 fi
 
-tmate "${TMATE_ARGS[@]}" new-session -d >/dev/null 2>&1 || true
+tmate -S /tmp/tmate.sock new-session -d >logs/tunnel/tmate.log 2>&1 || true
+
+echo "[start_tunnel] Menunggu tmate siap terhubung ke server relay..."
+tmate -S /tmp/tmate.sock wait tmate-ready 2>/dev/null || sleep 3
 
 TMATE_SSH=""
-for i in {1..30}; do
-  tmate -S /tmp/tmate.sock wait-for-ready 2>/dev/null || true
+for i in {1..20}; do
   TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
   if [ -n "$TMATE_SSH" ]; then
     echo "[start_tunnel] Sesi Tmate siap dalam ${i} detik"

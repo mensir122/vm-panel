@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { aesEncrypt, aesDecrypt, deriveKey } from '../lib/crypto.js';
 
 const KDF_SALT = 'vps-conn-salt';
@@ -87,7 +88,7 @@ export function parseSshCommand(rawSshCmd, opts = {}) {
 }
 
 // CLI handler untuk dijalankan langsung dari shell / workflow
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))) {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const mode = process.argv[2];
   if (mode === 'encrypt') {
     const src = process.argv[3];
