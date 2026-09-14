@@ -14,6 +14,7 @@ TG_CHAT="${TELEGRAM_CHAT_ID:-}"
 REPO="${GITHUB_REPOSITORY:-mensir122/vm-panel}"
 RUN_ID="${GITHUB_RUN_ID:-}"
 GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+TMATE_SSH_CMD="${TMATE_SSH_CMD:-}"
 
 TARGET_USER="${USER:-runner}"
 USER_HOME=$(eval echo "~${TARGET_USER}")
@@ -148,32 +149,37 @@ if [ -n "$NGROK_TOKEN" ]; then
 fi
 
 # 4. OPSI D: Fallback Tmate dengan Autentikasi Kunci Wajib & Anti-Bocor Log
-echo "[start_tunnel] Memulai sesi fallback Tmate terlindungi (Zero-Install)..."
-sudo apt-get install -y -qq tmate >/dev/null 2>&1 || true
-
-if [ -f "$AUTH_KEYS" ] && [ -s "$AUTH_KEYS" ]; then
-  echo "set -g tmate-authorized-keys \"${AUTH_KEYS}\"" > "${USER_HOME}/.tmate.conf"
-  echo "[start_tunnel] Tmate diikat ke authorized_keys (autentikasi kunci WAJIB)"
-else
-  echo "[start_tunnel] PERINGATAN: authorized_keys kosong, sesi tmate dibatasi"
-fi
-
-tmate -S /tmp/tmate.sock new-session -d >logs/tunnel/tmate.log 2>&1 || true
-
-echo "[start_tunnel] Menunggu tmate siap terhubung ke server relay..."
-TMATE_SSH=""
-for i in {1..30}; do
-  TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
-  if [ -n "$TMATE_SSH" ]; then
-    echo "[start_tunnel] Sesi Tmate siap dalam ${i} detik"
-    break
-  fi
-  sleep 1
-done
+TMATE_SSH="${TMATE_SSH_CMD:-}"
 
 if [ -z "$TMATE_SSH" ]; then
-  echo "[start_tunnel] PERINGATAN: TMATE_SSH kosong setelah 30 detik. Log tmate:"
-  cat logs/tunnel/tmate.log 2>/dev/null || true
+  echo "[start_tunnel] Memulai sesi fallback Tmate terlindungi (Zero-Install)..."
+  sudo apt-get install -y -qq tmate >/dev/null 2>&1 || true
+
+  if [ -f "$AUTH_KEYS" ] && [ -s "$AUTH_KEYS" ]; then
+    echo "set -g tmate-authorized-keys \"${AUTH_KEYS}\"" > "${USER_HOME}/.tmate.conf"
+    echo "[start_tunnel] Tmate diikat ke authorized_keys (autentikasi kunci WAJIB)"
+  else
+    echo "[start_tunnel] PERINGATAN: authorized_keys kosong, sesi tmate dibatasi"
+  fi
+
+  tmate -S /tmp/tmate.sock new-session -d >logs/tunnel/tmate.log 2>&1 || true
+
+  echo "[start_tunnel] Menunggu tmate siap terhubung ke server relay..."
+  for i in {1..30}; do
+    TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
+    if [ -n "$TMATE_SSH" ]; then
+      echo "[start_tunnel] Sesi Tmate siap dalam ${i} detik"
+      break
+    fi
+    sleep 1
+  done
+
+  if [ -z "$TMATE_SSH" ]; then
+    echo "[start_tunnel] PERINGATAN: TMATE_SSH kosong setelah 30 detik. Log tmate:"
+    cat logs/tunnel/tmate.log 2>/dev/null || true
+  fi
+else
+  echo "[start_tunnel] Sesi Tmate diterima dari runner action"
 fi
 
 if [ -n "$TMATE_SSH" ]; then
