@@ -15,6 +15,7 @@ REPO="${GITHUB_REPOSITORY:-mensir122/vm-panel}"
 RUN_ID="${GITHUB_RUN_ID:-}"
 GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 TMATE_SSH_CMD="${TMATE_SSH_CMD:-}"
+UPTERM_SSH_CMD="${UPTERM_SSH_CMD:-}"
 
 TARGET_USER="${USER:-runner}"
 USER_HOME=$(eval echo "~${TARGET_USER}")
@@ -149,55 +150,16 @@ if [ -n "$NGROK_TOKEN" ]; then
 fi
 
 # 4. OPSI D: Upterm Reverse SSH Relay (Zero-Install, Zero-Trust Key Enforced)
-echo "[start_tunnel] Mencoba inisialisasi sesi Upterm (Zero-Install)..."
-if ! command -v upterm >/dev/null 2>&1; then
-  echo "[start_tunnel] mengunduh binary upterm..."
-  curl -fsSL -o /tmp/upterm.deb https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.deb >/dev/null 2>&1 || true
-  if [ -f /tmp/upterm.deb ]; then
-    sudo dpkg -i /tmp/upterm.deb >/dev/null 2>&1 || true
-  fi
-fi
+UPTERM_SSH="${UPTERM_SSH_CMD:-}"
 
-if command -v upterm >/dev/null 2>&1; then
+if [ -n "$UPTERM_SSH" ]; then
   echo "[start_tunnel] provider terdeteksi: UPTERM (Zero-Install SSH Relay)"
-  AUTH_FLAGS=""
-  if [ -f "$AUTH_KEYS" ] && [ -s "$AUTH_KEYS" ]; then
-    AUTH_FLAGS="--authorized-keys ${AUTH_KEYS}"
-    echo "[start_tunnel] Upterm diikat ke authorized_keys (autentikasi kunci WAJIB)"
-  else
-    echo "[start_tunnel] PERINGATAN: authorized_keys kosong"
-  fi
+  # SENSOR LOG: Mask connection string agar TIDAK tampil mentah di log publik GitHub
+  echo "::add-mask::${UPTERM_SSH}"
+  echo "${UPTERM_SSH}" > runtime/vps-ssh.txt
+  chmod 600 runtime/vps-ssh.txt
 
-  if ! command -v tmux >/dev/null 2>&1; then
-    sudo apt-get install -y -qq tmux >/dev/null 2>&1 || true
-  fi
-
-  mkdir -p "${USER_HOME}/.upterm" logs/tunnel
-  rm -f "${USER_HOME}/.upterm/"*.sock
-
-  # Mulai upterm host di background tmux session (window ber-PTY)
-  tmux new-session -d -s vps-host "bash -c 'upterm host ${AUTH_FLAGS} --server ssh://uptermd.upterm.dev:22 --force-command \"tmux attach -t vps || tmux new -s vps\" -- tmux new -A -s vps > logs/tunnel/upterm.log 2>&1'" || true
-
-  echo "[start_tunnel] Menunggu upterm siap terhubung ke server relay..."
-  UPTERM_SSH=""
-  for i in {1..30}; do
-    SOCK=$(find "${USER_HOME}/.upterm" /run/user /tmp -name "*.sock" 2>/dev/null | head -n 1 || true)
-    if [ -n "$SOCK" ] && [ -S "$SOCK" ]; then
-      UPTERM_SSH=$(UPTERM_ADMIN_SOCKET="$SOCK" upterm session current --admin-socket "$SOCK" 2>/dev/null | grep -E '^SSH Session:' | sed 's/^SSH Session:[[:space:]]*//' || true)
-      if [ -n "$UPTERM_SSH" ]; then
-        echo "[start_tunnel] Sesi Upterm siap dalam ${i} detik"
-        break
-      fi
-    fi
-    sleep 1
-  done
-
-  if [ -n "$UPTERM_SSH" ]; then
-    echo "::add-mask::${UPTERM_SSH}"
-    echo "${UPTERM_SSH}" > runtime/vps-ssh.txt
-    chmod 600 runtime/vps-ssh.txt
-
-    cat > runtime/vps-connection.json <<EOF
+  cat > runtime/vps-connection.json <<EOF
 {
   "provider": "upterm",
   "ssh_cmd": "${UPTERM_SSH}",
@@ -205,24 +167,21 @@ if command -v upterm >/dev/null 2>&1; then
   "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-    commit_connection_state
+  commit_connection_state
 
-    if [ -n "$TG_BOT" ] && [ -n "$TG_CHAT" ]; then
-      echo "[start_tunnel] Mengirim akses SSH aman via Telegram pribadi..."
-      curl -sf -X POST "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
-        -d chat_id="${TG_CHAT}" \
-        -d text="🔐 [ORIONT VPS 24/7] Akses SSH Aktif:%0A<code>${UPTERM_SSH}</code>" \
-        -d parse_mode="HTML" >/dev/null 2>&1 || true
-      echo "[start_tunnel] Notifikasi SSH terkirim ke Telegram!"
-    else
-      echo "[start_tunnel] Akses Upterm aktif (Di-masking di log publik untuk keamanan)."
-      echo "[start_tunnel] Perintah SSH tersimpan terenkripsi di branch state -> jalankan 'npm run ssh' di laptop."
-    fi
-    exit 0
+  # Notifikasi Telegram Privat (Jika bot token diset)
+  if [ -n "$TG_BOT" ] && [ -n "$TG_CHAT" ]; then
+    echo "[start_tunnel] Mengirim akses SSH aman via Telegram pribadi..."
+    curl -sf -X POST "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
+      -d chat_id="${TG_CHAT}" \
+      -d text="🔐 [ORIONT VPS 24/7] Akses SSH Aktif:%0A<code>${UPTERM_SSH}</code>" \
+      -d parse_mode="HTML" >/dev/null 2>&1 || true
+    echo "[start_tunnel] Notifikasi SSH terkirim ke Telegram!"
   else
-    echo "[start_tunnel] PERINGATAN: Upterm belum merespons dalam 30 detik. Log tmux:"
-    tmux capture-pane -pt vps-host 2>/dev/null || true
+    echo "[start_tunnel] Akses Upterm aktif (Di-masking di log publik untuk keamanan)."
+    echo "[start_tunnel] Perintah SSH tersimpan terenkripsi di branch state -> jalankan 'npm run ssh' di laptop."
   fi
+  exit 0
 fi
 
 # 5. OPSI E: Fallback Tmate (Jika Upterm tidak tersedia)
