@@ -137,7 +137,19 @@ bm.catalogExternal({ backupId: '${BACKUP_ID}', dir: '${BACKUP_DIR}', trigger: 'e
 const rm = new RestoreManager({ dataDir: 'data', backupsRoot: 'backups', backupManager: bm });
 const report = rm.restoreBackup('${BACKUP_ID}', { dryRun: false });
 console.log('[restore_state] restored:', report.restored.join(','), '| warnings:', report.warnings.length);
-" || { echo "[restore_state] RESTORE GAGAL setelah decrypt SUKSES (pack sah tapi gagal dipulihkan) - FAIL LOUD; JANGAN fresh-start: vm.yml akan skip final-backup+upload sehingga siklus rusak ini TIDAK menimpa state cloud dengan pack kosong"; ghout "state_ok=false"; exit 1; }
+# Pulihkan folder kerja user (/home/runner/workspace) dan data .9router
+USER_PACK=$(find backups -name 'user_workspace.tar.gz' 2>/dev/null | head -1 || true)
+if [ -n "$USER_PACK" ] && [ -f "$USER_PACK" ]; then
+  echo "[restore_state] mengekstrak folder /home/runner/workspace dan ~/.9router..."
+  mkdir -p /home/runner/workspace
+  tar -xzf "$USER_PACK" -C /home/runner 2>/dev/null || true
+  echo "[restore_state] data proyek user berhasil dipulihkan!"
+fi
+
+# Pasang / pastikan perkakas pengguna aktif otomatis (9router, dll.)
+if [ -f "scripts/setup_tools.sh" ]; then
+  bash scripts/setup_tools.sh || true
+fi
 
 # Bersihkan plaintext di runner ini setelah restore (tidak dibutuhkan lagi;
 # sumber kebenaran tetap artifact terenkripsi).

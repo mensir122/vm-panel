@@ -19,6 +19,12 @@ bm.close?.();
 ")
 echo "[backup_final] backup final valid: ${BACKUP_ID}"
 
+# Simpan folder kerja user (/home/runner/workspace) dan data .9router
+USER_BACKUP_DIR="backups/manual/${BACKUP_ID}/files"
+mkdir -p "${USER_BACKUP_DIR}"
+echo "[backup_final] mengompres folder /home/runner/workspace dan ~/.9router..."
+tar -czf "${USER_BACKUP_DIR}/user_workspace.tar.gz" -C /home/runner workspace .9router 2>/dev/null || true
+
 # Enkripsi SATU backup dir terbaru + vault secrets (secrets/vault.enc,
 # secrets/secrets.yaml, secrets/configs/** — cap 4MB, guard fingerprint kunci
 # di header) → runtime/vm-state.enc (AES-256-GCM, kunci =
