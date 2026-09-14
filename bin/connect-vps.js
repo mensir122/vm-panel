@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync, spawnSync } from 'node:child_process';
 import { loadDotEnv } from '../lib/env.js';
-import { decryptConnection, parseSshCommand } from '../scripts/vps-connection.mjs';
+import { decryptConnection, parseSshCommand, updateSshConfig } from '../scripts/vps-connection.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -139,6 +139,13 @@ async function main() {
     process.exit(1);
   }
 
+  // Sinkronkan host vpanel-vps ke ~/.ssh/config secara otomatis
+  try {
+    updateSshConfig(conn);
+  } catch (err) {
+    // Abaikan jika permission ~/.ssh terbatas
+  }
+
   // Ekstrak target user@host dari string SSH (contoh: "ssh foo@uptermd.upterm.dev" -> "foo@uptermd.upterm.dev")
   const target = conn.ssh_cmd.replace(/^ssh\s+/, '').split(/\s+/)[0];
 
@@ -148,19 +155,21 @@ async function main() {
     console.log('\x1b[36m├──────────────────────────────────────────────────────────────┤\x1b[0m');
     console.log(`\x1b[36m│\x1b[0m  Perintah SSH  : \x1b[32m${conn.ssh_cmd}\x1b[0m`.padEnd(68) + '\x1b[36m│\x1b[0m');
     console.log(`\x1b[36m│\x1b[0m  Remote Target : \x1b[33m${target}\x1b[0m`.padEnd(68) + '\x1b[36m│\x1b[0m');
+    console.log(`\x1b[36m│\x1b[0m  SSH Config    : \x1b[34mHost vpanel-vps (~/.ssh/config)\x1b[0m`.padEnd(68) + '\x1b[36m│\x1b[0m');
     console.log(`\x1b[36m│\x1b[0m  Kunci Privat  : \x1b[35m~/.ssh/id_ed25519\x1b[0m`.padEnd(68) + '\x1b[36m│\x1b[0m');
     console.log('\x1b[36m└──────────────────────────────────────────────────────────────┘\x1b[0m\n');
     console.log('Untuk koneksi manual di VS Code (Remote - SSH):');
     console.log(`1. Tekan F1 di VS Code -> Pilih: Remote-SSH: Connect to Host...`);
-    console.log(`2. Masukkan target: ${conn.ssh_cmd}`);
-    console.log(`3. Pilih platform: Linux\n`);
+    console.log(`2. Pilih host: vpanel-vps`);
+    console.log(`3. Folder remote Linux akan langsung terbuka di VS Code!\n`);
     process.exit(0);
   }
 
   if (isVscode) {
-    const uri = `vscode-remote://ssh-remote+${target}/home/runner`;
-    console.log('\n\x1b[32m[✓] Membuka VS Code Remote ke VPS Ubuntu (/home/runner)...\x1b[0m');
-    console.log(`\x1b[90mURI: ${uri}\x1b[0m\n`);
+    const uri = `vscode-remote://ssh-remote+vpanel-vps/home/runner`;
+    console.log('\n\x1b[32m[✓] Membuka VS Code Remote ke VPS Ubuntu (/home/runner)...');
+    console.log(`    Host Target: vpanel-vps`);
+    console.log(`    URI: ${uri}\x1b[0m\n`);
     spawnSync('code', ['--folder-uri', uri], { shell: true, stdio: 'inherit' });
     process.exit(0);
   }

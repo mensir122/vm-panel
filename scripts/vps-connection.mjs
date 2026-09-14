@@ -87,6 +87,78 @@ export function parseSshCommand(rawSshCmd, opts = {}) {
   };
 }
 
+/**
+ * Update atau sisipkan konfigurasi Host vpanel-vps di ~/.ssh/config.
+ * Berguna untuk integrasi otomatis dengan VS Code Remote - SSH.
+ * @param {object} conn - objek koneksi { host, port, user }
+ * @param {object} [opts] - opsi custom direktori/path untuk pengujian
+ * @returns {string|null} content konfigurasi yang baru
+ */
+export function updateSshConfig(conn, opts = {}) {
+  if (!conn) {
+    return null;
+  }
+
+  let host = conn.host;
+  let port = conn.port;
+  let user = conn.user;
+
+  // Jika host/port belum eksplisit, parse dari ssh_cmd
+  if ((!host || !port) && conn.ssh_cmd) {
+    const pMatch = conn.ssh_cmd.match(/-p\s+(\d+)/);
+    port = port || (pMatch ? parseInt(pMatch[1], 10) : 22);
+
+    const target = conn.ssh_cmd.replace(/^ssh\s+/, '').trim().split(/\s+/)[0];
+    if (target.includes('@')) {
+      const parts = target.split('@');
+      user = user || parts[0];
+      host = host || parts[1];
+    } else {
+      host = host || target;
+      user = user || 'runner';
+    }
+  }
+
+  if (!host) {
+    return null;
+  }
+
+  port = port || 22;
+  user = user || 'runner';
+
+  const home = opts.homeDir || os.homedir();
+  const sshDir = opts.sshDir || path.join(home, '.ssh');
+  if (!fs.existsSync(sshDir)) {
+    fs.mkdirSync(sshDir, { recursive: true });
+  }
+  const configPath = opts.configPath || path.join(sshDir, 'config');
+  let content = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : '';
+
+  const idKey = path.join(sshDir, 'id_ed25519').replace(/\\/g, '/');
+  const blockHeader = '# === VPANEL VPS 24/7 AUTO CONFIG ===';
+  const blockFooter = '# === END VPANEL VPS ===';
+  const newBlock = `${blockHeader}
+Host vpanel-vps
+    HostName ${host}
+    Port ${port}
+    User ${user}
+    IdentityFile "${idKey}"
+    StrictHostKeyChecking accept-new
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+${blockFooter}`;
+
+  if (content.includes(blockHeader) && content.includes(blockFooter)) {
+    const regex = new RegExp(`${blockHeader}[\\s\\S]*?${blockFooter}`, 'g');
+    content = content.replace(regex, newBlock);
+  } else {
+    content = content ? `${content.trim()}\n\n${newBlock}\n` : `${newBlock}\n`;
+  }
+
+  fs.writeFileSync(configPath, content, { encoding: 'utf8' });
+  return content;
+}
+
 // CLI handler untuk dijalankan langsung dari shell / workflow
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const mode = process.argv[2];
