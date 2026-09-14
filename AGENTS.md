@@ -28,74 +28,45 @@ Dokumen ini adalah pedoman operasional dan teknis yang **wajib dipatuhi** oleh s
 
 ## 2. Arsitektur & Topologi Sistem
 
-VM-Panel (diberi nama tampilan **ORIONT VPANEL**) terdiri dari empat layer terintegrasi:
+ORIONT VPANEL kini beroperasi sebagai **Headless Linux VPS Engine 24/7**:
 
 ```mermaid
 graph TD
-    Desktop["Electron Desktop App (desktop/main.js)"] -->|Window / Preload| Panel
-    Browser["Web Browser (Localhost)"] -->|HTTP / Cookies| Panel["Panel Web Server (:8080) (panel/server/index.js)"]
-    Panel -->|REST API / Bearer Token| Manager["Manager API Daemon (:8097) (manager/index.js)"]
+    Client["Terminal Klien (Laptop/HP)"] -->|SSH :22 via Tailscale / Cloudflare / Tmate| SSHD["OpenSSH Server (:22) (Ubuntu Runner)"]
+    SSHD -->|vmctl CLI / Bash Shell| Manager["Manager API Daemon (:8097) (manager/index.js)"]
     Manager -->|Supervisor & Process Spawning| Services["Sub-Services & Projects (:10000 - :65535)"]
     Manager -->|SQLite / WAL Mode| DBs["SQLite Databases (data/*.db)"]
-    Hermes["Hermes AI Assistant (panel/server/assistant.js, routes /api/assistant di :8080)"]
-    Panel -->|Assistant engine| Hermes
-    Hermes -->|ManagerClient Bearer| Manager
-    Panel -->|Cloud Sync| GHRunner["GitHub Actions 24/7 Self-Hosted Runner"]
+    Manager -->|Self-Chain Keepalive| Chain["GitHub Actions 24/7 Self-Chain Loop (vm.yml + recovery.yml)"]
 ```
 
 ### Port & Proses Default:
-- **Panel Web Server**: `http://127.0.0.1:8080` (`node panel/server/index.js`)
-  - Server-rendered HTML tanpa framework berat (vanilla SSR + `panel/server/render.js`).
-  - Autentikasi session berbasis cookie `vpanel_session` (SameSite=Strict, HttpOnly).
-  - CSRF protection dengan double-submit cookie `vpanel_csrf`.
-- **Manager API**: `http://127.0.0.1:8097` (`node manager/index.js`)
-  - Mengelola lifecycle project, service spawning, monitoring health, process tree, audit trail, dan vault.
+- **OpenSSH Server**: Port `22` (dikonfigurasi via `scripts/setup_vps_ssh.sh`, autentikasi murni SSH public key, password dinonaktifkan).
+- **Reverse Tunnel**: Tailscale (`vpanel-vps`) / Cloudflare Tunnel / fallback Tmate via `scripts/start_tunnel.sh`.
+- **Manager API**: `http://127.0.0.1:8097` (`node manager/index.js`).
+  - Mengelola lifecycle project, service spawning, monitoring health, process tree, audit trail, dan vault terenkripsi.
   - Akses diamankan dengan Bearer token di `runtime/sockets/cli-token` atau env `VM_PANEL_TOKEN`.
-- **Desktop Application**: `desktop/main.js` (Electron)
-  - Membuka panel dalam window frameless bergaya mewah dengan custom titlebar window controls.
+- **vmctl CLI**: Perkakas baris perintah (`bin/vmctl.js` disymlink ke `/usr/local/bin/vmctl`) untuk kontrol langsung dari sesi SSH.
 - **Port Alokasi Proyek**: Port dinamis (misal `:20127`, `:10001`) yang dialokasikan otomatis dan diverifikasi ketersediaannya sebelum start.
 
 ---
 
-## 3. Template Engine & Desain Sistem ORIONT Dark Luxe
+## 3. Headless VPS & Akses SSH 24/7
 
-### Desain Sistem:
-- **Tema Visual**: *Obsidian Dark Luxe* — Monokrom minimalis modern.
-- **Warna Utama**:
-  - Background kanvas: `#0A0D0C`
-  - Kartu & Surface: `#111614`, `#181E1B`
-  - Border & Pembatas: `#1C221F`, `#26302B`
-  - Aksen / Teks Utama: `#FFFFFF`, `#F3F4F6`, `#E5E7EB`
-  - Teks Sekunder / Meta: `#9CA3AF`, `#6B7280`
-  - Status Hijau / Healthy: `#10B981` (dengan pulse animation)
-  - Typography: `Plus Jakarta Sans` (body) dan `JetBrains Mono` (kode/angka/telemetry).
-- **File CSS Utama**: `panel/static/panel.css` (seluruh utility, badge, modal, dropzone, table, dan titlebar didefinisikan di sini).
+> [!NOTE]
+> Seluruh antarmuka grafis Web UI (`panel/`) dan Desktop Electron (`desktop/`) telah dihapus 100% bersih tanpa sisa untuk performa maksimal dan fokus murni sebagai server VPS.
 
-### ATURAN KRUSIAL TEMPLATE ENGINE (`panel/server/render.js`):
-> [!CAUTION]
-> Template engine di `render.js` **TIDAK MENGHAPUS** tag variabel yang tidak disediakan; kunci yang tidak dikirim akan **tetap dirender apa adanya** sebagai teks mentah `{{namaVariabel}}` di browser!
-
-**Setiap kali Anda mengubah template `.html` di `panel/templates/`:**
-1. Pastikan setiap tag `{{variabel}}` atau `{{variabel|raw}}` memiliki key yang sesuai di controller `panel/server/index.js` (baik di `#pageVars` atau method `#page<Name>`).
-2. Jangan pernah menyisakan placeholder yang tidak terisi.
-3. Selalu uji dengan fetch HTTP dan scan regex `\{\{[^}]+\}\}` untuk memastikan hasil 100% bersih.
-
-### Struktur Halaman Standar:
-Semua 12 halaman utama panel (14 template = 12 halaman + login + error) memiliki kerangka seragam:
-1. **Desktop Titlebar**: `#desktop-titlebar` (tampil di Electron, auto-hide di browser biasa).
-2. **Sidebar**:
-   - Brand Logo (`ORIONT VPANEL` + icon `/static/oriont-logo.png`).
-   - Navigasi server-rendered (`{{nav|raw}}`).
-   - Host Telemetry Widget: `DAEMON 24/7` (`{{managerStatus}}`, `{{nodeVersionStr}}`, `{{osPlatformStr}}`).
-   - Footer: `ORIONT · operations console`.
-3. **Topbar**:
-   - Search input dengan shortcut badge `⌘ F` / `Ctrl+F`.
-   - Hermes Assistant trigger button (`#btn-topbar-hermes`).
-   - Alerts bell icon (link ke `/audit`).
-   - User profile pill (`system` / avatar).
-   - Logout button (merah).
-4. **Main Page Content**: Konten spesifik per rute.
-5. **Footer**: `ORIONT · VPANEL · Values are sampled on page load`.
+### Fitur Headless VPS:
+1. **Akses SSH Penuh**:
+   - Injeksi SSH Key via secret `SSH_PUBLIC_KEY`.
+   - Hak sudo tanpa password (`NOPASSWD:ALL`).
+   - Perkakas VPS bawaan: `tmux`, `htop`, `curl`, `neofetch`, `git`, `python3`, `node`.
+2. **Kontinuitas 24/7 Tanpa Mati**:
+   - Berjalan di GitHub Actions dengan alur self-chaining sebelum batas 6 jam.
+   - Sinkronisasi state database terenkripsi AES-256-GCM ke branch `state`.
+   - Watchdog pemulihan otomatis (`recovery.yml`) tiap 15 menit.
+3. **Persistensi State Lengkap**:
+   - Seluruh database SQLite di-checkpoint secara anggun sebelum pergantian runner.
+   - Sesi terminal dapat dipulihkan menggunakan `tmux`.
 
 ---
 

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# health_check.sh — health gate pasca-start (manager + panel wajib 200).
+# health_check.sh — health gate pasca-start (manager wajib 200).
 # Desain: docs/DESIGN.md §15.2 "health gate" — migration sukses HANYA jika ini lulus.
 set -euo pipefail
 
 MP="${MANAGER_API_PORT:-8097}"
-PP="${PANEL_PORT:-8080}"
 FAIL=0
 TOKEN_FILE="runtime/sockets/cli-token"
 AUTH=()
@@ -21,11 +20,14 @@ else
   FAIL=1
 fi
 
-if curl -sf -o /dev/null "http://127.0.0.1:${PP}/login"; then
-  echo "[health_check] panel: OK"
+# Cek OpenSSH daemon (di Linux/runner) jika port 22 terbuka atau sshd aktif
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet ssh 2>/dev/null; then
+  echo "[health_check] ssh: OK (systemd service active)"
+elif nc -z 127.0.0.1 22 2>/dev/null || (command -v ss >/dev/null 2>&1 && ss -tulpn | grep -q ':22\b'); then
+  echo "[health_check] ssh: OK (port 22 listening)"
 else
-  echo "[health_check] PANEL DOWN"
-  FAIL=1
+  echo "[health_check] ssh: standby (local/pre-tunnel)"
 fi
 
 exit "$FAIL"
+

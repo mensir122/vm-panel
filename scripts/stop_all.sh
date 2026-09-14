@@ -5,8 +5,8 @@ set -euo pipefail
 
 echo "[stop_all] graceful shutdown mulai"
 
-# Panel dulu, lalu manager (manager terakhir: satu-satunya penulis DB).
-for NAME in panel manager; do
+# Hentikan tunnel dulu bila ada, lalu manager (satu-satunya penulis DB).
+for NAME in tunnel manager; do
   PIDFILE="runtime/pid/${NAME}-launcher.pid"
   if [ -f "$PIDFILE" ]; then
     PID=$(cat "$PIDFILE")

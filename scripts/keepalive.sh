@@ -156,6 +156,7 @@ while :; do
   if [ "$NOW" -ge "$DRAIN_EPOCH" ]; then
     REMAIN_MIN=$(( (EXPIRES_EPOCH - NOW) / 60 ))
     echo "[keepalive] masuk drain window (t-${REMAIN_MIN} menit)"
+    wall "⚠️ [ORIONT VPS] Siklus 6 jam akan berpindah dalam ${REMAIN_MIN} menit. State sedang disinkronkan ke cloud..." 2>/dev/null || true
     break
   fi
 

@@ -90,7 +90,7 @@ async function shutdown(code) {
 }
 
 async function main() {
-  // 1. Manager dulu (satu-satunya penulis DB).
+  // 1. Manager daemon (penulis & pengelola DB/service).
   spawnProc('manager', 'manager/index.js');
   const mgrOk = await waitFor(async () => {
     if (!fs.existsSync(TOKEN_FILE)) return false;
@@ -107,28 +107,14 @@ async function main() {
     await shutdown(1);
     return;
   }
-  console.log(`[start-all] manager OK (port ${MPORT})`);
-
-  // 2. Panel (UI).
-  spawnProc('panel', 'panel/server/index.js');
-  const panelOk = await waitFor(async () => {
-    const r = await fetch(`http://127.0.0.1:${PPORT}/login`, {
-      signal: AbortSignal.timeout(1500),
-    });
-    return r.status === 200;
-  }, 60_000);
-  if (!panelOk) {
-    console.error('[start-all] GAGAL: panel tidak sehat dalam 60s');
-    await shutdown(1);
-    return;
-  }
-  console.log(`[start-all] panel OK (port ${PPORT})`);
-  console.log(`[start-all] SEMUANYA MENYALA -> buka http://127.0.0.1:${PPORT}`);
-  console.log('[start-all] Ctrl+C untuk mematikan keduanya.');
+  console.log(`[start-all] manager daemon OK (port ${MPORT})`);
+  console.log(`[start-all] ORIONT HEADLESS VPS DAEMON MENYALA`);
+  console.log(`[start-all] Akses CLI lokal: node bin/vmctl.js system status`);
+  console.log('[start-all] Tekan Ctrl+C untuk mematikan manager.');
 }
 
 process.on('SIGINT', () => {
-  console.log('\n[start-all] Ctrl+C - mematikan manager + panel...');
+  console.log('\n[start-all] Ctrl+C - mematikan manager...');
   shutdown(0);
 });
 process.on('SIGTERM', () => shutdown(0));

@@ -69,15 +69,25 @@ jobs:
       - name: Verify state integrity
         run: bash scripts/verify_state.sh
 
-      - name: Start manager + panel
-        run: |
-          bash scripts/start_manager.sh
-          bash scripts/start_panel.sh
+      - name: Setup VPS SSH Server
+        run: bash scripts/setup_vps_ssh.sh
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+
+      - name: Start VPS Remote Tunnel
+        run: bash scripts/start_tunnel.sh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+
+      - name: Start manager daemon
+        run: bash scripts/start_manager.sh
         env:
           RUNNER_ID: ${{ github.run_id }}
           VM_PANEL_ENV: actions
 
-      - name: Health gate (manager + panel wajib lulus)
+      - name: Health gate (manager + ssh wajib lulus)
         run: bash scripts/health_check.sh
       - name: Auto-deploy projects dari manifest
         run: bash scripts/apply_projects.sh

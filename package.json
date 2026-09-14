@@ -8,7 +8,7 @@
     "engines": {
         "node": ">=20"
     },
-    "main": "desktop/main.js",
+    "main": "manager/index.js",
     "bin": {
         "vmctl": "./bin/vmctl.js"
     },
@@ -19,44 +19,12 @@
         "test:security": "node --test tests/security/*.test.js",
         "test:recovery": "node --test tests/recovery/*.test.js",
         "start": "node start-all.mjs",
-        "start:panel": "node panel/server/index.js",
         "start:manager": "node manager/index.js",
-        "stop": "powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort 8097,8080 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }\"",
-        "desktop": "electron desktop/main.js",
-        "desktop:build": "electron-builder --dir",
-        "desktop:dist": "electron-builder --win",
-        "shortcut": "powershell -ExecutionPolicy Bypass -File scripts/create-shortcut.ps1"
+        "stop": "powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort 8097 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }\""
     },
     "dependencies": {
         "better-sqlite3": "11.10.0"
     },
-    "author": "VM-Panel",
-    "devDependencies": {
-        "electron": "^44.3.0",
-        "electron-builder": "^26.15.3"
-    },
-    "build": {
-        "appId": "com.vmpanel.desktop",
-        "productName": "VM-Panel",
-        "npmRebuild": false,
-        "asar": false,
-        "directories": {
-            "output": "dist"
-        },
-        "files": [
-            "**/*",
-            "!dist/**",
-            "!tests/**",
-            "!.git/**"
-        ],
-        "win": {
-            "target": "dir",
-            "icon": "desktop/assets/icon.ico"
-        },
-        "nsis": {
-            "oneClick": false,
-            "perMachine": false,
-            "allowToChangeInstallationDirectory": true
-        }
-    }
+    "author": "VM-Panel"
 }
+

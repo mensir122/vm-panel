@@ -1,63 +1,60 @@
-# VM-Panel
+# ORIONT Headless VPS (VM-Panel)
 
-VM-Panel adalah control plane + runtime plane untuk mengelola banyak project di satu host (GitHub Actions runner saat ini, VPS nanti) — layaknya VPS pribadi: deploy, service lifecycle, health check, auto-recovery, backup/restore/rollback, audit, dan permission dalam satu sistem.
+ORIONT Headless VPS adalah control plane + runtime plane untuk menjalankan lingkungan layaknya **Linux VPS pribadi 24/7 di atas GitHub Actions** (atau VPS nyata): akses OpenSSH Server port 22 dengan autentikasi SSH key, tunneling persisten (Tailscale / Cloudflare), deployment otomatis, service lifecycle supervisor, health check, auto-recovery, backup/restore/rollback terenkripsi (AES-256-GCM), audit, dan CLI `vmctl`.
 
-Tiga komponen:
+Komponen Inti:
 
-- **Manager** — daemon headless, satu-satunya penulis database (SQLite, mode WAL).
-- **Panel** — web UI terpisah (auth sendiri: password + TOTP + recovery codes; DB sendiri: `users.db`).
-- **vmctl** — CLI `vmctl <noun> <verb>`; operasi destruktif wajib two-phase confirm.
+- **Headless VPS Runner** — OpenSSH Server port 22 + Reverse Tunnel (Tailscale `vpanel-vps` / Cloudflare / Tmate) di GitHub Actions 24/7 self-chain.
+- **Manager Daemon** — engine headless `:8097`, satu-satunya penulis database (SQLite WAL).
+- **vmctl CLI** — perkakas terminal `vmctl <noun> <verb>` untuk kontrol penuh dari dalam sesi SSH.
 
-Rujukan desain lengkap: [`docs/DESIGN.md`](docs/DESIGN.md). Panduan operasional: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+Panduan lengkap akses SSH & VPS: [`docs/PANDUAN-VPS-SSH-247.md`](docs/PANDUAN-VPS-SSH-247.md). Rujukan desain: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Arsitektur Singkat
 
 ```
- vmctl (CLI)          Panel (web 127.0.0.1:8080)
-     |   \             /
-     |    \           /  HTTP loopback :8097 (bearer token)
-     |     ▼         ▼
-     |   ┌──────────────────────────┐
-     |   │ MANAGER (node manager/ ) │  16 modul + InternalSupervisor
-     |   │ API loopback + bearer    │  adapter: static / node / python
-     └──►│ runtime/sockets/cli-token│
-         └───────────┬──────────────┘
-                     | child_process (argv, no shell)
-             ┌─────────────────────┐
-             │ PROJECT SERVICES    │  workspace + env + port terisolasi
-             │ [static] [node] [py]│  per project (workspaces/<prj_id>)
-             └─────────────────────┘
+ Laptop / Terminal Klien
+    │
+    │  SSH (Port 22) via Tailscale / Cloudflare / Tmate
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ GITHUB ACTIONS HEADLESS RUNNER (ubuntu-latest, 24/7 chain)  │
+│                                                             │
+│  [OpenSSH Server :22]  ◄── SSH Key Pribadi                  │
+│           │                                                 │
+│           ▼                                                 │
+│      vmctl (CLI)                                            │
+│           │                                                 │
+│           ▼ (loopback :8097 + bearer token)                 │
+│  ┌──────────────────────────┐                               │
+│  │ MANAGER (node manager/ ) │  16 modul + Supervisor        │
+│  │ API loopback + bearer    │  adapter: static/node/python  │
+│  └────────────┬─────────────┘                               │
+│               │ child_process (argv, no shell)              │
+│       ┌───────┴─────────────┐                               │
+│       │ PROJECT SERVICES    │  workspace + port terisolasi  │
+│       │ [static] [node] [py]│  per project (workspaces/)    │
+│       └─────────────────────┘                               │
+└─────────────────────────────────────────────────────────────┘
 ```
-
-- Manager API hanya menerima koneksi loopback + bearer token (rate limit 60 req/menit).
-- Panel tidak pernah menulis DB manager; semua mutasi via Manager API.
-- vmctl membaca token dari `runtime/sockets/cli-token` (dibuat manager saat start).
 
 ## Quickstart
 
 Syarat: Node.js >= 20. Satu dependency produksi: `better-sqlite3`.
 
 ```bash
-# 1. Install dependency
-npm install
-
-# 2. Set master key (dipakai vault secret & enkripsi TOTP panel).
-#    Minimal 32 karakter acak. JANGAN commit nilainya.
-export VPANEL_MASTER_KEY="<acak-minimal-32-karakter>"
-
-# 3. Jalankan manager (API 127.0.0.1:8097; tulis runtime/pid/manager.pid
-#    dan runtime/sockets/cli-token)
+# 1. Jalankan daemon manager lokal
 npm start
 
-# 4. Jalankan panel (127.0.0.1:8080)
-npm run start:panel
+# 2. Periksa status sistem via CLI
+node bin/vmctl.js system status
+
+# 3. Buat dan deploy project
+node bin/vmctl.js project create --name my-service --type node --port 10001
 ```
 
-First-run bootstrap:
+Akses SSH 24/7 di GitHub Actions: lihat [`docs/PANDUAN-VPS-SSH-247.md`](docs/PANDUAN-VPS-SSH-247.md).
 
-1. Buka `http://127.0.0.1:8080/bootstrap` — buat akun owner (token setup sekali-pakai, TTL 15 menit).
-2. Simpan **TOTP secret** dan **10 recovery codes** yang tampil sekali; tidak pernah muncul lagi.
-3. Login di `/login`: username + password + kode TOTP (atau recovery code).
 4. Buat project dan deploy via vmctl atau panel:
 
 ```bash
@@ -82,16 +79,14 @@ Catatan bootstrap: bootstrap menolak folder yang sudah berisi `platform.db` non-
 ```
 lib/       SDK bersama: db (WAL+migrate+integrity), crypto, vault, lock,
            redact, paths, config, api-client, errors, ids, fsutil, log
-manager/   daemon + 16 modul (manager/<nama>_manager/) + manager/adapters/
-panel/     server SSR (panel/server/), templates, static, config/panel.yaml
+manager/   daemon headless + 16 modul (manager/<nama>_manager/) + manager/adapters/
 bin/       vmctl.js — CLI entrypoint
 data/      9 database SQLite + migrations (platform, projects, services,
            deployments, health, backups, audit, users, locks)
 workspaces/ runtime/ logs/ backups/ projects/ secrets/ scripts/ templates/
 tests/     unit/ (aktif), integration/, security/, recovery/
-docs/      DESIGN.md (sumber kebenaran), ARCHITECTURE, OPERATIONS,
-           SECURITY, TESTING, TEST-PLAN, test-report.md
-.github/workflows/  workflow runner GHA (vm.yml, recovery.yml — fase F5)
+docs/      DESIGN.md, ARCHITECTURE, OPERATIONS, PANDUAN-VPS-SSH-247
+.github/workflows/  workflow runner GHA (vm.yml, recovery.yml, ci.yml)
 ```
 
 Konfigurasi: `config.yaml` (semua default dev, tanpa credential). Contoh env: `.env.example` (`VPANEL_MASTER_KEY`, `MANAGER_API_PORT`, `PANEL_PORT`, `VM_PANEL_ENV`).
