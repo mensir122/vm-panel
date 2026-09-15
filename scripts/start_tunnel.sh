@@ -62,12 +62,60 @@ commit_connection_state() {
   fi
 }
 
-# 1. OPSI A: Tailscale Mesh VPN (Sangat Direkomendasikan & Privat Total)
+# 1. OPSI A: Bore Raw TCP Tunnel (Zero-Install, Full Port 22 Support untuk VS Code Remote-SSH)
+echo "[start_tunnel] provider memeriksa: BORE (Raw TCP Port 22 Forwarding untuk VS Code Remote-SSH)"
+if ! command -v bore >/dev/null 2>&1; then
+  echo "[start_tunnel] mengunduh binary bore..."
+  curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /tmp 2>/dev/null || true
+  if [ -f /tmp/bore ]; then
+    sudo mv /tmp/bore /usr/local/bin/bore
+    sudo chmod +x /usr/local/bin/bore
+  fi
+fi
+
+if command -v bore >/dev/null 2>&1; then
+  nohup bore local 22 --to bore.pub > logs/tunnel/bore.log 2>&1 &
+  echo $! > runtime/pid/tunnel-launcher.pid
+
+  BORE_PORT=""
+  for i in {1..20}; do
+    if [ -f logs/tunnel/bore.log ]; then
+      BORE_PORT=$(grep -oE 'bore.pub:[0-9]+' logs/tunnel/bore.log | cut -d: -f2 | tail -n1 || true)
+      if [ -n "$BORE_PORT" ]; then
+        break
+      fi
+    fi
+    sleep 1
+  done
+
+  if [ -n "$BORE_PORT" ]; then
+    echo "::add-mask::${BORE_PORT}"
+    echo "[start_tunnel] Bore TCP tunnel aktif di bore.pub:${BORE_PORT} (kompatibel penuh VS Code Remote-SSH)"
+    cat > runtime/vps-connection.json <<EOF
+{
+  "provider": "bore",
+  "host": "bore.pub",
+  "port": ${BORE_PORT},
+  "user": "${TARGET_USER}",
+  "ssh_cmd": "ssh ${TARGET_USER}@bore.pub -p ${BORE_PORT}",
+  "run_id": "${RUN_ID}",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+    commit_connection_state
+    echo "[start_tunnel] Akses SSH & VS Code Remote siap: ssh ${TARGET_USER}@bore.pub -p ${BORE_PORT}"
+    exit 0
+  else
+    echo "[start_tunnel] Bore tidak mendapatkan port, beralih ke provider berikutnya..."
+  fi
+fi
+
+# 2. OPSI B: Tailscale Mesh VPN (Jika Bore tidak tersedia)
 if [ -n "$TS_KEY" ]; then
   echo "[start_tunnel] provider terdeteksi: TAILSCALE (Private WireGuard Mesh)"
   if ! command -v tailscale >/dev/null 2>&1; then
     echo "[start_tunnel] mengunduh dan menginstal Tailscale..."
-    curl -fsSL https://tailscale.com/install.sh | sudo sh >/dev/null 2>&1 || true
+    curl -fsSL https://github.com/tailscale.com/install.sh | sudo sh >/dev/null 2>&1 || true
   fi
 
   # Start tailscaled daemon bila belum berjalan
@@ -114,7 +162,7 @@ EOF
   fi
 fi
 
-# 2. OPSI B: Cloudflare Tunnel
+# 3. OPSI C: Cloudflare Tunnel
 if [ -n "$CF_TOKEN" ]; then
   echo "[start_tunnel] provider terdeteksi: CLOUDFLARE TUNNEL"
   if ! command -v cloudflared >/dev/null 2>&1; then
@@ -128,7 +176,7 @@ if [ -n "$CF_TOKEN" ]; then
   exit 0
 fi
 
-# 3. OPSI C: Ngrok TCP Tunnel
+# 4. OPSI D: Ngrok TCP Tunnel
 if [ -n "$NGROK_TOKEN" ]; then
   echo "[start_tunnel] provider terdeteksi: NGROK"
   if ! command -v ngrok >/dev/null 2>&1; then
@@ -147,54 +195,6 @@ if [ -n "$NGROK_TOKEN" ]; then
     echo "[start_tunnel] Ngrok tunnel aktif (URL disensor di log untuk keamanan)"
   fi
   exit 0
-fi
-
-# 4. OPSI D: Bore Raw TCP Tunnel (Zero-Install, Full Port 22 Support untuk VS Code Remote-SSH)
-echo "[start_tunnel] provider memeriksa: BORE (Raw TCP Port 22 Forwarding untuk VS Code Remote-SSH)"
-if ! command -v bore >/dev/null 2>&1; then
-  echo "[start_tunnel] mengunduh binary bore..."
-  curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /tmp 2>/dev/null || true
-  if [ -f /tmp/bore ]; then
-    sudo mv /tmp/bore /usr/local/bin/bore
-    sudo chmod +x /usr/local/bin/bore
-  fi
-fi
-
-if command -v bore >/dev/null 2>&1; then
-  nohup bore local 22 --to bore.pub > logs/tunnel/bore.log 2>&1 &
-  echo $! > runtime/pid/tunnel-launcher.pid
-
-  BORE_PORT=""
-  for i in {1..20}; do
-    if [ -f logs/tunnel/bore.log ]; then
-      BORE_PORT=$(grep -oE 'bore.pub:[0-9]+' logs/tunnel/bore.log | cut -d: -f2 | tail -n1 || true)
-      if [ -n "$BORE_PORT" ]; then
-        break
-      fi
-    fi
-    sleep 1
-  done
-
-  if [ -n "$BORE_PORT" ]; then
-    echo "::add-mask::${BORE_PORT}"
-    echo "[start_tunnel] Bore TCP tunnel aktif di bore.pub:${BORE_PORT} (kompatibel penuh VS Code Remote-SSH)"
-    cat > runtime/vps-connection.json <<EOF
-{
-  "provider": "bore",
-  "host": "bore.pub",
-  "port": ${BORE_PORT},
-  "user": "${TARGET_USER}",
-  "ssh_cmd": "ssh ${TARGET_USER}@bore.pub -p ${BORE_PORT}",
-  "run_id": "${RUN_ID}",
-  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
-    commit_connection_state
-    echo "[start_tunnel] Akses SSH & VS Code Remote siap: ssh ${TARGET_USER}@bore.pub -p ${BORE_PORT}"
-    exit 0
-  else
-    echo "[start_tunnel] Bore tidak mendapatkan port, beralih ke provider berikutnya..."
-  fi
 fi
 
 # 5. OPSI E: Upterm Reverse SSH Relay (Zero-Install, Zero-Trust Key Enforced)
