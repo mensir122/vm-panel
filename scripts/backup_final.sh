@@ -26,6 +26,11 @@ echo "[backup_final] mencatat snapshot paket npm global dan python..."
 npm list -g --depth=0 --json > "${USER_BACKUP_DIR}/npm_globals.json" 2>/dev/null || true
 pip list --format=freeze > "${USER_BACKUP_DIR}/pip_packages.txt" 2>/dev/null || true
 
+# Flush SQLite WAL 9router jika ada agar data 100% konsisten
+if [ -f "/home/runner/.9router/db/data.sqlite" ]; then
+  sqlite3 /home/runner/.9router/db/data.sqlite 'PRAGMA wal_checkpoint(TRUNCATE);' 2>/dev/null || true
+fi
+
 echo "[backup_final] mengompres seluruh file dan folder pribadi pengguna..."
 tar -czf "${USER_BACKUP_DIR}/user_home.tar.gz" \
     -C /home/runner \
