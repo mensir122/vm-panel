@@ -33,27 +33,47 @@ if ! pgrep -f 'next-server' >/dev/null 2>&1 && ! pgrep -f '9router' >/dev/null 2
   sleep 2
 fi
 
-# 4. Nyalakan Cloudflare Tunnel otomatis di background jika belum berjalan
-if ! pgrep -f 'cloudflared tunnel' >/dev/null 2>&1; then
-  echo "[setup_tools] menyalakan Cloudflare Tunnel publik..."
-  if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
-    nohup cloudflared tunnel run --token "${CLOUDFLARE_TUNNEL_TOKEN}" > /home/runner/cloudflared.log 2>&1 &
-  else
-    nohup cloudflared tunnel --url http://localhost:8080 > /home/runner/cloudflared.log 2>&1 &
+# 4. Nyalakan Ngrok Permanent Domain jika token & domain tersedia
+NGROK_TOKEN="${NGROK_AUTHTOKEN:-3JOdSEElbSe5UwaMtFVynGXKDkK_z5MpEa3VRjXHqTkdZ3ZH}"
+NGROK_DOM="${NGROK_DOMAIN:-chair-cyclist-premium.ngrok-free.dev}"
+
+PUBLIC_URL=""
+
+if [ -n "${NGROK_TOKEN}" ] && [ -n "${NGROK_DOM}" ]; then
+  if ! pgrep -f 'ngrok http' >/dev/null 2>&1; then
+    echo "[setup_tools] menyalakan Ngrok Permanent Domain (https://${NGROK_DOM})..."
+    if ! command -v ngrok >/dev/null 2>&1; then
+      curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | sudo tar -xz -C /usr/local/bin 2>/dev/null || true
+    fi
+    ngrok config add-authtoken "${NGROK_TOKEN}" >/dev/null 2>&1 || true
+    nohup ngrok http --url "https://${NGROK_DOM}" 8080 > /home/runner/ngrok.log 2>&1 &
+    sleep 2
   fi
+  PUBLIC_URL="https://${NGROK_DOM}"
 fi
 
-# Polling URL publik dari cloudflared.log (maksimal 30 detik)
-PUBLIC_URL=""
-for i in {1..30}; do
-  if [ -f /home/runner/cloudflared.log ]; then
-    PUBLIC_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /home/runner/cloudflared.log | head -1 || true)
-    if [ -n "$PUBLIC_URL" ]; then
-      break
+# 5. Nyalakan Cloudflare Tunnel sebagai fallback / backup
+if [ -z "${PUBLIC_URL}" ]; then
+  if ! pgrep -f 'cloudflared tunnel' >/dev/null 2>&1; then
+    echo "[setup_tools] menyalakan Cloudflare Tunnel publik..."
+    if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+      nohup cloudflared tunnel run --token "${CLOUDFLARE_TUNNEL_TOKEN}" > /home/runner/cloudflared.log 2>&1 &
+    else
+      nohup cloudflared tunnel --url http://localhost:8080 > /home/runner/cloudflared.log 2>&1 &
     fi
   fi
-  sleep 1
-done
+
+  # Polling URL publik dari cloudflared.log (maksimal 30 detik)
+  for i in {1..30}; do
+    if [ -f /home/runner/cloudflared.log ]; then
+      PUBLIC_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /home/runner/cloudflared.log | head -1 || true)
+      if [ -n "$PUBLIC_URL" ]; then
+        break
+      fi
+    fi
+    sleep 1
+  done
+fi
 
 if [ -n "$PUBLIC_URL" ]; then
   echo "$PUBLIC_URL" > /home/runner/PUBLIC_URL.txt
