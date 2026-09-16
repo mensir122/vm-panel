@@ -33,6 +33,7 @@ const repo = getRepo();
 function fetchConnection() {
   try {
     const raw = execSync(`gh api "repos/${repo}/contents/vps-connection.enc?ref=state" --jq .content`, {
+      cwd: rootDir,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'ignore'],
     }).trim();
@@ -44,6 +45,7 @@ function fetchConnection() {
 
   try {
     const raw = execSync(`gh api "repos/${repo}/contents/vps-connection.json?ref=state" --jq .content`, {
+      cwd: rootDir,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'ignore'],
     }).trim();
