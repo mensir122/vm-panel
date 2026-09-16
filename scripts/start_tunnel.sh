@@ -74,11 +74,14 @@ if ! command -v bore >/dev/null 2>&1; then
 fi
 
 if command -v bore >/dev/null 2>&1; then
-  nohup bore local 22 --to bore.pub > logs/tunnel/bore.log 2>&1 &
+  # Prioritaskan fixed port konsisten (default 20127 atau env BORE_PREF_PORT)
+  BORE_PREF="${BORE_PREF_PORT:-20127}"
+  echo "[start_tunnel] mencoba fixed port konsisten: ${BORE_PREF}..."
+  nohup bore local 22 --to bore.pub --port "${BORE_PREF}" > logs/tunnel/bore.log 2>&1 &
   echo $! > runtime/pid/tunnel-launcher.pid
 
   BORE_PORT=""
-  for i in {1..20}; do
+  for i in {1..7}; do
     if [ -f logs/tunnel/bore.log ]; then
       BORE_PORT=$(grep -oE 'bore.pub:[0-9]+' logs/tunnel/bore.log | cut -d: -f2 | tail -n1 || true)
       if [ -n "$BORE_PORT" ]; then
@@ -87,6 +90,25 @@ if command -v bore >/dev/null 2>&1; then
     fi
     sleep 1
   done
+
+  # Fallback otomatis ke port acak jika port konsisten tidak berhasil bind
+  if [ -z "$BORE_PORT" ]; then
+    echo "[start_tunnel] port ${BORE_PREF} tidak tersedia/bentrok, beralih ke port acak..."
+    PID_OLD=$(cat runtime/pid/tunnel-launcher.pid 2>/dev/null || true)
+    if [ -n "$PID_OLD" ]; then kill -9 "$PID_OLD" 2>/dev/null || true; fi
+    nohup bore local 22 --to bore.pub > logs/tunnel/bore.log 2>&1 &
+    echo $! > runtime/pid/tunnel-launcher.pid
+
+    for i in {1..15}; do
+      if [ -f logs/tunnel/bore.log ]; then
+        BORE_PORT=$(grep -oE 'bore.pub:[0-9]+' logs/tunnel/bore.log | cut -d: -f2 | tail -n1 || true)
+        if [ -n "$BORE_PORT" ]; then
+          break
+        fi
+      fi
+      sleep 1
+    done
+  fi
 
   if [ -n "$BORE_PORT" ]; then
     echo "::add-mask::${BORE_PORT}"
