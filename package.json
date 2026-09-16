@@ -17,6 +17,7 @@
         "ssh": "node bin/connect-vps.js",
         "ssh:vscode": "node bin/connect-vps.js --vscode",
         "ssh:info": "node bin/connect-vps.js --info",
+        "sync": "node bin/sync-port.mjs",
         "test": "node --test tests/unit/*.test.js",
         "test:unit": "node --test tests/unit/*.test.js",
         "test:integration": "node --test tests/integration/*.test.js",

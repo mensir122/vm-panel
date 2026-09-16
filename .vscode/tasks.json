@@ -1,0 +1,20 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Auto Sync VPS Port",
+      "type": "shell",
+      "command": "node bin/sync-port.mjs --silent",
+      "runOptions": {
+        "runOn": "folderOpen"
+      },
+      "presentation": {
+        "reveal": "silent",
+        "echo": false,
+        "showReuseMessage": false,
+        "clear": false
+      },
+      "problemMatcher": []
+    }
+  ]
+}
