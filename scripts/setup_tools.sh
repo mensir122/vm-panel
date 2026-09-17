@@ -4,6 +4,13 @@ set -euo pipefail
 
 echo "[setup_tools] memeriksa dan memasang perkakas pengguna..."
 
+# 0. FFmpeg (Wajib untuk OriontClipper video & audio processing)
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "[setup_tools] menginstal ffmpeg..."
+  sudo apt-get update -qq >/dev/null 2>&1 || true
+  sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true
+fi
+
 # 1. 9router
 if ! command -v 9router >/dev/null 2>&1; then
   echo "[setup_tools] menginstal 9router..."
