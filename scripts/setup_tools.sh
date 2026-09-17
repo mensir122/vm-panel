@@ -117,5 +117,25 @@ else
   echo "[setup_tools] Info: URL publik cloudflared belum terdeteksi atau menggunakan named tunnel token."
 fi
 
+# 6. Nyalakan OriontClipper bot otomatis jika ada
+if [ -d "/home/runner/OriontClipper" ]; then
+  echo "[setup_tools] mendeteksi direktori OriontClipper, menyalakan bot 24/7..."
+  if ! pgrep -f 'python.*bot\.py' >/dev/null 2>&1; then
+    (
+      cd /home/runner/OriontClipper
+      if [ -f "start_bot.py" ]; then
+        python3 start_bot.py >/dev/null 2>&1 || true
+      elif [ -x ".venv/bin/python" ]; then
+        nohup .venv/bin/python bot.py > bot.log 2>&1 &
+      else
+        nohup python3 bot.py > bot.log 2>&1 &
+      fi
+    )
+    echo "[setup_tools] OriontClipper bot berhasil dinyalakan otomatis!"
+  else
+    echo "[setup_tools] OriontClipper bot sudah berjalan."
+  fi
+fi
+
 echo "[setup_tools] perkakas dan layanan publik 24/7 siap digunakan!"
 exit 0
