@@ -65,7 +65,8 @@ describe('VPS Connection Helper & Cryptography', () => {
 
     assert.strictEqual(parsed.command, 'ssh');
     assert.ok(parsed.args.includes('-o'));
-    assert.ok(parsed.args.includes('StrictHostKeyChecking=accept-new'));
+    assert.ok(parsed.args.includes('StrictHostKeyChecking=no'));
+    assert.ok(parsed.args.includes('UserKnownHostsFile=/dev/null'));
     assert.ok(parsed.args.includes('-i'));
     assert.ok(parsed.args.includes('/custom/path/id_ed25519'));
     assert.ok(parsed.args.includes('foo@bar.tmate.io'));

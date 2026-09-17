@@ -69,7 +69,8 @@ export function parseSshCommand(rawSshCmd, opts = {}) {
   const finalArgs = [];
 
   // Sisipkan opsi keamanan dan kenyamanan
-  finalArgs.push('-o', 'StrictHostKeyChecking=accept-new');
+  finalArgs.push('-o', 'StrictHostKeyChecking=no');
+  finalArgs.push('-o', 'UserKnownHostsFile=/dev/null');
   finalArgs.push('-o', 'ServerAliveInterval=30');
   finalArgs.push('-o', 'ServerAliveCountMax=3');
 
@@ -143,7 +144,8 @@ Host vpanel-vps
     Port ${port}
     User ${user}
     IdentityFile "${idKey}"
-    StrictHostKeyChecking accept-new
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
     ServerAliveInterval 30
     ServerAliveCountMax 3
 ${blockFooter}`;

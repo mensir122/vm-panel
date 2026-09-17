@@ -86,14 +86,16 @@ async function main() {
 
   const currentPort = getCurrentConfigPort();
 
-  if (targetPort && currentPort === targetPort) {
+  const configPath = path.join(os.homedir(), '.ssh', 'config');
+  const oldContent = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : '';
+  const newContent = updateSshConfig(conn);
+
+  if (oldContent === newContent) {
     if (!isSilent) {
-      console.log(`[vps-sync] Port sudah sesuai (${targetPort}). Tidak ada perubahan.`);
+      console.log(`[vps-sync] Port dan konfigurasi sudah sesuai (${targetPort}). Tidak ada perubahan.`);
     }
     process.exit(0);
   }
-
-  updateSshConfig(conn);
 
   if (!isSilent) {
     console.log(`\x1b[32m[✓] Port VPS berhasil disinkronkan ke ~/.ssh/config: ${currentPort || 'none'} -> ${targetPort}\x1b[0m`);
