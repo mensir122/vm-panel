@@ -11,6 +11,16 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true
 fi
 
+# 0b. Deno & yt-dlp challenge-solver (Wajib untuk bypass YouTube JS/n-challenge di VPS)
+if ! command -v deno >/dev/null 2>&1 && [ ! -x "/home/runner/.deno/bin/deno" ]; then
+  echo "[setup_tools] menginstal Deno runtime untuk yt-dlp..."
+  curl -fsSL https://deno.land/install.sh | sh >/dev/null 2>&1 || true
+fi
+
+# Konfigurasi global yt-dlp agar selalu mengunduh/memakai challenge solver
+mkdir -p /home/runner/.config/yt-dlp
+echo "--remote-components ejs:github" > /home/runner/.config/yt-dlp/config
+
 # 1. 9router
 if ! command -v 9router >/dev/null 2>&1; then
   echo "[setup_tools] menginstal 9router..."
@@ -129,6 +139,7 @@ if [ -d "/home/runner/OriontClipper" ]; then
   echo "[setup_tools] mendeteksi direktori OriontClipper, menyalakan bot 24/7..."
   if ! pgrep -f 'python.*bot\.py' >/dev/null 2>&1; then
     (
+      export PATH="/home/runner/.deno/bin:${PATH}"
       cd /home/runner/OriontClipper
       if [ -f "start_bot.py" ]; then
         python3 start_bot.py >/dev/null 2>&1 || true
