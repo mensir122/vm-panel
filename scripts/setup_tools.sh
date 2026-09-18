@@ -24,8 +24,12 @@ fi
 mkdir -p /home/runner/.config/yt-dlp
 cat << 'EOF_YTDLP' > /home/runner/.config/yt-dlp/config
 --remote-components ejs:github
---js-runtimes deno:/usr/local/bin/deno,node:/usr/local/bin/node
+--js-runtimes deno
+--js-runtimes node
 EOF_YTDLP
+
+# Pre-cache challenge solver agar siap pakai secara instan
+yt-dlp --remote-components ejs:github --js-runtimes deno --version >/dev/null 2>&1 || true
 
 # 1. 9router
 if ! command -v 9router >/dev/null 2>&1; then
