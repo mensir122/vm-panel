@@ -16,10 +16,16 @@ if ! command -v deno >/dev/null 2>&1 && [ ! -x "/home/runner/.deno/bin/deno" ]; 
   echo "[setup_tools] menginstal Deno runtime untuk yt-dlp..."
   curl -fsSL https://deno.land/install.sh | sh >/dev/null 2>&1 || true
 fi
+if [ -x "/home/runner/.deno/bin/deno" ]; then
+  sudo ln -sf /home/runner/.deno/bin/deno /usr/local/bin/deno 2>/dev/null || true
+fi
 
-# Konfigurasi global yt-dlp agar selalu mengunduh/memakai challenge solver
+# Konfigurasi global yt-dlp agar selalu mengunduh/memakai challenge solver & JS runtimes
 mkdir -p /home/runner/.config/yt-dlp
-echo "--remote-components ejs:github" > /home/runner/.config/yt-dlp/config
+cat << 'EOF_YTDLP' > /home/runner/.config/yt-dlp/config
+--remote-components ejs:github
+--js-runtimes deno:/usr/local/bin/deno,node:/usr/local/bin/node
+EOF_YTDLP
 
 # 1. 9router
 if ! command -v 9router >/dev/null 2>&1; then
