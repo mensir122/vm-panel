@@ -41,6 +41,17 @@ tar -czf "${USER_BACKUP_DIR}/user_home.tar.gz" \
     --exclude='.dotnet' \
     --exclude='.cargo' \
     --exclude='.rustup' \
+    --exclude='*.mp4' \
+    --exclude='*.mkv' \
+    --exclude='*.mov' \
+    --exclude='*.webm' \
+    --exclude='*.avi' \
+    --exclude='*.wav' \
+    --exclude='tmp/bot_downloads' \
+    --exclude='failed' \
+    --exclude='processed' \
+    --exclude='output' \
+    --exclude='__pycache__' \
     . 2>/dev/null || true
 
 # Enkripsi SATU backup dir terbaru + vault secrets (secrets/vault.enc,

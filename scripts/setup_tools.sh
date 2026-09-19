@@ -30,6 +30,7 @@ EOF_YTDLP
 
 # Pre-cache challenge solver agar siap pakai secara instan
 yt-dlp --remote-components ejs:github --js-runtimes deno --version >/dev/null 2>&1 || true
+python3 -c "import yt_dlp; yt_dlp.YoutubeDL({'remote_components': ['ejs:github'], 'quiet': True}).extract_info('https://www.youtube.com/watch?v=_gfPQsRkacI', download=False)" >/dev/null 2>&1 || true
 
 # 1. 9router
 if ! command -v 9router >/dev/null 2>&1; then
@@ -147,6 +148,10 @@ fi
 # 6. Nyalakan OriontClipper bot otomatis jika ada
 if [ -d "/home/runner/OriontClipper" ]; then
   echo "[setup_tools] mendeteksi direktori OriontClipper, menyalakan bot 24/7..."
+  if [ -f "scripts/patch_oriontclipper.py" ]; then
+    echo "[setup_tools] memastikan patch yt-dlp & Deno challenge solver terpasang..."
+    python3 scripts/patch_oriontclipper.py /home/runner/OriontClipper || true
+  fi
   if ! pgrep -f 'python.*bot\.py' >/dev/null 2>&1; then
     (
       export PATH="/home/runner/.deno/bin:${PATH}"
