@@ -165,19 +165,185 @@ def main():
                 content = content.replace(old_save_success, new_save_success)
                 modified = True
 
-        # Fallback to plain text if Telegram Markdown parsing fails
-        if "Telegram Markdown send failed" not in content:
-            old_send_catalog = """        for i, msg_text in enumerate(catalog_messages):
-            is_last = (i == len(catalog_messages) - 1)
-            sent = await update.effective_message.reply_text(
-                msg_text,
-                parse_mode="Markdown",
-                reply_markup=reply_markup if is_last else None,
-            )
-            if is_last:
-                context.user_data["active_job"]["catalog_msg_id"] = sent.message_id"""
+        # 1e. Ensure import pickle is present
+        if "import pickle" not in content:
+            content = content.replace("import os\n", "import os\nimport pickle\n", 1)
+            modified = True
 
-            new_send_catalog = """        for i, msg_text in enumerate(catalog_messages):
+        # 1f. Ensure AIORateLimiter is imported and used on Application.builder()
+        if "AIORateLimiter" not in content:
+            old_ptb_imp = "from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes"
+            new_ptb_imp = "from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, AIORateLimiter"
+            if old_ptb_imp in content:
+                content = content.replace(old_ptb_imp, new_ptb_imp, 1)
+                modified = True
+
+            old_app_build = "app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).request(request).build()"
+            new_app_build = "app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).request(request).rate_limiter(AIORateLimiter()).build()"
+            if old_app_build in content:
+                content = content.replace(old_app_build, new_app_build, 1)
+                modified = True
+
+        # 1g. Ensure save_session, load_session, get_active_job and safe release_lock are defined
+        if "def save_session(" not in content:
+            old_lock = """# Global lock — only 1 video at a time (2-core VPS)
+_PROCESSING_LOCK = threading.Lock()
+
+def try_claim_lock() -> bool:
+    \"\"\"Atomically check and claim the global processing lock. True = claimed.\"\"\"
+    return _PROCESSING_LOCK.acquire(blocking=False)
+
+def release_lock() -> None:
+    _PROCESSING_LOCK.release()"""
+
+            new_lock = """# Global lock — only 1 video at a time (2-core VPS)
+_PROCESSING_LOCK = threading.Lock()
+
+def try_claim_lock() -> bool:
+    \"\"\"Atomically check and claim the global processing lock. True = claimed.\"\"\"
+    return _PROCESSING_LOCK.acquire(blocking=False)
+
+def release_lock() -> None:
+    try:
+        if _PROCESSING_LOCK.locked():
+            _PROCESSING_LOCK.release()
+    except RuntimeError:
+        pass
+
+def save_session(user_id: int, job: dict | None) -> None:
+    \"\"\"Persists active job dictionary to disk for resilience across restarts.\"\"\"
+    try:
+        sess_dir = config.PROJECT_ROOT / "tmp" / "sessions"
+        sess_dir.mkdir(parents=True, exist_ok=True)
+        sess_file = sess_dir / f"sess_{user_id}.pkl"
+        if not job:
+            sess_file.unlink(missing_ok=True)
+        else:
+            with open(sess_file, "wb") as f:
+                pickle.dump(job, f)
+    except Exception as exc:
+        LOGGER.warning("Could not persist session for user %s: %s", user_id, exc)
+
+def load_session(user_id: int) -> dict | None:
+    \"\"\"Loads persisted active job from disk if valid.\"\"\"
+    try:
+        sess_file = config.PROJECT_ROOT / "tmp" / "sessions" / f"sess_{user_id}.pkl"
+        if sess_file.exists():
+            with open(sess_file, "rb") as f:
+                job = pickle.load(f)
+                if isinstance(job, dict):
+                    wd = job.get("work_dir")
+                    if wd and isinstance(wd, Path) and wd.exists():
+                        return job
+    except Exception as exc:
+        LOGGER.warning("Could not restore session for user %s: %s", user_id, exc)
+    return None
+
+def get_active_job(context: ContextTypes.DEFAULT_TYPE, user_id: int | None = None) -> dict | None:
+    \"\"\"Gets active job from context.user_data or restores from disk if missing.\"\"\"
+    job = context.user_data.get("active_job") if (context is not None and hasattr(context, "user_data") and context.user_data is not None) else None
+    if isinstance(job, dict) and job.get("moments"):
+        return job
+    if user_id:
+        restored = load_session(user_id)
+        if restored and isinstance(restored, dict):
+            if context is not None and hasattr(context, "user_data") and context.user_data is not None:
+                context.user_data["active_job"] = restored
+            return restored
+    return job if isinstance(job, dict) else None"""
+
+            if old_lock in content:
+                content = content.replace(old_lock, new_lock, 1)
+                modified = True
+
+        # 1h. Ensure safe_send_catalog_messages helper is defined and used
+        if "async def safe_send_catalog_messages(" not in content:
+            helper_code = """async def safe_send_catalog_messages(
+    message: Message,
+    catalog_messages: list[str],
+    reply_markup: InlineKeyboardMarkup | None,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int | None:
+    \"\"\"Delivers catalog messages with rate limiting, per-chat pacing (1 msg/sec), and flood control handling.\"\"\"
+    last_msg_id = None
+    total = len(catalog_messages)
+
+    for i, msg_text in enumerate(catalog_messages):
+        is_last = (i == total - 1)
+        kb = reply_markup if is_last else None
+
+        if i > 0:
+            await asyncio.sleep(1.2)
+
+        sent = None
+        for attempt in range(3):
+            try:
+                sent = await message.reply_text(
+                    msg_text,
+                    parse_mode="Markdown",
+                    reply_markup=kb,
+                )
+                break
+            except telegram.error.RetryAfter as err:
+                wait_sec = int(getattr(err, "retry_after", 3)) + 1
+                LOGGER.warning("Telegram Flood Wait (RetryAfter %s s) during catalog delivery. Sleeping...", wait_sec)
+                if wait_sec <= 25:
+                    await asyncio.sleep(wait_sec)
+                    continue
+                else:
+                    await asyncio.sleep(5)
+            except Exception as exc_send:
+                LOGGER.warning("Telegram Markdown send failed (%s), retrying as plain text", exc_send)
+                clean_text = re.sub(r"[*_`\\[\\]]", "", msg_text)
+                try:
+                    await asyncio.sleep(0.5)
+                    sent = await message.reply_text(
+                        clean_text,
+                        reply_markup=kb,
+                    )
+                    break
+                except telegram.error.RetryAfter as err2:
+                    wait_sec = int(getattr(err2, "retry_after", 3)) + 1
+                    LOGGER.warning("Telegram Flood Wait on plain text: waiting %s s", wait_sec)
+                    if wait_sec <= 25:
+                        await asyncio.sleep(wait_sec)
+                        continue
+                except Exception as exc2:
+                    LOGGER.error("Failed to deliver catalog chunk %s: %s", i, exc2)
+                    break
+
+        if sent:
+            last_msg_id = sent.message_id
+
+    # Fallback: if last message with reply_markup was not delivered, send a small standalone button menu
+    if reply_markup and (not sent or not is_last):
+        try:
+            await asyncio.sleep(1.0)
+            fallback_sent = await message.reply_text(
+                "🎬 *Pilihan Klip Tersedia:*\\nPilih klip yang ingin digenerate melalui tombol di bawah:",
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+            )
+            last_msg_id = fallback_sent.message_id
+        except Exception as exc_fallback:
+            LOGGER.warning("Fallback button delivery failed: %s", exc_fallback)
+
+    return last_msg_id"""
+
+            if "def build_clip_catalog_messages(" in content:
+                content = content.replace(
+                    "def build_clip_catalog_messages(",
+                    helper_code.strip() + "\n\n\ndef build_clip_catalog_messages(",
+                    1
+                )
+                modified = True
+
+        # 1i. Use safe_send_catalog_messages and save_session in handle_video & run_youtube_flow & show_active_clips
+        old_vid_catalog_variants = [
+            """        catalog_messages = build_clip_catalog_messages(moments, context)
+        reply_markup = build_clip_keyboard(len(moments), set())
+
+        for i, msg_text in enumerate(catalog_messages):
             is_last = (i == len(catalog_messages) - 1)
             try:
                 sent = await update.effective_message.reply_text(
@@ -193,23 +359,88 @@ def main():
                     reply_markup=reply_markup if is_last else None,
                 )
             if is_last:
-                context.user_data["active_job"]["catalog_msg_id"] = sent.message_id"""
+                context.user_data["active_job"]["catalog_msg_id"] = sent.message_id""",
+            """        catalog_messages = build_clip_catalog_messages(moments, context)
+        reply_markup = build_clip_keyboard(len(moments), set())
 
-            if old_send_catalog in content:
-                content = content.replace(old_send_catalog, new_send_catalog)
-                modified = True
+        for i, msg_text in enumerate(catalog_messages):
+            is_last = (i == len(catalog_messages) - 1)
+            sent = await update.effective_message.reply_text(
+                msg_text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup if is_last else None,
+            )
+            if is_last:
+                context.user_data["active_job"]["catalog_msg_id"] = sent.message_id""",
+        ]
+        new_vid_catalog = """        catalog_messages = build_clip_catalog_messages(moments, context)
+        reply_markup = build_clip_keyboard(len(moments), set())
 
-            old_show_catalog = """    for i, msg_text in enumerate(catalog_messages):
-        is_last = (i == len(catalog_messages) - 1)
-        sent = await update.message.reply_text(
-            msg_text,
-            parse_mode="Markdown",
-            reply_markup=reply_markup if is_last else None,
+        cat_id = await safe_send_catalog_messages(
+            update.effective_message, catalog_messages, reply_markup, context
         )
-        if is_last:
-            job["catalog_msg_id"] = sent.message_id"""
+        if cat_id:
+            context.user_data["active_job"]["catalog_msg_id"] = cat_id
+            save_session(update.effective_user.id, context.user_data["active_job"])"""
 
-            new_show_catalog = """    for i, msg_text in enumerate(catalog_messages):
+        for old_v in old_vid_catalog_variants:
+            if old_v in content:
+                content = content.replace(old_v, new_vid_catalog, 1)
+                modified = True
+                break
+
+        old_yt_catalog_variants = [
+            """        catalog_messages = build_clip_catalog_messages(moments, context)
+        reply_markup = build_clip_keyboard(len(moments), set())
+
+        for i, msg_text in enumerate(catalog_messages):
+            is_last = (i == len(catalog_messages) - 1)
+            try:
+                sent = await update.effective_message.reply_text(
+                    msg_text,
+                    parse_mode="Markdown",
+                    reply_markup=reply_markup if is_last else None,
+                )
+            except Exception as exc_send:
+                LOGGER.warning("Telegram Markdown send failed (%s), falling back to plain text", exc_send)
+                clean_text = re.sub(r"[*_`\\[\\]]", "", msg_text)
+                sent = await update.effective_message.reply_text(
+                    clean_text,
+                    reply_markup=reply_markup if is_last else None,
+                )
+            if is_last:
+                context.user_data["active_job"]["catalog_msg_id"] = sent.message_id""",
+            """        catalog_messages = build_clip_catalog_messages(moments, context)
+        reply_markup = build_clip_keyboard(len(moments), set())
+
+        for i, msg_text in enumerate(catalog_messages):
+            is_last = (i == len(catalog_messages) - 1)
+            sent = await update.effective_message.reply_text(
+                msg_text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup if is_last else None,
+            )
+            if is_last:
+                context.user_data["active_job"]["catalog_msg_id"] = sent.message_id""",
+        ]
+        new_yt_catalog = """        catalog_messages = build_clip_catalog_messages(moments, context)
+        reply_markup = build_clip_keyboard(len(moments), set())
+
+        cat_id = await safe_send_catalog_messages(
+            update.effective_message, catalog_messages, reply_markup, context
+        )
+        if cat_id:
+            context.user_data["active_job"]["catalog_msg_id"] = cat_id
+            save_session(user_id, context.user_data["active_job"])"""
+
+        for old_y in old_yt_catalog_variants:
+            if old_y in content:
+                content = content.replace(old_y, new_yt_catalog, 1)
+                modified = True
+                break
+
+        old_show_catalog_variants = [
+            """    for i, msg_text in enumerate(catalog_messages):
         is_last = (i == len(catalog_messages) - 1)
         try:
             sent = await update.message.reply_text(
@@ -225,11 +456,70 @@ def main():
                 reply_markup=reply_markup if is_last else None,
             )
         if is_last:
-            job["catalog_msg_id"] = sent.message_id"""
+            job["catalog_msg_id"] = sent.message_id""",
+            """    for i, msg_text in enumerate(catalog_messages):
+        is_last = (i == len(catalog_messages) - 1)
+        sent = await update.message.reply_text(
+            msg_text,
+            parse_mode="Markdown",
+            reply_markup=reply_markup if is_last else None,
+        )
+        if is_last:
+            job["catalog_msg_id"] = sent.message_id""",
+        ]
+        new_show_catalog = """    cat_id = await safe_send_catalog_messages(
+        update.message, catalog_messages, reply_markup, context
+    )
+    if cat_id:
+        job["catalog_msg_id"] = cat_id
+        save_session(user_id, job)"""
 
-            if old_show_catalog in content:
-                content = content.replace(old_show_catalog, new_show_catalog)
+        for old_s in old_show_catalog_variants:
+            if old_s in content:
+                content = content.replace(old_s, new_show_catalog, 1)
                 modified = True
+                break
+
+        # 1j. Patch clip_callback to safely retrieve active_job
+        old_clip_cb_check = """    job = context.user_data.get("active_job")
+    if not job or not job.get("moments"):
+        try:
+            await query.answer("Sesi klip tidak aktif.", show_alert=True)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏳ Pilih campaign untuk video yang baru kamu kirim lewat tombol di atas ya!\\n"
+                "(Kirim /done untuk membatalkan.)"
+                if job.get("awaiting_campaign")
+                else "ℹ️ Sesi klip tidak ditemukan atau sudah selesai. Kirim video/link baru untuk mulai!"
+            ),
+            reply_markup=MAIN_MENU,
+        )
+        return"""
+
+        new_clip_cb_check = """    job = get_active_job(context, user_id)
+    if not job or not job.get("moments"):
+        try:
+            await query.answer("Sesi klip tidak aktif.", show_alert=True)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏳ Pilih campaign untuk video yang baru kamu kirim lewat tombol di atas ya!\\n"
+                "(Kirim /done untuk membatalkan.)"
+                if (isinstance(job, dict) and job.get("awaiting_campaign"))
+                else "ℹ️ Sesi klip tidak ditemukan atau sudah selesai. Kirim video/link baru untuk mulai!"
+            ),
+            reply_markup=MAIN_MENU,
+        )
+        return"""
+
+        if old_clip_cb_check in content:
+            content = content.replace(old_clip_cb_check, new_clip_cb_check, 1)
+            modified = True
 
         # Safe edit in unexpected error handler so it doesn't crash if message was deleted
         if "except Exception:\\n            await update.effective_message.reply_text" not in content:
@@ -250,6 +540,33 @@ def main():
             print(f"[patch_oriontclipper] bot.py successfully updated")
         else:
             print(f"[patch_oriontclipper] bot.py already up-to-date")
+
+    # 2. Patch modules/bot_ui.py to compact card preview
+    bot_ui_py = root / "modules" / "bot_ui.py"
+    if bot_ui_py.exists():
+        ui_content = bot_ui_py.read_text(encoding="utf-8")
+        old_card_end = """    if alasan_clean:
+        card += f"💡 *Kenapa Menarik:* _{alasan_clean}_\\n"
+    card += (
+        f"🎵 *Mood BGM:* `{bgm_mood}`\\n"
+        f"📝 *Caption Siap Pakai:*\\n_{caption_clean}_\\n\\n"
+    )
+    return card"""
+        new_card_end = """    if alasan_clean:
+        card += f"💡 *Kenapa Menarik:* _{alasan_clean}_\\n"
+    card += f"🎵 *Mood BGM:* `{bgm_mood}`\\n"
+    if caption_clean:
+        short_cap = caption_clean[:90] + ("..." if len(caption_clean) > 90 else "")
+        card += f"📝 *Caption:* _{short_cap}_\\n\\n"
+    else:
+        card += "\\n"
+    return card"""
+        if old_card_end in ui_content:
+            ui_content = ui_content.replace(old_card_end, new_card_end, 1)
+            bot_ui_py.write_text(ui_content, encoding="utf-8")
+            print(f"[patch_oriontclipper] modules/bot_ui.py successfully updated")
+        else:
+            print(f"[patch_oriontclipper] modules/bot_ui.py already up-to-date")
 
     # 2. Patch modules/youtube_flow.py with clean, correct indentation
     yt_flow_py = root / "modules" / "youtube_flow.py"
