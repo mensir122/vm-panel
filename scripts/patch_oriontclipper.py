@@ -165,6 +165,86 @@ def main():
                 content = content.replace(old_save_success, new_save_success)
                 modified = True
 
+        # Fallback to plain text if Telegram Markdown parsing fails
+        if "Telegram Markdown send failed" not in content:
+            old_send_catalog = """        for i, msg_text in enumerate(catalog_messages):
+            is_last = (i == len(catalog_messages) - 1)
+            sent = await update.effective_message.reply_text(
+                msg_text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup if is_last else None,
+            )
+            if is_last:
+                context.user_data["active_job"]["catalog_msg_id"] = sent.message_id"""
+
+            new_send_catalog = """        for i, msg_text in enumerate(catalog_messages):
+            is_last = (i == len(catalog_messages) - 1)
+            try:
+                sent = await update.effective_message.reply_text(
+                    msg_text,
+                    parse_mode="Markdown",
+                    reply_markup=reply_markup if is_last else None,
+                )
+            except Exception as exc_send:
+                LOGGER.warning("Telegram Markdown send failed (%s), falling back to plain text", exc_send)
+                clean_text = re.sub(r"[*_`\\[\\]]", "", msg_text)
+                sent = await update.effective_message.reply_text(
+                    clean_text,
+                    reply_markup=reply_markup if is_last else None,
+                )
+            if is_last:
+                context.user_data["active_job"]["catalog_msg_id"] = sent.message_id"""
+
+            if old_send_catalog in content:
+                content = content.replace(old_send_catalog, new_send_catalog)
+                modified = True
+
+            old_show_catalog = """    for i, msg_text in enumerate(catalog_messages):
+        is_last = (i == len(catalog_messages) - 1)
+        sent = await update.message.reply_text(
+            msg_text,
+            parse_mode="Markdown",
+            reply_markup=reply_markup if is_last else None,
+        )
+        if is_last:
+            job["catalog_msg_id"] = sent.message_id"""
+
+            new_show_catalog = """    for i, msg_text in enumerate(catalog_messages):
+        is_last = (i == len(catalog_messages) - 1)
+        try:
+            sent = await update.message.reply_text(
+                msg_text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup if is_last else None,
+            )
+        except Exception as exc_send:
+            LOGGER.warning("Telegram Markdown send failed (%s), falling back to plain text", exc_send)
+            clean_text = re.sub(r"[*_`\\[\\]]", "", msg_text)
+            sent = await update.message.reply_text(
+                clean_text,
+                reply_markup=reply_markup if is_last else None,
+            )
+        if is_last:
+            job["catalog_msg_id"] = sent.message_id"""
+
+            if old_show_catalog in content:
+                content = content.replace(old_show_catalog, new_show_catalog)
+                modified = True
+
+        # Safe edit in unexpected error handler so it doesn't crash if message was deleted
+        if "except Exception:\\n            await update.effective_message.reply_text" not in content:
+            old_err_edit = """        await status_msg.edit_text(f"❌ *Error tak terduga*\\n\\n{exc}", parse_mode="Markdown")"""
+            new_err_edit = """        try:
+            await status_msg.edit_text(f"❌ *Error tak terduga*\\n\\n{exc}", parse_mode="Markdown")
+        except Exception:
+            try:
+                await update.effective_message.reply_text(f"❌ Error tak terduga:\\n{exc}")
+            except Exception:
+                pass"""
+            if old_err_edit in content:
+                content = content.replace(old_err_edit, new_err_edit)
+                modified = True
+
         if modified:
             bot_py.write_text(content, encoding="utf-8")
             print(f"[patch_oriontclipper] bot.py successfully updated")
