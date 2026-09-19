@@ -273,10 +273,10 @@ def get_active_job(context: ContextTypes.DEFAULT_TYPE, user_id: int | None = Non
         kb = reply_markup if is_last else None
 
         if i > 0:
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.8)
 
         sent = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 sent = await message.reply_text(
                     msg_text,
@@ -287,16 +287,13 @@ def get_active_job(context: ContextTypes.DEFAULT_TYPE, user_id: int | None = Non
             except telegram.error.RetryAfter as err:
                 wait_sec = int(getattr(err, "retry_after", 3)) + 1
                 LOGGER.warning("Telegram Flood Wait (RetryAfter %s s) during catalog delivery. Sleeping...", wait_sec)
-                if wait_sec <= 25:
-                    await asyncio.sleep(wait_sec)
-                    continue
-                else:
-                    await asyncio.sleep(5)
+                await asyncio.sleep(wait_sec)
+                continue
             except Exception as exc_send:
                 LOGGER.warning("Telegram Markdown send failed (%s), retrying as plain text", exc_send)
                 clean_text = re.sub(r"[*_`\\[\\]]", "", msg_text)
                 try:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.0)
                     sent = await message.reply_text(
                         clean_text,
                         reply_markup=kb,
@@ -305,9 +302,8 @@ def get_active_job(context: ContextTypes.DEFAULT_TYPE, user_id: int | None = Non
                 except telegram.error.RetryAfter as err2:
                     wait_sec = int(getattr(err2, "retry_after", 3)) + 1
                     LOGGER.warning("Telegram Flood Wait on plain text: waiting %s s", wait_sec)
-                    if wait_sec <= 25:
-                        await asyncio.sleep(wait_sec)
-                        continue
+                    await asyncio.sleep(wait_sec)
+                    continue
                 except Exception as exc2:
                     LOGGER.error("Failed to deliver catalog chunk %s: %s", i, exc2)
                     break
@@ -541,10 +537,16 @@ def get_active_job(context: ContextTypes.DEFAULT_TYPE, user_id: int | None = Non
         else:
             print(f"[patch_oriontclipper] bot.py already up-to-date")
 
-    # 2. Patch modules/bot_ui.py to compact card preview
+    # 2. Patch modules/bot_ui.py to compact card preview & use safe animation interval
     bot_ui_py = root / "modules" / "bot_ui.py"
     if bot_ui_py.exists():
         ui_content = bot_ui_py.read_text(encoding="utf-8")
+        ui_modified = False
+
+        if "await asyncio.sleep(1.5)" in ui_content:
+            ui_content = ui_content.replace("await asyncio.sleep(1.5)", "await asyncio.sleep(4.5)")
+            ui_modified = True
+
         old_card_end = """    if alasan_clean:
         card += f"💡 *Kenapa Menarik:* _{alasan_clean}_\\n"
     card += (
@@ -563,6 +565,9 @@ def get_active_job(context: ContextTypes.DEFAULT_TYPE, user_id: int | None = Non
     return card"""
         if old_card_end in ui_content:
             ui_content = ui_content.replace(old_card_end, new_card_end, 1)
+            ui_modified = True
+
+        if ui_modified:
             bot_ui_py.write_text(ui_content, encoding="utf-8")
             print(f"[patch_oriontclipper] modules/bot_ui.py successfully updated")
         else:
