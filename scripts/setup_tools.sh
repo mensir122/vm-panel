@@ -20,7 +20,8 @@ if [ -x "/home/runner/.deno/bin/deno" ]; then
   sudo ln -sf /home/runner/.deno/bin/deno /usr/local/bin/deno 2>/dev/null || true
 fi
 
-# Konfigurasi global yt-dlp agar selalu mengunduh/memakai challenge solver & JS runtimes
+# 0c. Update yt-dlp & konfigurasi global challenge solver & JS runtimes
+pip install -U yt-dlp >/dev/null 2>&1 || true
 mkdir -p /home/runner/.config/yt-dlp
 cat << 'EOF_YTDLP' > /home/runner/.config/yt-dlp/config
 --remote-components ejs:github
@@ -148,6 +149,18 @@ fi
 # 6. Nyalakan OriontClipper bot otomatis jika ada
 if [ -d "/home/runner/OriontClipper" ]; then
   echo "[setup_tools] mendeteksi direktori OriontClipper, menyalakan bot 24/7..."
+  # Sinkronisasi / restore cookies permanen jika tmp/ kosong
+  if [ -f "/home/runner/OriontClipper/data/cookies_shared.txt" ] && [ ! -f "/home/runner/OriontClipper/tmp/cookies_shared.txt" ]; then
+    echo "[setup_tools] memulihkan cookies YouTube dari data/cookies_shared.txt..."
+    mkdir -p /home/runner/OriontClipper/tmp
+    cp /home/runner/OriontClipper/data/cookies_shared.txt /home/runner/OriontClipper/tmp/cookies_shared.txt
+    chmod 600 /home/runner/OriontClipper/tmp/cookies_shared.txt 2>/dev/null || true
+  elif [ -f "/home/runner/OriontClipper/tmp/cookies_shared.txt" ] && [ ! -f "/home/runner/OriontClipper/data/cookies_shared.txt" ]; then
+    mkdir -p /home/runner/OriontClipper/data
+    cp /home/runner/OriontClipper/tmp/cookies_shared.txt /home/runner/OriontClipper/data/cookies_shared.txt
+    chmod 600 /home/runner/OriontClipper/data/cookies_shared.txt 2>/dev/null || true
+  fi
+
   if [ -f "scripts/patch_oriontclipper.py" ]; then
     echo "[setup_tools] memastikan patch yt-dlp & Deno challenge solver terpasang..."
     python3 scripts/patch_oriontclipper.py /home/runner/OriontClipper || true
