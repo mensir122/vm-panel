@@ -2,8 +2,9 @@
 """
 scripts/patch_oriontclipper.py
 Ensures OriontClipper uses resilient Deno JS challenge solving, multi-client player
-configuration, cookie persistence, and automatic fallback retry so YouTube downloads
-never fail with 'The page needs to be reloaded' or lost cookies.
+configuration, cookie persistence, properly structured try/except blocks, and defensive
+fallback checks so YouTube downloads never fail with 'The page needs to be reloaded'
+or ''NoneType' object has no attribute 'segments''.
 Idempotent and safe: runs on startup via setup_tools.sh.
 """
 import sys
@@ -89,49 +90,32 @@ def main():
                 content = content.replace(old_runtimes, new_runtimes)
                 modified = True
 
-        # Patch fallback retry in download_youtube_video if not present
-        if "the page needs to be reloaded" not in content:
-            old_try = """    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            path = Path(ydl.prepare_filename(info))
-            if not path.exists():
-                for f in output_dir.iterdir():
-                    if f.is_file() and f.suffix in config.SUPPORTED_EXTENSIONS:
-                        return f
-                return None
-            return path
-    except Exception as exc:"""
-
-            new_try = """    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            path = Path(ydl.prepare_filename(info))
-            if not path.exists():
-                for f in output_dir.iterdir():
-                    if f.is_file() and f.suffix in config.SUPPORTED_EXTENSIONS:
-                        return f
-                return None
-            return path
-    except Exception as exc:
-        err_text = strip_ansi(exc).lower()
-        if "the page needs to be reloaded" in err_text:
-            LOGGER.warning("Encountered reload error on %s, retrying with fallback player client...", url)
-            try:
-                fallback_opts = dict(ydl_opts)
-                fallback_opts["extractor_args"] = {"youtube": {"player_client": ["mweb", "web", "android"]}}
-                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    path = Path(ydl.prepare_filename(info))
-                    if path.exists():
-                        return path
-                    for f in output_dir.iterdir():
-                        if f.is_file() and f.suffix in config.SUPPORTED_EXTENSIONS:
-                            return f
-            except Exception:
-                pass"""
-            if old_try in content:
-                content = content.replace(old_try, new_try)
+        # Defensive guard against None transcript
+        if 'if not transcript or not getattr(transcript, "segments", None):' not in content:
+            old_fetch_block = """            transcript = await loop.run_in_executor(
+                None,
+                partial(
+                    youtube_flow.fetch_youtube_transcript,
+                    url,
+                    work_dir,
+                    user_id,
+                    COOKIE_PATH if has_cookies() else None,
+                ),
+            )"""
+            new_fetch_block = """            transcript = await loop.run_in_executor(
+                None,
+                partial(
+                    youtube_flow.fetch_youtube_transcript,
+                    url,
+                    work_dir,
+                    user_id,
+                    COOKIE_PATH if has_cookies() else None,
+                ),
+            )
+            if not transcript or not getattr(transcript, "segments", None):
+                raise youtube_flow.YoutubeTranscriptError("Transkrip otomatis tidak tersedia")"""
+            if old_fetch_block in content:
+                content = content.replace(old_fetch_block, new_fetch_block)
                 modified = True
 
         # Remove self-destructive COOKIE_PATH.unlink calls on transient errors
@@ -183,18 +167,19 @@ def main():
 
         if modified:
             bot_py.write_text(content, encoding="utf-8")
-            print(f"[patch_oriontclipper] bot.py successfully updated with resilient cookie & reload logic")
+            print(f"[patch_oriontclipper] bot.py successfully updated")
         else:
             print(f"[patch_oriontclipper] bot.py already up-to-date")
 
-    # 2. Patch modules/youtube_flow.py
+    # 2. Patch modules/youtube_flow.py with clean, correct indentation
     yt_flow_py = root / "modules" / "youtube_flow.py"
     if yt_flow_py.exists():
         flow_content = yt_flow_py.read_text(encoding="utf-8")
         flow_modified = False
 
-        if '"remote_components"' not in flow_content:
-            old_base_opts = """def _base_ydl_opts() -> dict:
+        # Ensure _base_ydl_opts has Deno & multi-client
+        old_base_opts_variants = [
+            """def _base_ydl_opts() -> dict:
     _deno_path_prepend()
     opts: dict = {
         "quiet": True,
@@ -214,9 +199,9 @@ def main():
     )
     if node_exe:
         opts["js_runtimes"] = {"node": {"path": str(node_exe)}}
-    return opts"""
-
-            new_base_opts = """def _base_ydl_opts() -> dict:
+    return opts""",
+        ]
+        new_base_opts = """def _base_ydl_opts() -> dict:
     _deno_path_prepend()
     opts: dict = {
         "quiet": True,
@@ -248,16 +233,13 @@ def main():
     if js_runtimes:
         opts["js_runtimes"] = js_runtimes
     return opts"""
-            if old_base_opts in flow_content:
-                flow_content = flow_content.replace(old_base_opts, new_base_opts)
+        for v in old_base_opts_variants:
+            if v in flow_content:
+                flow_content = flow_content.replace(v, new_base_opts)
                 flow_modified = True
 
-        # Add reload retry to fetch_youtube_transcript
-        if "Reload error fetching transcript" not in flow_content:
-            old_transcript_call = """    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = _single_video(ydl.extract_info(url, download=True))"""
-            new_transcript_call = """    try:
+        # Rewrite fetch_youtube_transcript extract call with proper nested try/except
+        old_transcript_call_broken = """    try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = _single_video(ydl.extract_info(url, download=True))
     except Exception as exc:
@@ -273,16 +255,35 @@ def main():
                 raise exc
         else:
             raise"""
-            if old_transcript_call in flow_content:
-                flow_content = flow_content.replace(old_transcript_call, new_transcript_call)
-                flow_modified = True
 
-        # Add reload retry to download_youtube_segment
-        if "Reload error downloading segment" not in flow_content:
-            old_segment_call = """    try:
+        old_transcript_call_original = """    try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)"""
-            new_segment_call = """    try:
+            info = _single_video(ydl.extract_info(url, download=True))"""
+
+        new_transcript_call_fixed = """    try:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = _single_video(ydl.extract_info(url, download=True))
+        except Exception as exc:
+            err_text = str(exc).lower()
+            if "the page needs to be reloaded" in err_text:
+                LOGGER.warning("Reload error fetching transcript, retrying with fallback player client...")
+                fallback_opts = dict(opts)
+                fallback_opts["extractor_args"] = {"youtube": {"player_client": ["mweb", "web", "android"]}}
+                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                    info = _single_video(ydl.extract_info(url, download=True))
+            else:
+                raise"""
+
+        if old_transcript_call_broken in flow_content:
+            flow_content = flow_content.replace(old_transcript_call_broken, new_transcript_call_fixed)
+            flow_modified = True
+        elif old_transcript_call_original in flow_content and new_transcript_call_fixed not in flow_content:
+            flow_content = flow_content.replace(old_transcript_call_original, new_transcript_call_fixed)
+            flow_modified = True
+
+        # Rewrite download_youtube_segment extract call with proper nested try/except
+        old_segment_call_broken = """    try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
     except Exception as exc:
@@ -296,13 +297,36 @@ def main():
                     ydl.extract_info(url, download=True)
             except Exception:
                 pass"""
-            if old_segment_call in flow_content:
-                flow_content = flow_content.replace(old_segment_call, new_segment_call)
-                flow_modified = True
+
+        old_segment_call_original = """    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)"""
+
+        new_segment_call_fixed = """    try:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except Exception as exc:
+            err_text = str(exc).lower()
+            if "the page needs to be reloaded" in err_text:
+                LOGGER.warning("Reload error downloading segment, retrying with fallback player client...")
+                fallback_opts = dict(opts)
+                fallback_opts["extractor_args"] = {"youtube": {"player_client": ["mweb", "web", "android"]}}
+                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                    ydl.extract_info(url, download=True)
+            else:
+                raise"""
+
+        if old_segment_call_broken in flow_content:
+            flow_content = flow_content.replace(old_segment_call_broken, new_segment_call_fixed)
+            flow_modified = True
+        elif old_segment_call_original in flow_content and new_segment_call_fixed not in flow_content:
+            flow_content = flow_content.replace(old_segment_call_original, new_segment_call_fixed)
+            flow_modified = True
 
         if flow_modified:
             yt_flow_py.write_text(flow_content, encoding="utf-8")
-            print(f"[patch_oriontclipper] modules/youtube_flow.py successfully updated with reload retry")
+            print(f"[patch_oriontclipper] modules/youtube_flow.py successfully fixed")
         else:
             print(f"[patch_oriontclipper] modules/youtube_flow.py already up-to-date")
 
