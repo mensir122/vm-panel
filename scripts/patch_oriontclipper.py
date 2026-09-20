@@ -7,6 +7,7 @@ fallback checks so YouTube downloads never fail with 'The page needs to be reloa
 or ''NoneType' object has no attribute 'segments''.
 Idempotent and safe: runs on startup via setup_tools.sh.
 """
+import re
 import sys
 from pathlib import Path
 
@@ -517,18 +518,48 @@ def get_active_job(context: ContextTypes.DEFAULT_TYPE, user_id: int | None = Non
             content = content.replace(old_clip_cb_check, new_clip_cb_check, 1)
             modified = True
 
-        # Safe edit in unexpected error handler so it doesn't crash if message was deleted
-        if "except Exception:\\n            await update.effective_message.reply_text" not in content:
-            old_err_edit = """        await status_msg.edit_text(f"❌ *Error tak terduga*\\n\\n{exc}", parse_mode="Markdown")"""
-            new_err_edit = """        try:
+        # Ensure unexpected error handlers have defensive try/except against deleted status messages
+        if "try:\n            await status_msg.edit_text(f\"❌ *Error tak terduga*" not in content:
+            # 1. handle_video bare block
+            bare_hv = """    except Exception as exc:
+        LOGGER.error("Unexpected error: %s", exc)
+        animator.stop()
+        await status_msg.edit_text(f"❌ *Error tak terduga*\\n\\n{exc}", parse_mode="Markdown")"""
+            safe_hv = """    except Exception as exc:
+        LOGGER.error("Unexpected error: %s", exc)
+        animator.stop()
+        try:
             await status_msg.edit_text(f"❌ *Error tak terduga*\\n\\n{exc}", parse_mode="Markdown")
         except Exception:
             try:
                 await update.effective_message.reply_text(f"❌ Error tak terduga:\\n{exc}")
             except Exception:
                 pass"""
-            if old_err_edit in content:
-                content = content.replace(old_err_edit, new_err_edit)
+            if bare_hv in content:
+                content = content.replace(bare_hv, safe_hv, 1)
+                modified = True
+
+            # 2. run_youtube_flow bare block
+            bare_yt = """    except Exception as exc:
+        LOGGER.error("Unexpected YouTube flow error: %s", exc)
+        animator.stop()
+        if sticker_msg:
+            await bot_ui.safe_delete_message(context.bot, chat_id, sticker_msg.message_id)
+        await status_msg.edit_text(f"❌ *Error tak terduga*\\n\\n{exc}", parse_mode="Markdown")"""
+            safe_yt = """    except Exception as exc:
+        LOGGER.error("Unexpected YouTube flow error: %s", exc)
+        animator.stop()
+        if sticker_msg:
+            await bot_ui.safe_delete_message(context.bot, chat_id, sticker_msg.message_id)
+        try:
+            await status_msg.edit_text(f"❌ *Error tak terduga*\\n\\n{exc}", parse_mode="Markdown")
+        except Exception:
+            try:
+                await update.effective_message.reply_text(f"❌ Error tak terduga:\\n{exc}")
+            except Exception:
+                pass"""
+            if bare_yt in content:
+                content = content.replace(bare_yt, safe_yt, 1)
                 modified = True
 
         if modified:

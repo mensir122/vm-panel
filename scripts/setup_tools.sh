@@ -181,6 +181,15 @@ if [ -d "/home/runner/OriontClipper" ]; then
   else
     echo "[setup_tools] OriontClipper bot sudah berjalan."
   fi
+
+  # 7. Watchdog 24/7 untuk memastikan OriontClipper otomatis hidup kembali bila sempat mati
+  if ! pgrep -f 'bot_watchdog.sh' >/dev/null 2>&1; then
+    if [ -f "scripts/bot_watchdog.sh" ]; then
+      chmod +x scripts/bot_watchdog.sh
+      nohup bash scripts/bot_watchdog.sh >/home/runner/OriontClipper/watchdog.log 2>&1 &
+      echo "[setup_tools] OriontClipper bot_watchdog 24/7 berhasil diaktifkan!"
+    fi
+  fi
 fi
 
 echo "[setup_tools] perkakas dan layanan publik 24/7 siap digunakan!"
