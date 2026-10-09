@@ -1,1 +1,1 @@
-{"CPU":"Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz","Cores":4,"RAM_GB":15.6,"Disk_free_GB":84.5,"Disk_total_GB":144.3,"OS":"Linux 6.17.0-1022-azure","runnerId":"37795392406","capturedAt":"2026-10-08T14:51:33.209Z"}
+{"CPU":"AMD EPYC 7763 64-Core Processor","Cores":4,"RAM_GB":15.6,"Disk_free_GB":84.4,"Disk_total_GB":144.3,"OS":"Linux 6.17.0-1022-azure","runnerId":"37840368272","capturedAt":"2026-10-08T20:37:46.175Z"}
