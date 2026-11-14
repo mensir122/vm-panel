@@ -1,1 +1,1 @@
-{"CPU":"AMD EPYC 7763 64-Core Processor","Cores":4,"RAM_GB":15.6,"Disk_free_GB":83,"Disk_total_GB":144.3,"OS":"Linux 7.0.0-1017-azure","runnerId":"43458476167","capturedAt":"2026-11-13T16:05:41.144Z"}
+{"CPU":"Intel(R) Xeon(R) 6975P-C","Cores":4,"RAM_GB":15.3,"Disk_free_GB":86.4,"Disk_total_GB":144.3,"OS":"Linux 7.0.0-1014-aws","runnerId":"43513852951","capturedAt":"2026-11-13T21:51:48.514Z"}
