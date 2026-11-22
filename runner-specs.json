@@ -1,1 +1,1 @@
-{"CPU":"INTEL(R) XEON(R) PLATINUM 8573C","Cores":4,"RAM_GB":15.6,"Disk_free_GB":85,"Disk_total_GB":144.3,"OS":"Linux 7.0.0-1020-azure","runnerId":"44945259072","capturedAt":"2026-11-21T20:18:06.878Z"}
+{"CPU":"AMD EPYC 9V45 96-Core Processor","Cores":4,"RAM_GB":15.6,"Disk_free_GB":85.1,"Disk_total_GB":144.3,"OS":"Linux 7.0.0-1020-azure","runnerId":"45003019614","capturedAt":"2026-11-22T08:31:12.813Z"}
