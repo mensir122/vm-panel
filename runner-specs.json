@@ -1,1 +1,1 @@
-{"CPU":"AMD EPYC 9V74 80-Core Processor","Cores":4,"RAM_GB":15.6,"Disk_free_GB":85,"Disk_total_GB":144.3,"OS":"Linux 7.0.0-1020-azure","runnerId":"45936764064","capturedAt":"2026-11-27T03:56:36.105Z"}
+{"CPU":"Intel(R) Xeon(R) 6975P-C","Cores":4,"RAM_GB":15.3,"Disk_free_GB":88.6,"Disk_total_GB":144.3,"OS":"Linux 7.0.0-1016-aws","runnerId":"45975574823","capturedAt":"2026-11-27T09:43:25.570Z"}
