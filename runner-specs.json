@@ -1,1 +1,1 @@
-{"CPU":"Intel(R) Xeon(R) 6975P-C","Cores":4,"RAM_GB":15.3,"Disk_free_GB":88.6,"Disk_total_GB":144.3,"OS":"Linux 7.0.0-1016-aws","runnerId":"45975574823","capturedAt":"2026-11-27T09:43:25.570Z"}
+{"CPU":"AMD EPYC 9V45 96-Core Processor","Cores":4,"RAM_GB":15.6,"Disk_free_GB":84.8,"Disk_total_GB":144.3,"OS":"Linux 7.0.0-1020-azure","runnerId":"46024806942","capturedAt":"2026-11-27T15:28:05.611Z"}
